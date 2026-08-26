@@ -31,7 +31,7 @@ https://github.com/user-attachments/assets/79174a4a-ef86-4c1d-9f1a-909d0b29a248
 
 G2ray is a powerful, interactive Bash panel designed to instantly deploy and manage Xray VLESS XHTTP configurations. Built specifically for the GitHub Codespaces environment, it automates port management, traffic monitoring, and connection keep-alives natively.
 
-> **Note:** The panel includes a best-effort anti-sleep engine using Tmux while the Codespace is running. It cannot bypass GitHub quota limits, manual stops, or automatic deletion of stopped Codespaces.
+> **Note:** The panel includes a best-effort anti-sleep engine using Tmux while the Codespace is running. Its panel toggle is persistent and is restored during headless startup until you explicitly turn it off. It cannot bypass GitHub quota limits, manual stops, idle policies that ignore container traffic, or automatic deletion of stopped Codespaces.
 
 ---
 
@@ -41,7 +41,7 @@ G2ray is a powerful, interactive Bash panel designed to instantly deploy and man
 Generate and start Xray engines in seconds. The beautiful menu-driven CLI interface makes managing nodes and viewing live config links effortless. 
 
 #### 🔄 Smart Auto-Keepalive
-Built-in background loops and Tmux keepalives reduce idle shutdowns while the Codespace is active. If GitHub stops, blocks, or deletes the Codespace, reopen it from GitHub Codespaces; the panel will auto-start and self-heal after the container starts again.
+Built-in background loops and a persistent Tmux keepalive preference reduce idle shutdowns while the Codespace is active. If GitHub stops, blocks, or deletes the Codespace, reopen it from GitHub Codespaces or use the configured Worker/direct GitHub wake path; the panel will auto-start and self-heal after the container starts again.
 
 #### 📡 Live Analytics & Quota
 Tracks real-time RX/TX traffic and resource usage (CPU/RAM). The quota panel is a local 2-core wall-clock estimate that resets by month; GitHub billing remains authoritative. GitHub's 15 GB-month allowance is storage quota, not traffic quota.
@@ -458,7 +458,7 @@ G2rayXCodeLeafy/
 <summary><kbd>❓</kbd> FAQ & Troubleshooting</summary>
 
 **My Codespace keeps shutting down?**
-Ensure you have activated Option `7` in the G2ray panel (Toggle Anti-Sleep Mode) to spawn a background Tmux session that simulates activity while the Codespace is running. This is best-effort: GitHub may still stop the Codespace when quota, budget, idle-timeout policy, or retention/deletion rules apply.
+Ensure Option `7` in the G2ray panel (Toggle Anti-Sleep Mode) is enabled. The choice is saved under `data/` and restored on interactive and headless starts until you turn it off. This is best-effort: GitHub may still stop the Codespace when quota, budget, idle-timeout policy, or retention/deletion rules apply.
 
 **Will it restart after my monthly quota resets?**
 Not by itself while GitHub is blocking or stopping the Codespace, because no code runs inside a stopped Codespace. The Worker can show `HTTP 402`, estimate the next monthly reset, and, if you enabled optional KV/Cron, check conservatively near reset. The same configs work next month only if the same Codespace survives, so mark it as **Keep codespace** before quota runs out. After the monthly included usage resets, reopen it from GitHub or the Worker; `postStartCommand` runs `scripts/post-start.sh`, which calls `g2ray.sh --silent-start`, starts Xray, starts the supervisor, records boot status, and refreshes exported configs.

@@ -38,6 +38,7 @@ reset_runtime_paths() {
     BOOT_STATUS_FILE="$DATA_DIR/boot_status.json"
     XHTTP_PATH_CACHE_FILE="$DATA_DIR/xhttp_path_cache"
     XHTTP_MODE_FILE="$DATA_DIR/xhttp_mode.txt"
+    ANTI_SLEEP_DISABLED_FILE="$DATA_DIR/anti_sleep_mode_disabled"
     LOW_OVERHEAD_FILE="$DATA_DIR/low_overhead_mode"
     LOW_OVERHEAD_DISABLED_FILE="$DATA_DIR/low_overhead_mode_disabled"
     LATENCY_FOCUS_FILE="$DATA_DIR/latency_focus_mode"
@@ -2461,6 +2462,43 @@ test_low_overhead_env_can_be_overridden_by_toggle() {
     pass "low-overhead mode can be explicitly toggled even when env default is enabled"
 }
 
+test_anti_sleep_preference_persists_across_headless_reconciliation() {
+    (
+        reset_runtime_paths
+        local tmux_state="$TMP_ROOT/mock-tmux-state" new_session_calls="$TMP_ROOT/mock-tmux-starts"
+        : > "$new_session_calls"
+        tmux() {
+            case "${1:-}" in
+                has-session) [[ -f "$tmux_state" ]] ;;
+                new-session)
+                    printf 'start\n' >> "$new_session_calls"
+                    : > "$tmux_state"
+                    ;;
+                kill-session) rm -f "$tmux_state" ;;
+                *) return 1 ;;
+            esac
+        }
+
+        anti_sleep_enabled || fail "anti-sleep should default to enabled"
+        sync_anti_sleep_runtime
+        [[ -f "$tmux_state" ]] || fail "headless reconciliation did not start enabled anti-sleep"
+
+        disable_anti_sleep
+        anti_sleep_enabled && fail "anti-sleep disable preference was not persisted"
+        [[ ! -f "$tmux_state" ]] || fail "disabling anti-sleep left its runtime alive"
+
+        sync_anti_sleep_runtime
+        [[ ! -f "$tmux_state" ]] || fail "headless reconciliation ignored the disabled preference"
+        [[ "$(wc -l < "$new_session_calls")" -eq 1 ]] \
+            || fail "disabled anti-sleep was restarted during reconciliation"
+
+        enable_anti_sleep
+        anti_sleep_enabled || fail "anti-sleep enable preference was not persisted"
+        [[ -f "$tmux_state" ]] || fail "enabling anti-sleep did not start its runtime"
+    )
+    pass "anti-sleep preference survives headless and interactive runtime reconciliation"
+}
+
 test_low_overhead_keeps_important_state_logs() {
     reset_runtime_paths
     enable_low_overhead_mode
@@ -3258,6 +3296,76 @@ test_self_heal_defers_external_repairs_while_traffic_is_active() {
     pass "self-heal defers disruptive external repair while traffic is active"
 }
 
+test_self_heal_preserves_idle_established_tunnels() {
+    (
+        reset_runtime_paths
+        write_test_vless_config
+        ensure_codespace_port_public() { return 0; }
+        xray_running() { return 0; }
+        xray_listener_ready() { return 0; }
+        xhttp_probe_metrics() { printf '404 25 route_settling_404\n'; }
+        inbound_tunnel_connection_present() { return 0; }
+        curl_http_code() { fail "self-heal continued probing after finding an established tunnel"; }
+        repair_codespace_port_route() { fail "self-heal destroyed an idle established tunnel"; }
+        force_reconnect() { fail "self-heal reconnected despite an established tunnel"; }
+        reset_route_bad_count() { return 0; }
+        reset_edge_bad_count() { return 0; }
+
+        self_heal_once || fail "self-heal failed while preserving an idle established tunnel"
+        grep -Fq 'signal=established_connection' "$LOG_FILE" \
+            || fail "self-heal did not classify the established-tunnel deferral"
+    )
+    pass "self-heal preserves quiet but established tunnel sessions"
+}
+
+test_self_heal_preserves_idle_established_ws_tunnels() {
+    (
+        reset_runtime_paths
+        write_test_vless_config
+        XRAY_PORT=443
+        WS_PORT=8443
+        ws_fallback_configured() { return 0; }
+        ensure_codespace_port_public() { return 0; }
+        ensure_optional_ws_port_public() { return 0; }
+        xray_running() { return 0; }
+        xray_listener_ready() { return 0; }
+        xhttp_probe_metrics() { printf '404 25 route_settling_404\n'; }
+        ss() {
+            case "$*" in
+                *":8443"*) printf 'ESTAB 0 0 127.0.0.1:8443 127.0.0.1:49152\n' ;;
+            esac
+        }
+        curl_http_code() { fail "self-heal continued probing after finding an established WS tunnel"; }
+        repair_codespace_port_route() { fail "self-heal destroyed an idle established WS tunnel"; }
+        force_reconnect() { fail "self-heal reconnected despite an established WS tunnel"; }
+        reset_route_bad_count() { return 0; }
+        reset_edge_bad_count() { return 0; }
+
+        self_heal_once || fail "self-heal failed while preserving an idle established WS tunnel"
+        grep -Fq 'signal=established_connection' "$LOG_FILE" \
+            || fail "self-heal did not classify the established WS tunnel deferral"
+    )
+    pass "self-heal preserves quiet but established WebSocket sessions"
+}
+
+test_self_heal_reasserts_optional_ws_visibility() {
+    (
+        reset_runtime_paths
+        write_test_vless_config
+        ws_fallback_configured() { return 0; }
+        ensure_codespace_port_public() { printf 'primary\n' >> "$TMP_ROOT/ports"; return 0; }
+        ensure_optional_ws_port_public() { printf 'ws\n' >> "$TMP_ROOT/ports"; return 0; }
+        xray_running() { return 0; }
+        xray_listener_ready() { return 0; }
+        xhttp_probe_metrics() { printf '204 25 ready\n'; }
+
+        self_heal_once || fail "self-heal failed while refreshing optional WS visibility"
+        grep -Fxq 'primary' "$TMP_ROOT/ports" || fail "primary port visibility was not checked"
+        grep -Fxq 'ws' "$TMP_ROOT/ports" || fail "optional WS port visibility was not checked"
+    )
+    pass "self-heal reasserts optional WebSocket port visibility"
+}
+
 test_self_heal_keeps_failure_count_when_route_repair_fails() {
     (
         reset_runtime_paths
@@ -3681,6 +3789,9 @@ test_route_health_refresh_does_not_let_unusable_cache_starve_builtins
 test_route_refresh_backoff_preserves_cache_without_probe_storms
 test_stale_route_cache_is_not_exported_after_hard_age
 test_self_heal_defers_external_repairs_while_traffic_is_active
+test_self_heal_preserves_idle_established_tunnels
+test_self_heal_preserves_idle_established_ws_tunnels
+test_self_heal_reasserts_optional_ws_visibility
 test_self_heal_keeps_failure_count_when_route_repair_fails
 test_port_listener_detection_does_not_require_sudo
 test_deadline_terminates_descendant_processes
@@ -3750,6 +3861,7 @@ test_config_metadata_sanitizes_invalid_max_fallback_links
 test_bench_json_reports_deterministic_budgets
 test_low_overhead_mode_suppresses_info_logs
 test_low_overhead_env_can_be_overridden_by_toggle
+test_anti_sleep_preference_persists_across_headless_reconciliation
 test_low_overhead_keeps_important_state_logs
 test_latency_focus_mode_suppresses_noncritical_info_but_preserves_warnings
 test_latency_focus_env_can_be_overridden_by_toggle

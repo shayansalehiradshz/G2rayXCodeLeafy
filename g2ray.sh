@@ -82,6 +82,7 @@ DNS_CANDIDATE_CACHE_FILE="$DATA_DIR/dns_candidate_cache.tsv"
 BOOT_STATUS_FILE="$DATA_DIR/boot_status.json"
 XHTTP_PATH_CACHE_FILE="$DATA_DIR/xhttp_path_cache"
 XHTTP_MODE_FILE="$DATA_DIR/xhttp_mode.txt"
+ANTI_SLEEP_DISABLED_FILE="$DATA_DIR/anti_sleep_mode_disabled"
 LOW_OVERHEAD_FILE="$DATA_DIR/low_overhead_mode"
 LOW_OVERHEAD_DISABLED_FILE="$DATA_DIR/low_overhead_mode_disabled"
 LOW_OVERHEAD_PREV_PROFILE_FILE="$DATA_DIR/low_overhead_previous_profile.txt"
@@ -2270,8 +2271,19 @@ check_for_updates() {
     sleep 1
 }
 
+anti_sleep_enabled() {
+    [[ ! -f "$ANTI_SLEEP_DISABLED_FILE" ]]
+}
+
+anti_sleep_running() {
+    command -v tmux >/dev/null 2>&1 || return 1
+    tmux has-session -t g2ray_keepalive 2>/dev/null
+}
+
 enable_anti_sleep() {
-    tmux has-session -t g2ray_keepalive 2>/dev/null && return 0
+    mkdir -p "$DATA_DIR" 2>/dev/null || true
+    rm -f "$ANTI_SLEEP_DISABLED_FILE" 2>/dev/null || true
+    anti_sleep_running && return 0
 cat > "$DATA_DIR/keepalive.sh" << 'EOF'
 #!/bin/bash
 while true; do
@@ -2281,7 +2293,26 @@ done
 EOF
     chmod +x "$DATA_DIR/keepalive.sh"
     local keepalive_cmd; keepalive_cmd=$(printf 'bash %q' "$DATA_DIR/keepalive.sh")
-    tmux new-session -d -s g2ray_keepalive "$keepalive_cmd" 2>/dev/null || true
+    if ! command -v tmux >/dev/null 2>&1 || ! tmux new-session -d -s g2ray_keepalive "$keepalive_cmd" 2>/dev/null; then
+        log_event WARN "anti_sleep runtime_start_failed tmux_unavailable_or_rejected"
+        return 1
+    fi
+}
+
+disable_anti_sleep() {
+    mkdir -p "$DATA_DIR" 2>/dev/null || true
+    _atomic_write "$ANTI_SLEEP_DISABLED_FILE" "1" 2>/dev/null || : > "$ANTI_SLEEP_DISABLED_FILE"
+    if anti_sleep_running; then
+        tmux kill-session -t g2ray_keepalive 2>/dev/null || true
+    fi
+}
+
+sync_anti_sleep_runtime() {
+    if anti_sleep_enabled; then
+        enable_anti_sleep || true
+    elif anti_sleep_running; then
+        tmux kill-session -t g2ray_keepalive 2>/dev/null || true
+    fi
 }
 
 is_port_open() {
@@ -2341,6 +2372,21 @@ active_tunnel_recent() {
     age=$(stamp_age_sec "$ACTIVE_TRAFFIC_STAMP_FILE")
     [[ "$age" =~ ^[0-9]+$ ]] || age=999999999
     (( age <= window ))
+}
+
+inbound_tunnel_connection_present() {
+    command -v ss >/dev/null 2>&1 || return 1
+    local port
+    local -a ports=("$XRAY_PORT")
+    if ws_fallback_configured && [[ "$WS_PORT" != "$XRAY_PORT" ]]; then
+        ports+=("$WS_PORT")
+    fi
+    for port in "${ports[@]}"; do
+        local connections
+        connections=$(ss -Htn state established "( sport = :${port} )" 2>/dev/null || true)
+        [[ -n "${connections//[[:space:]]/}" ]] && return 0
+    done
+    return 1
 }
 
 route_repair_cooldown_active() {
@@ -2444,6 +2490,8 @@ repair_codespace_port_route() {
     sleep 2
     if ensure_codespace_port_public force; then
         log_event INFO "route_repair public_ok port=${XRAY_PORT}"
+        ensure_optional_ws_port_public force >/dev/null 2>&1 \
+            || log_event WARN "route_repair ws_port_public_failed port=${WS_PORT}"
         return 0
     fi
     log_event ERROR "route_repair public_failed port=${XRAY_PORT}"
@@ -3083,10 +3131,13 @@ health_probe() {
 
 self_heal_once() {
     [[ -f "$CONFIG_FILE" ]] || return 0
-    local reason="" code xcode xms bad_count threshold traffic_active=false
+    local reason="" code xcode xms bad_count threshold traffic_active=false traffic_signal=none
 
     if ! ensure_codespace_port_public >/dev/null 2>&1; then
         log_event WARN "self_heal port_public_failed port=${XRAY_PORT}"
+    fi
+    if ! ensure_optional_ws_port_public >/dev/null 2>&1; then
+        log_event WARN "self_heal ws_port_public_failed port=${WS_PORT}"
     fi
 
     if ! xray_running; then
@@ -3118,11 +3169,17 @@ self_heal_once() {
     # still flowing. Dead core/listener recovery above remains immediate.
     if active_tunnel_recent; then
         traffic_active=true
+        traffic_signal=recent_bytes
+    elif inbound_tunnel_connection_present; then
+        # Long-lived HTTP streams and WebSockets can be completely quiet while
+        # still valid. Reasserting a Codespaces port destroys those sessions.
+        traffic_active=true
+        traffic_signal=established_connection
     fi
     if [[ "$traffic_active" == true ]]; then
         reset_route_bad_count
         reset_edge_bad_count
-        log_event WARN "self_heal external_probe_failed xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} action=defer_active_traffic"
+        log_event WARN "self_heal external_probe_failed xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} action=defer_active_traffic signal=${traffic_signal}"
         return 0
     fi
 
@@ -6420,6 +6477,7 @@ if [[ "${1:-}" == "--headless-route-settle" ]]; then
 fi
 
 if [[ "${1:-}" == "--silent-start" ]]; then
+    sync_anti_sleep_runtime
     if [[ ! -f "$CONFIG_FILE" ]]; then
         write_boot_status "no_config" "silent_start" "No config exists yet; open the panel and generate one." "0" "0" \
             || log_event WARN "boot_status nonfatal_write_failed reason=silent_start"
@@ -6460,7 +6518,7 @@ trap 'exit 143' TERM
 check_for_updates "$@"
 ensure_runtime_ready "interactive_attach" >/dev/null 2>&1 || true
 start_background_tasks || log_event WARN "background supervisor_start_deferred reason=interactive_attach"
-enable_anti_sleep
+sync_anti_sleep_runtime
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
     refresh_screen
@@ -6498,9 +6556,12 @@ while true; do
         _STATUS="${RED}■ STOPPED${NC}"
     fi
 
-    if tmux has-session -t g2ray_keepalive 2>/dev/null; then
+    if anti_sleep_enabled && anti_sleep_running; then
         _KA="${GREEN}Enabled${NC}"
         _KA_LABEL="${GREEN}currently Enabled${NC}"
+    elif anti_sleep_enabled; then
+        _KA="${YELLOW}Enabled (runtime unavailable)${NC}"
+        _KA_LABEL="${YELLOW}enabled, runtime unavailable${NC}"
     else
         _KA="${DIM}Disabled${NC}"
         _KA_LABEL="${DIM}currently Disabled${NC}"
@@ -6672,12 +6733,15 @@ while true; do
             ;;
         6) recover_now ;;
         7)
-            if tmux has-session -t g2ray_keepalive 2>/dev/null; then
-                tmux kill-session -t g2ray_keepalive
+            if anti_sleep_enabled; then
+                disable_anti_sleep
                 echo -e "\n  ${RED}■ Anti-Sleep disabled.${NC}"
             else
-                enable_anti_sleep
-                echo -e "\n  ${GREEN}▶ Anti-Sleep enabled.${NC}"
+                if enable_anti_sleep; then
+                    echo -e "\n  ${GREEN}▶ Anti-Sleep enabled.${NC}"
+                else
+                    echo -e "\n  ${YELLOW}⚠ Anti-Sleep preference was enabled, but Tmux could not start.${NC}"
+                fi
             fi
             sleep 2
             ;;
