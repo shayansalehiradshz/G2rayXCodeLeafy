@@ -766,7 +766,7 @@ test_route_health_records_source_reason_and_recent_average() {
 test_route_failure_reason_classifier() {
     reset_runtime_paths
     [[ "$(route_failure_reason_for_status 200 "")" == "ready" ]] || fail "HTTP 200 should classify ready"
-    [[ "$(route_failure_reason_for_status 400 "")" == "ready" ]] || fail "HTTP 400 should classify ready"
+    [[ "$(route_failure_reason_for_status 400 "")" == "unexpected_http_status" ]] || fail "HTTP 400 should classify as an XHTTP error"
     [[ "$(route_failure_reason_for_status 404 "")" == "route_settling_404" ]] || fail "HTTP 404 should classify route settling"
     [[ "$(route_failure_reason_for_status 0 "operation timed out")" == "timeout_or_unreachable" ]] || fail "HTTP 0 timeout should classify unreachable"
     [[ "$(route_failure_reason_for_status 503 "")" == "edge_or_origin_error" ]] || fail "HTTP 503 should classify edge/origin error"
@@ -816,6 +816,81 @@ test_xhttp_probe_metrics_reports_curl_failure_reason() {
     [[ "$code" == "0" ]] || fail "curl timeout probe did not report HTTP 0: $code"
     [[ "$reason" == "timeout_or_unreachable" ]] || fail "curl timeout probe did not report actionable reason: $reason"
     pass "xhttp probe metrics reports curl failure reason"
+}
+
+test_xhttp_options_requires_handler_success() {
+    xhttp_status_usable 200 || fail "HTTP 200 from the XHTTP OPTIONS handler was not accepted"
+    if xhttp_status_usable 400; then
+        fail "HTTP 400 was accepted even though the pinned Xray OPTIONS handler returns 200 on success"
+    fi
+    if xhttp_status_usable 404; then
+        fail "HTTP 404 was accepted as a usable XHTTP route"
+    fi
+    pass "XHTTP readiness requires the pinned handler's HTTP 200 success response"
+}
+
+test_legacy_http_400_cache_rows_are_never_exported() {
+    reset_runtime_paths
+    printf '2026-08-28T00:00:00Z\t20.0.0.1\t400\t20\ttrue\tlegacy\tready\n' > "$ROUTE_HEALTH_FILE"
+
+    if route_health_cache_fresh; then
+        fail "legacy HTTP 400 cache row kept the route cache fresh"
+    fi
+    if route_health_cache_exportable; then
+        fail "legacy HTTP 400 cache row remained exportable"
+    fi
+    [[ -z "$(cached_route_candidate_ips)" ]] \
+        || fail "legacy HTTP 400 cache row remained a discovery candidate"
+    [[ -z "$(cached_usable_fallback_ips)" ]] \
+        || fail "legacy HTTP 400 cache row was exported as a fallback"
+
+    printf '2026-08-28T00:00:01Z\t20.0.0.2\t200\t30\ttrue\tprobe\tready\n' >> "$ROUTE_HEALTH_FILE"
+    [[ "$(cached_route_candidate_ips)" == "20.0.0.2" ]] \
+        || fail "strict cache migration did not preserve the HTTP 200 route"
+    [[ "$(cached_usable_fallback_ips)" == "20.0.0.2" ]] \
+        || fail "strict cache migration did not export only the HTTP 200 route"
+    pass "legacy HTTP 400 route-cache rows cannot survive strict readiness migration"
+}
+
+test_future_state_timestamps_are_treated_as_stale() {
+    reset_runtime_paths
+    local stamp="$DATA_DIR/future.stamp" file="$DATA_DIR/future.file" stamp_age file_age
+    printf '200\n' > "$stamp"
+    : > "$file"
+    date() { printf '100\n'; }
+    stat() { printf '200\n'; }
+
+    stamp_age=$(stamp_age_sec "$stamp")
+    file_age=$(file_age_sec "$file")
+    unset -f date stat
+
+    [[ "$stamp_age" == "999999999" ]] \
+        || fail "future epoch stamp was treated as fresh: age=$stamp_age"
+    [[ "$file_age" == "999999999" ]] \
+        || fail "future file mtime was treated as fresh: age=$file_age"
+    pass "future clock state cannot suppress visibility, cache, or recovery work"
+}
+
+test_future_deadlines_do_not_suppress_recovery() {
+    reset_runtime_paths
+    printf '200\n' > "$EDGE_RECONNECT_STAMP_FILE"
+    printf '1000\t20.0.0.1\ttimeout_or_unreachable\n' > "$ROUTE_COOLDOWN_FILE"
+    printf 'last_attempt_epoch\t200\nconsecutive_failures\t1\nnext_allowed_epoch\t1000\n' > "$ROUTE_REFRESH_STATE_FILE"
+    ROUTE_FAILURE_COOLDOWN_SEC=180
+    ROUTE_REFRESH_BACKOFF_MAX_SEC=600
+    SELF_HEAL_RECONNECT_COOLDOWN_SEC=300
+    date() { printf '100\n'; }
+
+    if edge_reconnect_cooldown_active; then
+        fail "future reconnect timestamp suppressed self-heal"
+    fi
+    if route_candidate_cooldown_active 20.0.0.1; then
+        fail "far-future route cooldown suppressed a candidate after a clock rollback"
+    fi
+    route_refresh_retry_allowed \
+        || fail "far-future route backoff suppressed scanner recovery after a clock rollback"
+    unset -f date
+    pass "future deadlines cannot suppress reconnect, candidates, or route refresh"
 }
 
 test_cached_route_order_prefers_pinned_route_then_latency_without_stats() {
@@ -913,7 +988,7 @@ EOF
 test_route_preferences_clear_matching_cooldowns() {
     reset_runtime_paths
     local future
-    future=$(( $(date +%s) + 3600 ))
+    future=$(( $(date +%s) + ROUTE_FAILURE_COOLDOWN_SEC - 1 ))
 
     printf '%s\t20.0.0.9\ttimeout_or_unreachable\n' "$future" > "$ROUTE_COOLDOWN_FILE"
     add_manual_route_candidate 20.0.0.9 || fail "manual route add failed"
@@ -936,7 +1011,7 @@ test_route_health_refresh_preserves_cache_when_all_candidates_are_cooled_down() 
     PORT_DOMAIN="behavior-space-443.app.github.dev"
     ROUTE_PROBE_CONCURRENCY=2
     local future original_resolver original_probe
-    future=$(( $(date +%s) + 3600 ))
+    future=$(( $(date +%s) + ROUTE_FAILURE_COOLDOWN_SEC - 1 ))
     original_resolver="$(declare -f resolve_domain_ips_with_sources)"
     original_probe="$(declare -f xhttp_probe_metrics)"
     printf '2026-05-30T00:00:00Z\t20.0.0.1\t200\t50\ttrue\tdns\tready\n' > "$ROUTE_HEALTH_FILE"
@@ -1478,6 +1553,36 @@ JSON
     [[ "$(jq -r '.outbounds[] | select(.tag == "block") | .settings.response.type' "$CONFIG_FILE")" == "none" ]] \
         || fail "existing config migration retained an HTTP payload on the generic blackhole outbound"
     pass "existing config upgrade preserves UUID and restores safe handshake, blackhole, and WebSocket settings"
+}
+
+test_existing_xhttp_config_upgrade_accepts_all_client_modes() {
+    reset_runtime_paths
+    cat > "$CONFIG_FILE" <<'JSON'
+{
+  "dns": {"servers": ["localhost"]},
+  "policy": {"levels": {"0": {"handshake": 4}}},
+  "inbounds": [{
+    "tag": "vless-in",
+    "protocol": "vless",
+    "settings": {"clients": [{"id": "11111111-2222-4333-8444-555555555555"}]},
+    "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/", "mode": "packet-up"}},
+    "sniffing": {"enabled": true, "destOverride": ["http", "tls"]}
+  }],
+  "outbounds": [
+    {"tag": "direct", "protocol": "freedom"},
+    {"tag": "block", "protocol": "blackhole", "settings": {"response": {"type": "none"}}}
+  ],
+  "routing": {"domainStrategy": "AsIs", "rules": []}
+}
+JSON
+
+    upgrade_config_dns
+
+    [[ "$(jq -r '.inbounds[] | select(.tag == "vless-in") | .streamSettings.xhttpSettings.mode' "$CONFIG_FILE")" == "auto" ]] \
+        || fail "existing XHTTP inbound remained restricted to one client mode"
+    [[ "$(jq -r '.inbounds[] | select(.tag == "vless-in") | .settings.clients[0].id' "$CONFIG_FILE")" == "11111111-2222-4333-8444-555555555555" ]] \
+        || fail "XHTTP compatibility migration changed the active UUID"
+    pass "existing XHTTP config accepts all supported client modes without changing identity"
 }
 
 test_start_xray_restores_config_when_migrated_config_is_invalid() {
@@ -2104,7 +2209,7 @@ test_xhttp_mode_is_persistent_and_link_consistent() {
     set_xhttp_mode "stream-up" >/dev/null || fail "set_xhttp_mode did not accept stream-up"
     [[ "$(xhttp_mode_value)" == "stream-up" ]] || fail "xhttp mode was not persisted"
     generate_config >/dev/null || fail "generate_config failed with stream-up mode"
-    grep -Fq '"mode": "stream-up"' "$CONFIG_FILE" || fail "server config did not use persistent XHTTP mode"
+    grep -Fq '"mode": "auto"' "$CONFIG_FILE" || fail "server config did not accept all supported XHTTP client modes"
     grep -Fq '"168.63.129.16"' "$CONFIG_FILE" || fail "server config does not include Azure internal DNS resolver"
     grep -Fq '"network": "udp", "port": "443"' "$CONFIG_FILE" || fail "server config does not block outbound UDP/443"
     if grep -Fq '"quic"' "$CONFIG_FILE"; then
@@ -2117,7 +2222,25 @@ test_xhttp_mode_is_persistent_and_link_consistent() {
     if set_xhttp_mode "invalid-mode" >/dev/null 2>&1; then
         fail "set_xhttp_mode accepted an invalid mode"
     fi
-    pass "XHTTP mode persists and exported links match server config"
+    pass "XHTTP mode persists in links while the server accepts all supported client modes"
+}
+
+test_xhttp_mode_change_does_not_restart_auto_inbound() {
+    (
+        reset_runtime_paths
+        printf '11111111-2222-4333-8444-555555555555\n' > "$UUID_FILE"
+        cat > "$CONFIG_FILE" <<'JSON'
+{"inbounds":[{"tag":"vless-in","protocol":"vless","settings":{"clients":[{"id":"11111111-2222-4333-8444-555555555555"}]},"streamSettings":{"network":"xhttp","xhttpSettings":{"path":"/","mode":"auto"}}}]}
+JSON
+        local refreshed=0
+        refresh_config_exports() { refreshed=1; return 0; }
+        reapply_config_preserving_uuid_if_exists() { fail "auto XHTTP inbound was restarted for a link-only mode change"; }
+
+        set_xhttp_mode "stream-up" >/dev/null || fail "mode change failed with auto inbound"
+        [[ "$refreshed" == "1" ]] || fail "mode change did not refresh exported links"
+        [[ "$(xhttp_config_mode)" == "stream-up" ]] || fail "auto inbound did not export the selected client mode"
+    )
+    pass "XHTTP link mode changes do not restart an auto-mode server inbound"
 }
 
 test_generated_links_use_active_config_mode_over_env_override() {
@@ -2707,24 +2830,46 @@ test_route_wait_requires_stable_usable_probes() {
 }
 
 test_route_wait_rejects_transient_single_success() {
-    reset_runtime_paths
-    local probes_file="$TMP_ROOT/route-wait-flap-count.txt"
-    printf '0\n' > "$probes_file"
-    xhttp_probe_metrics() {
-        local probes
-        probes=$(cat "$probes_file")
-        probes=$((probes + 1))
-        printf '%s\n' "$probes" > "$probes_file"
-        case "$probes" in
-            1) printf '200 11\n' ;;
-            2) printf '404 12\n' ;;
-            3) printf '200 13\n' ;;
-            *) printf '200 14\n' ;;
-        esac
-    }
-    wait_for_xhttp_route_ready "behavior_flap" 10 >/dev/null || fail "route wait did not recover after transient success then stable success"
-    awk -F '\t' '$2 == "behavior_flap" && $3 == "ready" && $4 == "200" && $7 == "4" { found = 1 } END { exit !found }' "$ROUTE_SETTLING_HISTORY_FILE" \
-        || fail "route wait accepted a transient single 200 instead of waiting for stability"
+    (
+        reset_runtime_paths
+        local probes_file="$TMP_ROOT/route-wait-flap-count.txt"
+        local clock_file="$TMP_ROOT/route-wait-flap-clock.txt"
+        printf '0\n' > "$probes_file"
+        printf '0\n' > "$clock_file"
+        xhttp_probe_metrics() {
+            local probes
+            probes=$(cat "$probes_file")
+            probes=$((probes + 1))
+            printf '%s\n' "$probes" > "$probes_file"
+            case "$probes" in
+                1) printf '200 11\n' ;;
+                2) printf '404 12\n' ;;
+                3) printf '200 13\n' ;;
+                *) printf '200 14\n' ;;
+            esac
+        }
+        date() {
+            if [[ "${1:-}" == "+%s" ]]; then
+                local calls
+                calls=$(cat "$clock_file")
+                calls=$((calls + 1))
+                printf '%s\n' "$calls" > "$clock_file"
+                if (( calls >= 4 )); then
+                    printf '10\n'
+                else
+                    printf '0\n'
+                fi
+            else
+                command date "$@"
+            fi
+        }
+        sleep() { :; }
+        ensure_codespace_port_public() { return 0; }
+        wait_for_xhttp_route_ready "behavior_flap" 10 >/dev/null \
+            || fail "route wait did not confirm a recovery that began at the timeout boundary"
+        awk -F '\t' '$2 == "behavior_flap" && $3 == "ready" && $4 == "200" && $7 == "4" { found = 1 } END { exit !found }' "$ROUTE_SETTLING_HISTORY_FILE" \
+            || fail "route wait accepted a transient single 200 instead of waiting for stability"
+    )
     pass "route wait rejects transient single success"
 }
 
@@ -3777,6 +3922,10 @@ test_route_failure_reason_classifier
 test_edge_origin_errors_enter_candidate_cooldown
 test_xhttp_external_probe_uses_strict_tls_by_default
 test_xhttp_probe_metrics_reports_curl_failure_reason
+test_xhttp_options_requires_handler_success
+test_legacy_http_400_cache_rows_are_never_exported
+test_future_state_timestamps_are_treated_as_stale
+test_future_deadlines_do_not_suppress_recovery
 test_cached_route_order_prefers_pinned_route_then_latency_without_stats
 test_route_monitor_default_and_hard_cap_are_wide_but_bounded
 test_blacklisted_route_is_excluded_from_cached_exports
@@ -3825,6 +3974,7 @@ test_generate_config_replaces_stale_no_config_boot_status
 test_generate_config_keeps_success_when_boot_status_write_fails
 test_generated_and_upgraded_configs_do_not_block_page_assets_as_ads
 test_existing_config_upgrade_preserves_uuid_and_safe_handshake_floor
+test_existing_xhttp_config_upgrade_accepts_all_client_modes
 test_start_xray_restores_config_when_migrated_config_is_invalid
 test_start_xray_restores_config_when_previous_engine_cannot_stop
 test_start_xray_cleans_up_when_pid_state_cannot_be_committed
@@ -3850,6 +4000,7 @@ test_refresh_config_exports_updates_input_hash_after_direct_refresh
 test_force_reconnect_skips_restart_when_identity_unknown
 test_generated_links_follow_configured_xhttp_path
 test_xhttp_mode_is_persistent_and_link_consistent
+test_xhttp_mode_change_does_not_restart_auto_inbound
 test_generated_links_use_active_config_mode_over_env_override
 test_custom_xhttp_extra_json_is_validated
 test_websocket_fallback_is_advanced_opt_in

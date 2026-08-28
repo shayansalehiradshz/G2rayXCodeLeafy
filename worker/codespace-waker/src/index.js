@@ -1853,7 +1853,9 @@ function codespacesForwardingDomain(env = {}) {
 }
 
 function isRouteStatusUsable(status) {
-  return status === 200 || status === 400;
+  // The pinned Xray XHTTP handler returns 200 for OPTIONS before parsing a
+  // tunnel request. HTTP 400 is an error/generic edge response, not readiness.
+  return status === 200;
 }
 
 function routeFailureReason(status, error) {

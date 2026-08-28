@@ -452,11 +452,19 @@ xhttp_mode_value() {
 }
 
 set_xhttp_mode() {
-    local mode="${1:-}"
+    local mode="${1:-}" active_mode=""
     valid_xhttp_mode "$mode" || return 1
     _atomic_write "$XHTTP_MODE_FILE" "$mode" || return 1
     log_event INFO "xhttp_mode preference set mode=${mode}"
-    reapply_config_preserving_uuid_if_exists
+    active_mode=$(xhttp_active_inbound_mode)
+    if [[ -s "$CONFIG_FILE" && "$active_mode" != "auto" ]]; then
+        # Migrate an older mode-restricted inbound once. Current configs accept
+        # every supported client mode, so later link-mode changes need no
+        # disruptive Xray restart.
+        reapply_config_preserving_uuid_if_exists
+    else
+        refresh_config_exports >/dev/null 2>&1 || true
+    fi
 }
 
 xhttp_mode_summary() {
@@ -475,8 +483,9 @@ show_xhttp_mode_manager() {
     local choice mode
     while true; do
         refresh_screen
-        echo -e "  ${GREEN}XHTTP Mode${NC}\n"
+        echo -e "  ${GREEN}XHTTP Client Link Mode${NC}\n"
         echo -e "  Current : ${WHITE}$(xhttp_mode_summary)${NC}\n"
+        echo -e "  ${DIM}The server accepts all supported modes; this controls newly exported links.${NC}\n"
         echo -e "  ${RED}1)${NC} packet-up  ${DIM}Best default behind GitHub/Codespaces HTTP edge${NC}"
         echo -e "  ${RED}2)${NC} stream-up  ${DIM}Experimental; test for upload/browsing behavior${NC}"
         echo -e "  ${RED}3)${NC} stream-one ${DIM}Experimental; most picky through reverse proxies${NC}"
@@ -494,7 +503,7 @@ show_xhttp_mode_manager() {
         esac
         if set_xhttp_mode "$mode"; then
             echo -e "\n  ${GREEN}XHTTP mode saved: ${mode}.${NC}"
-            echo -e "  ${DIM}Existing UUID is preserved; regenerate/view configs to copy matching links.${NC}"
+            echo -e "  ${DIM}Existing UUID is preserved. A current auto-mode server stays connected; view configs to copy matching links.${NC}"
         else
             echo -e "\n  ${RED}Could not save XHTTP mode.${NC}"
         fi
@@ -1312,7 +1321,7 @@ xhttp_config_path() {
     printf '/'
 }
 
-xhttp_config_mode() {
+xhttp_active_inbound_mode() {
     local mode=""
     if [[ -f "$CONFIG_FILE" ]] && command -v jq >/dev/null 2>&1; then
         mode=$(jq -r '.inbounds[]? | select(.tag=="vless-in") | .streamSettings.xhttpSettings.mode // empty' "$CONFIG_FILE" 2>/dev/null \
@@ -1320,6 +1329,17 @@ xhttp_config_mode() {
     fi
     if valid_xhttp_mode "$mode"; then
         printf '%s' "$mode"
+    fi
+}
+
+xhttp_config_mode() {
+    local active_mode
+    active_mode=$(xhttp_active_inbound_mode)
+    # New server configs use auto so one healthy inbound can accept every
+    # supported client mode. Keep old restricted configs link-consistent until
+    # they are regenerated, then export the user's panel preference.
+    if [[ -n "$active_mode" && "$active_mode" != "auto" ]]; then
+        printf '%s' "$active_mode"
         return 0
     fi
     xhttp_mode_value
@@ -1378,7 +1398,9 @@ xhttp_probe_status() {
 
 xhttp_status_usable() {
     local code="${1:-0}"
-    [[ "$code" == "200" || "$code" == "400" ]]
+    # The pinned Xray XHTTP handler answers OPTIONS with 200 before parsing a
+    # tunnel request. A 400 therefore proves an error path, not readiness.
+    [[ "$code" == "200" ]]
 }
 
 panel_next_action_code() {
@@ -1439,12 +1461,11 @@ reset_edge_bad_count() {
 }
 
 edge_reconnect_cooldown_active() {
-    local now last cooldown="$SELF_HEAL_RECONNECT_COOLDOWN_SEC"
+    local age cooldown="$SELF_HEAL_RECONNECT_COOLDOWN_SEC"
     [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=300
-    last=$(cat "$EDGE_RECONNECT_STAMP_FILE" 2>/dev/null || echo 0)
-    [[ "$last" =~ ^[0-9]+$ ]] || last=0
-    now=$(date +%s)
-    (( now - last < cooldown ))
+    age=$(stamp_age_sec "$EDGE_RECONNECT_STAMP_FILE")
+    [[ "$age" =~ ^[0-9]+$ ]] || age=999999999
+    (( age < cooldown ))
 }
 
 mark_edge_reconnect_attempt() {
@@ -1563,7 +1584,7 @@ blacklisted_route_candidates() {
 
 cached_route_candidate_ips() {
     [[ -s "$ROUTE_HEALTH_FILE" ]] || return 0
-    awk -F '\t' 'NF >= 5 && $5 == "true" {print $2}' "$ROUTE_HEALTH_FILE" 2>/dev/null \
+    awk -F '\t' 'NF >= 5 && $3 == "200" && $5 == "true" {print $2}' "$ROUTE_HEALTH_FILE" 2>/dev/null \
         | while IFS= read -r ip; do
             valid_ipv4 "$ip" && printf '%s\n' "$ip"
         done
@@ -2342,7 +2363,8 @@ stamp_age_sec() {
     [[ -f "$file" ]] || { printf '999999999'; return 0; }
     now=$(date +%s 2>/dev/null || printf '0')
     stamp=$(cat "$file" 2>/dev/null || printf '0')
-    [[ "$stamp" =~ ^[0-9]+$ ]] || stamp=0
+    [[ "$now" =~ ^[0-9]+$ && "$stamp" =~ ^[0-9]+$ && "$now" -ge "$stamp" ]] \
+        || { printf '999999999'; return 0; }
     printf '%s' "$(( now - stamp ))"
 }
 
@@ -2351,7 +2373,8 @@ file_age_sec() {
     [[ -f "$file" ]] || { printf '999999999'; return 0; }
     now=$(date +%s 2>/dev/null || printf '0')
     mtime=$(stat -c %Y "$file" 2>/dev/null || printf '0')
-    [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
+    [[ "$now" =~ ^[0-9]+$ && "$mtime" =~ ^[0-9]+$ && "$now" -ge "$mtime" ]] \
+        || { printf '999999999'; return 0; }
     printf '%s' "$(( now - mtime ))"
 }
 
@@ -2517,7 +2540,11 @@ wait_for_xhttp_route_ready() {
         else
             stable=0
         fi
-        (( elapsed >= max_wait )) && break
+        # If the first healthy probe arrives exactly at the deadline, allow the
+        # bounded confirmation sequence to finish. Otherwise a recovering route
+        # can be reported as timed out solely because the scheduler woke us late.
+        # Any following failure resets stable to zero and exits immediately.
+        (( elapsed >= max_wait && stable == 0 )) && break
         if (( attempt == 1 )); then
             ensure_codespace_port_public >/dev/null 2>&1 || true
         elif (( attempt % 5 == 0 )) && mark_route_repair_attempt_if_allowed; then
@@ -2957,6 +2984,7 @@ upgrade_config_dns() {
             end
         )
       | (.inbounds[]? | select(.sniffing? and .sniffing.destOverride?) | .sniffing.destOverride) |= (map(select(. != "quic")))
+      | (.inbounds[]? | select(.tag == "vless-in" and .streamSettings.xhttpSettings?) | .streamSettings.xhttpSettings.mode) = "auto"
       | (.inbounds[]? | select(.tag == "vless-ws" and .streamSettings.wsSettings?) | .streamSettings.wsSettings.heartbeatPeriod) = $ws_heartbeat
       | (.outbounds[]? | select(.protocol == "blackhole") | .settings.response.type) = "none"
       | (.policy.levels["0"].handshake) |=
@@ -3735,7 +3763,7 @@ _generate_config_impl() {
         }
         had_previous_config=true
     fi
-    local profile_name handshake conn_idle uplink_only downlink_only buffer_size sniff_quic loglevel sniff_dest key value xhttp_mode
+    local profile_name handshake conn_idle uplink_only downlink_only buffer_size sniff_quic loglevel sniff_dest key value xhttp_export_mode xhttp_accept_mode
     while IFS='=' read -r key value; do
         case "$key" in
             name) profile_name="$value" ;;
@@ -3758,7 +3786,11 @@ _generate_config_impl() {
     loglevel="${loglevel:-warning}"
     sniff_dest='["http", "tls"]'
     [[ "$sniff_quic" == "true" ]] && sniff_dest='["http", "tls", "quic"]'
-    xhttp_mode=$(xhttp_mode_value)
+    xhttp_export_mode=$(xhttp_mode_value)
+    # The pinned Xray server accepts packet-up, stream-up, and stream-one when
+    # its inbound mode is auto. Client links still use the explicit panel
+    # preference, preserving a conservative packet-up default.
+    xhttp_accept_mode="auto"
     # Outbound socket options: TCP keepalive always (keep origin connections warm
     # and detect dead peers), plus TCP Fast Open when the kernel supports it.
     local direct_sockopt tfo_state="off" sockopt_inner
@@ -3790,7 +3822,7 @@ JSONEOF
 )
     fi
     local uuid_hash; uuid_hash=$(fingerprint_secret "$uuid")
-    log_event INFO "generate_config uuid_hash=${uuid_hash} port=${XRAY_PORT} domain=${PORT_DOMAIN} profile=${profile_name} xhttp_mode=${xhttp_mode} tcp_fast_open=${tfo_state}"
+    log_event INFO "generate_config uuid_hash=${uuid_hash} port=${XRAY_PORT} domain=${PORT_DOMAIN} profile=${profile_name} xhttp_accept_mode=${xhttp_accept_mode} xhttp_export_mode=${xhttp_export_mode} tcp_fast_open=${tfo_state}"
     candidate_config=$(mktemp "${CONFIG_FILE}.candidate.XXXXXX.json") || {
         rm -f "$previous_config" 2>/dev/null || true
         return 1
@@ -3823,7 +3855,7 @@ JSONEOF
       },
       "streamSettings": {
         "network": "xhttp", "security": "none",
-        "xhttpSettings": { "mode": "${xhttp_mode}", "path": "/" },
+        "xhttpSettings": { "mode": "${xhttp_accept_mode}", "path": "/" },
         "sockopt": { "tcpKeepAliveInterval": ${TCP_KEEPALIVE_INTERVAL_SEC}, "tcpKeepAliveIdle": ${TCP_KEEPALIVE_IDLE_SEC} }
       },
       "sniffing": { "enabled": true, "destOverride": ${sniff_dest}, "routeOnly": false }
@@ -4200,12 +4232,15 @@ route_failure_reason_for_status() {
 }
 
 route_candidate_cooldown_active() {
-    local ip="$1" now until reason
+    local ip="$1" now until reason ttl remaining
     [[ -s "$ROUTE_COOLDOWN_FILE" ]] || return 1
     now=$(date +%s)
+    ttl="$ROUTE_FAILURE_COOLDOWN_SEC"
+    [[ "$ttl" =~ ^[0-9]+$ && "$ttl" -gt 0 ]] || ttl=180
     while IFS=$'\t' read -r until _ip reason; do
         [[ "$_ip" == "$ip" && "$until" =~ ^[0-9]+$ ]] || continue
-        if (( now < until )); then
+        remaining=$((until - now))
+        if (( remaining > 0 && remaining <= ttl )); then
             return 0
         fi
     done < "$ROUTE_COOLDOWN_FILE"
@@ -4454,11 +4489,14 @@ route_refresh_state_value() {
 }
 
 route_refresh_retry_allowed() {
-    local next now
+    local next now remaining max_delay
     next=$(route_refresh_state_value next_allowed_epoch)
     [[ "$next" =~ ^[0-9]+$ ]] || return 0
     now=$(date +%s)
-    (( now >= next ))
+    max_delay="$ROUTE_REFRESH_BACKOFF_MAX_SEC"
+    [[ "$max_delay" =~ ^[0-9]+$ && "$max_delay" -gt 0 ]] || max_delay=600
+    remaining=$((next - now))
+    (( remaining <= 0 || remaining > max_delay ))
 }
 
 route_refresh_record_success() {
@@ -4572,7 +4610,7 @@ _refresh_route_candidate_health_impl() {
         return 0
     fi
     if [[ -z "$best_ip" && -s "$ROUTE_HEALTH_FILE" ]] \
-        && awk -F '\t' '$5 == "true" { found=1 } END { exit found ? 0 : 1 }' "$ROUTE_HEALTH_FILE" 2>/dev/null; then
+        && awk -F '\t' '$3 == "200" && $5 == "true" { found=1 } END { exit found ? 0 : 1 }' "$ROUTE_HEALTH_FILE" 2>/dev/null; then
         rm -f "$route_health_tmp" 2>/dev/null || true
         log_event WARN "route_candidate_monitor all_unusable_preserved_cache count=${count} max=${max}"
         route_refresh_record_failure
@@ -4603,7 +4641,7 @@ refresh_route_candidate_health() {
 route_health_cache_fresh() {
     local age
     [[ -s "$ROUTE_HEALTH_FILE" ]] || return 1
-    awk -F '\t' '$5 == "true" { found=1; exit } END { exit found ? 0 : 1 }' "$ROUTE_HEALTH_FILE" 2>/dev/null || return 1
+    awk -F '\t' '$3 == "200" && $5 == "true" { found=1; exit } END { exit found ? 0 : 1 }' "$ROUTE_HEALTH_FILE" 2>/dev/null || return 1
     age=$(file_age_sec "$ROUTE_HEALTH_FILE")
     [[ "$ROUTE_HEALTH_TTL_SEC" =~ ^[0-9]+$ ]] || ROUTE_HEALTH_TTL_SEC=300
     (( age <= ROUTE_HEALTH_TTL_SEC ))
@@ -4612,7 +4650,7 @@ route_health_cache_fresh() {
 route_health_cache_exportable() {
     local age
     [[ -s "$ROUTE_HEALTH_FILE" ]] || return 1
-    awk -F '\t' '$5 == "true" { found=1; exit } END { exit found ? 0 : 1 }' "$ROUTE_HEALTH_FILE" 2>/dev/null || return 1
+    awk -F '\t' '$3 == "200" && $5 == "true" { found=1; exit } END { exit found ? 0 : 1 }' "$ROUTE_HEALTH_FILE" 2>/dev/null || return 1
     age=$(file_age_sec "$ROUTE_HEALTH_FILE")
     [[ "$ROUTE_HEALTH_EXPORT_MAX_AGE_SEC" =~ ^[0-9]+$ ]] || ROUTE_HEALTH_EXPORT_MAX_AGE_SEC=21600
     (( age <= ROUTE_HEALTH_EXPORT_MAX_AGE_SEC ))
@@ -4676,7 +4714,7 @@ cached_usable_fallback_ips() {
             }
             next
         }
-        NF >= 5 && $5 == "true" {
+        NF >= 5 && $3 == "200" && $5 == "true" {
             ip = $2
             latency = ($4 ~ /^[0-9]+$/) ? $4 + 0 : 99999999
             total = ((ip in samples) && samples[ip] > 0) ? samples[ip] : 1
@@ -4756,10 +4794,11 @@ route_candidate_health_summary() {
         }
         NF >= 5 {
             ip = $2
-            usable_rank = ($5 == "true") ? 0 : 1
+            record_usable = ($3 == "200" && $5 == "true")
+            usable_rank = record_usable ? 0 : 1
             latency = ($4 ~ /^[0-9]+$/) ? $4 + 0 : 99999999
             total = ((ip in samples) && samples[ip] > 0) ? samples[ip] : 1
-            ok = (ip in successes) ? successes[ip] : (($5 == "true") ? 1 : 0)
+            ok = (ip in successes) ? successes[ip] : (record_usable ? 1 : 0)
             recent = (ip in recent_failures) ? recent_failures[ip] : 0
             success_penalty = int(((total - ok) * 1000) / total) + (recent * 75)
             confidence = (total >= 10 && ok >= total * 0.95) ? "high" : ((total >= 5 && ok >= total * 0.80) ? "medium" : "provisional")
@@ -4771,7 +4810,7 @@ route_candidate_health_summary() {
             source = (NF >= 6 && $6 != "") ? $6 : "unknown"
             reason = (NF >= 7 && $7 != "") ? $7 : ((ip in last_reason) ? last_reason[ip] : "unknown")
             line = sprintf("%-15s HTTP %-3s last=%sms avg=%sms success=%s/%s recent=%sms recent_fail=%s confidence=%s usable=%s source=%s reason=%s",
-                ip, $3, last_ms, avg_ms, ok, total, score_ms, recent, confidence, $5, source, reason)
+                ip, $3, last_ms, avg_ms, ok, total, score_ms, recent, confidence, record_usable ? "true" : "false", source, reason)
             printf "%d\t%d\t%08d\t%08d\t%04d\t%08d\t%s\t%s\n",
                 pinned_rank, usable_rank, route_score, score_ms, success_penalty, last_ms, ip, line
         }
@@ -6603,7 +6642,7 @@ while true; do
     echo -e "  ${RED}18)${NC} Toggle Low-Overhead Mode ($(echo -e "$_LOW_LABEL"))"
     echo -e "  ${RED}19)${NC} Toggle WebSocket Fallback ($(echo -e "$_WS_LABEL"))"
     echo -e "  ${RED}20)${NC} Cloudflare WS Front ($(echo -e "$_WS_FRONT_LABEL"))"
-    echo -e "  ${RED}21)${NC} XHTTP Mode ($(echo -e "$_XHTTP_MODE_LABEL"))"
+    echo -e "  ${RED}21)${NC} XHTTP Link Mode ($(echo -e "$_XHTTP_MODE_LABEL"))"
     echo -e "  ${RED}49)${NC} Toggle Latency Focus Mode ($(echo -e "$_LATENCY_LABEL"))"
     echo ""
     echo -e "  ${WHITE}${B}● ANALYTICS & TOOLS${NC}"

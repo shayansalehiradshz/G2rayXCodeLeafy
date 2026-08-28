@@ -1069,7 +1069,7 @@ async function testWakeFailureIncludesNextAction() {
   console.log("PASS: Worker wake failures include actionable next_action");
 }
 
-async function testHealthTreatsHttp400RouteAsUsable() {
+async function testHealthRejectsHttp400RouteAsUnusable() {
   globalThis.fetch = async (input) => {
     const url = String(input);
     if (url.includes("api.github.com")) {
@@ -1094,11 +1094,11 @@ async function testHealthTreatsHttp400RouteAsUsable() {
   const response = await worker.fetch(makeRequest("/api/health"), baseEnv(), {});
   const body = await responseJson(response);
   assert.equal(response.status, 200);
-  assert.equal(body.route_ready, true);
+  assert.equal(body.route_ready, false);
   assert.equal(body.route_probe.http_status, 400);
-  assert.equal(body.next_action_code, "retry_vless_config");
-  assert.equal(body.message, "Codespace is available and the XHTTP route is usable.");
-  console.log("PASS: Worker route readiness matches panel HTTP 400/200 semantics");
+  assert.equal(body.next_action_code, "inspect_panel_diagnostics");
+  assert.equal(body.message, "Codespace status loaded, but the XHTTP route is not usable yet.");
+  console.log("PASS: Worker rejects HTTP 400 because the pinned XHTTP OPTIONS handler succeeds with 200");
 }
 
 async function testOptionalPortCannotMasqueradeAsPrimaryXhttpReadiness() {
@@ -2247,7 +2247,7 @@ try {
   await testScheduledQuotaCronRetriesAfterResetIfPreResetWakeStillBlocked();
   await testScheduledQuotaCronKeepsRetryingAfterResetWhileStillBlocked();
   await testWakeFailureIncludesNextAction();
-  await testHealthTreatsHttp400RouteAsUsable();
+  await testHealthRejectsHttp400RouteAsUnusable();
   await testOptionalPortCannotMasqueradeAsPrimaryXhttpReadiness();
   await testWakeRequiresStableRouteReadiness();
   await testHealthWaitsBetweenStableRouteProbes();

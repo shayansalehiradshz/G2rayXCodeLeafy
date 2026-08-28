@@ -1029,8 +1029,8 @@ test_worker_dashboard_and_history_features() {
         || fail 'Worker cold wake still holds the mobile request open for GitHub state polling'
     grep_fixed 'isRouteStatusUsable(res.status)' "$WORKER_SCRIPT" \
         || fail 'Worker route readiness does not share the panel status classifier'
-    grep_fixed 'return status === 200 || status === 400;' "$WORKER_SCRIPT" \
-        || fail 'Worker route readiness does not treat HTTP 400 as usable like the panel'
+    grep_fixed 'return status === 200;' "$WORKER_SCRIPT" \
+        || fail 'Worker route readiness does not require the pinned XHTTP OPTIONS handler success response'
     grep_fixed 'next_action' "$WORKER_SCRIPT" \
         || fail 'Worker API does not return a concrete next action when route is not ready'
     grep_fixed 'next_action_code' "$WORKER_SCRIPT" \
@@ -1921,8 +1921,8 @@ test_xhttp_route_settling_is_observable() {
         || fail 'script does not provide a dedicated XHTTP edge probe'
     grep_fixed 'xhttp_status_usable()' "$SCRIPT" \
         || fail 'script does not classify XHTTP probe status codes'
-    grep_fixed '[[ "$code" == "200" || "$code" == "400" ]]' "$SCRIPT" \
-        || fail 'HTTP 404 is still treated as a usable XHTTP route'
+    grep_fixed '[[ "$code" == "200" ]]' "$SCRIPT" \
+        || fail 'XHTTP readiness does not require the pinned OPTIONS handler success response'
     grep_fixed 'xhttp_route_usable=' "$SCRIPT" \
         || fail 'health/reconnect logs do not expose XHTTP route usability'
     grep_fixed 'repair_codespace_port_route()' "$SCRIPT" \

@@ -163,7 +163,7 @@ For automation that only needs GitHub state and wants to avoid an external route
 ## Expected Responses
 
 - `200` with `ok: true`: GitHub accepted or handled the start request.
-- `route_ready: true`: the XHTTP route returned HTTP `200` or `400` during the Worker wait window, matching the panel's route-readiness classifier.
+- `route_ready: true`: the XHTTP route returned HTTP `200` during the Worker wait window, matching the pinned Xray handler's successful `OPTIONS` response and the panel classifier. HTTP `400` is treated as an error, not readiness.
 - `route_ready: false` with HTTP `404`: the Codespace started, but the GitHub route has not settled yet.
 - `route_ready: false` with HTTP `0`: DNS, TLS, or the app route did not answer before the Worker timeout.
 - `route_failure_reason`: machine-readable route reason such as `route_settling_404`, `timeout_or_unreachable`, `dns_tls_or_network_unreachable`, `edge_or_origin_error`, or `ready`.
