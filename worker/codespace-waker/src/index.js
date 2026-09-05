@@ -625,7 +625,24 @@ function failedAuthKey(request) {
   const ip = request.headers.get("cf-connecting-ip")
     || request.headers.get("x-forwarded-for")
     || "unknown";
-  return FAILED_AUTH_KEY_PREFIX + encodeURIComponent(String(ip).split(",")[0].trim() || "unknown");
+  let identity = String(ip).split(",")[0].trim() || "unknown";
+  if (identity.includes(":")) {
+    try {
+      // URL validates and canonicalizes IPv6 before grouping rotating interface
+      // addresses. This bounds one subnet's KV writes, not a distributed attack.
+      const canonical = new URL(`http://[${identity}]/`).hostname.slice(1, -1);
+      const [left, right = ""] = canonical.split("::");
+      const head = left ? left.split(":") : [];
+      const tail = right ? right.split(":") : [];
+      const groups = canonical.includes("::")
+        ? [...head, ...Array(8 - head.length - tail.length).fill("0"), ...tail]
+        : head;
+      identity = groups.slice(0, 4).join(":") + "::/64";
+    } catch {
+      identity = "unknown";
+    }
+  }
+  return FAILED_AUTH_KEY_PREFIX + encodeURIComponent(identity);
 }
 
 async function secretsEqual(supplied, expected) {
@@ -648,12 +665,14 @@ async function sha256Hex(value) {
 
 async function startCodespaceData(name, token, env, priorStatus = null, routePorts = [codespacePort(env)]) {
   const endpoint = `https://api.github.com/user/codespaces/${encodeURIComponent(name)}/start`;
-  let res;
+  let res, body;
   try {
-    res = await githubFetchWithRetry(endpoint, {
+    const result = await githubFetchWithRetry(endpoint, {
       method: "POST",
       headers: githubHeaders(token)
     }, FETCH_TIMEOUT_MS, env);
+    res = result.response;
+    body = parseBody(result.text);
   } catch (error) {
     return {
       ok: false,
@@ -664,9 +683,6 @@ async function startCodespaceData(name, token, env, priorStatus = null, routePor
       message: "GitHub start API did not answer before the timeout."
     };
   }
-
-  const text = await res.text();
-  const body = parseBody(text);
 
   const githubFailure = githubFailureForResponse(res, body, name);
   if (githubFailure) {
@@ -748,12 +764,14 @@ async function startCodespaceData(name, token, env, priorStatus = null, routePor
 
 async function getCodespaceStatus(codespaceName, token, env) {
   const endpoint = `https://api.github.com/user/codespaces/${encodeURIComponent(codespaceName)}`;
-  let res;
+  let res, body;
   try {
-    res = await githubFetchWithRetry(endpoint, {
+    const result = await githubFetchWithRetry(endpoint, {
       method: "GET",
       headers: githubHeaders(token)
     }, FETCH_TIMEOUT_MS, env);
+    res = result.response;
+    body = parseBody(result.text);
   } catch (error) {
     return {
       ok: false,
@@ -764,8 +782,6 @@ async function getCodespaceStatus(codespaceName, token, env) {
       message: "GitHub status API did not answer before the timeout."
     };
   }
-
-  const body = parseBody(await res.text());
 
   const githubFailure = githubFailureForResponse(res, body, codespaceName);
   if (githubFailure) return githubFailure;
@@ -1283,7 +1299,7 @@ function shouldStoreHistoryEvent(env, event, existing) {
   return eventTs - previousTs >= sampleMs;
 }
 
-async function recordQuotaIncident(env, event, data) {
+async function recordQuotaIncident(env, event, data, cronFields = null) {
   if (!env.WAKER_KV) return { recorded: false, incident: null };
   try {
     const nowIso = currentDate(env).toISOString();
@@ -1300,7 +1316,8 @@ async function recordQuotaIncident(env, event, data) {
       quota_reset_estimate_utc: quotaResetEstimate,
       retention_period_minutes: data.retention_period_minutes ?? existing.retention_period_minutes ?? null,
       retention_expires_at: data.retention_expires_at || existing.retention_expires_at || null,
-      retention_risk: data.retention_risk || existing.retention_risk || "unknown"
+      retention_risk: data.retention_risk || existing.retention_risk || "unknown",
+      ...cronFields
     };
 
     if (data.quota_blocked) {
@@ -1310,13 +1327,14 @@ async function recordQuotaIncident(env, event, data) {
       incident.same_codespace_exists = data.reason === "codespace_not_found_or_token_cannot_access_it" ? false : true;
     } else if (data.ok) {
       incident.same_codespace_exists = true;
-      if (event.kind === "wake" || event.kind === "cron_wake") {
+      if ((event.kind === "wake" || event.kind === "cron_wake") && data.start_accepted === true) {
         incident.last_successful_start_at = nowIso;
       }
       if (event.kind === "health" || event.kind === "cron_health") {
         incident.last_successful_health_at = nowIso;
       }
-      const isWakeRecovery = event.kind === "wake" || event.kind === "cron_wake";
+      const isWakeRecovery = (event.kind === "wake" || event.kind === "cron_wake") &&
+        (data.start_accepted === true || data.route_ready === true);
       const resetMs = Date.parse(incident.quota_reset_estimate_utc || "");
       const nowMs = Date.parse(nowIso);
       const resetHasPassed = !Number.isFinite(resetMs) || (Number.isFinite(nowMs) && nowMs >= resetMs);
@@ -1346,6 +1364,7 @@ async function recordQuotaIncident(env, event, data) {
 
 function shouldWriteQuotaIncident(env, existing, incident, nowIso) {
   if (!existing || Object.keys(existing).length === 0) return true;
+  if (!existing.last_successful_start_at && incident.last_successful_start_at) return true;
 
   const stateFields = [
     "codespace",
@@ -1356,7 +1375,9 @@ function shouldWriteQuotaIncident(env, existing, incident, nowIso) {
     "quota_drought_active",
     "same_codespace_exists",
     "first_quota_blocked_at",
-    "last_successful_start_at"
+    "last_cron_check_at",
+    "last_cron_wake_at",
+    "last_cron_post_reset_wake_at"
   ];
   if (stateFields.some((field) => existing[field] !== incident[field])) return true;
 
@@ -1443,20 +1464,19 @@ async function handleQuotaSurvivalCron(controller, env) {
     ...event,
     history_recorded_at: now.toISOString()
   });
-  const result = await recordQuotaIncident(env, event, data);
-  if (result.incident) {
-    result.incident.last_cron_check_at = now.toISOString();
-    if (nearReset) {
-      if (quotaCronPostReset(incident, now)) {
-        result.incident.last_cron_post_reset_wake_at = now.toISOString();
-        result.incident.last_cron_post_reset_wake_reset_estimate_utc = incident.quota_reset_estimate_utc || null;
-      } else {
-        result.incident.last_cron_wake_at = now.toISOString();
-        result.incident.last_cron_wake_reset_estimate_utc = incident.quota_reset_estimate_utc || null;
-      }
+  const cronFields = { last_cron_check_at: now.toISOString() };
+  if (nearReset) {
+    if (quotaCronPostReset(incident, now)) {
+      cronFields.last_cron_post_reset_wake_at = now.toISOString();
+      cronFields.last_cron_post_reset_wake_reset_estimate_utc = incident.quota_reset_estimate_utc || null;
+    } else {
+      cronFields.last_cron_wake_at = now.toISOString();
+      cronFields.last_cron_wake_reset_estimate_utc = incident.quota_reset_estimate_utc || null;
     }
-    await env.WAKER_KV.put(quotaIncidentKey(codespaceName), JSON.stringify(result.incident));
   }
+  // Persist the observation and scheduler stamps together: one write per key,
+  // also avoiding KV's one-write-per-second same-key limit.
+  await recordQuotaIncident(env, event, data, cronFields);
   return { ok: true, near_reset: nearReset, quota_blocked: data.quota_blocked === true };
 }
 
@@ -1681,8 +1701,10 @@ function configuredCooldownSeconds(env, name, fallback, max) {
 
 async function probeCodespaceRoutes(name, routePorts, env, options = {}) {
   const ports = normalizeRoutePorts(routePorts);
-  const probes = await Promise.all(ports.map(async (port) => {
-    const probe = options.stable === false
+  const probes = await Promise.all(ports.map(async (port, index) => {
+    // Only the primary XHTTP route gates readiness. An optional WS endpoint
+    // cannot pass OPTIONS, so do not spend a full settling loop on it.
+    const probe = options.stable === false || index > 0
       ? await probeXhttpRoute(name, port, 1, Date.now(), env)
       : await waitForXhttpRoute(name, port, env);
     return { ...probe, port };
@@ -1768,7 +1790,7 @@ async function probeXhttpRoute(name, port, attempts = 1, startedAt = Date.now(),
       attempts,
       waited_ms: Date.now() - startedAt,
       error: null,
-      route_failure_reason: routeFailureReason(res.status, null)
+      route_failure_reason: routeFailureReason(res.status, null, res.headers.get("location"))
     };
   } catch (error) {
     const reason = routeFailureReason(0, error);
@@ -1785,14 +1807,20 @@ async function probeXhttpRoute(name, port, attempts = 1, startedAt = Date.now(),
   }
 }
 
-async function fetchWithTimeout(input, init = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+async function fetchWithTimeout(input, init = {}, timeoutMs = FETCH_TIMEOUT_MS, consumeResponse = null) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(input, {
+    const response = await fetch(input, {
       ...init,
       signal: controller.signal
     });
+    // Keep the deadline alive through GitHub's body read. A response header
+    // alone does not complete an API request. Status-only probes discard the
+    // unused body so redirects/errors do not retain Worker connection slots.
+    if (consumeResponse) return await consumeResponse(response);
+    try { await response.body?.cancel(); } catch {}
+    return response;
   } finally {
     clearTimeout(timer);
   }
@@ -1803,17 +1831,18 @@ async function githubFetchWithRetry(input, init = {}, timeoutMs = FETCH_TIMEOUT_
   let lastError = null;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      const response = await fetchWithTimeout(input, init, timeoutMs);
-      if (attempt < attempts && shouldRetryGithubResponse(response)) {
-        try {
-          await response.body?.cancel();
-        } catch {
-          // The response is being discarded either way; retry remains useful.
+      const result = await fetchWithTimeout(input, init, timeoutMs, async (response) => {
+        if (attempt < attempts && shouldRetryGithubResponse(response)) {
+          try { await response.body?.cancel(); } catch {}
+          return { response, text: "" };
         }
+        return { response, text: await response.text() };
+      });
+      if (attempt < attempts && shouldRetryGithubResponse(result.response)) {
         await sleep(githubRetryDelayMs(env, attempt));
         continue;
       }
-      return response;
+      return result;
     } catch (error) {
       lastError = error;
       if (attempt >= attempts) break;
@@ -1858,7 +1887,7 @@ function isRouteStatusUsable(status) {
   return status === 200;
 }
 
-function routeFailureReason(status, error) {
+function routeFailureReason(status, error, location = null) {
   if (isRouteStatusUsable(status)) return "ready";
   if (status === 404) return "route_settling_404";
   if (status === 0) {
@@ -1868,6 +1897,16 @@ function routeFailureReason(status, error) {
   }
   if (status >= 500) return "edge_or_origin_error";
   if (status === 401 || status === 403) return "auth_or_visibility_blocked";
+  if (status >= 300 && status < 400) {
+    try {
+      const target = new URL(location);
+      if (target.protocol === "https:" && target.hostname === "github.com" &&
+          (target.pathname === "/login" || target.pathname.startsWith("/login/"))) {
+        return "auth_or_visibility_blocked";
+      }
+    } catch {}
+    return "unexpected_redirect";
+  }
   return "unexpected_http_status";
 }
 

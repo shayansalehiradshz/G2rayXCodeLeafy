@@ -21,6 +21,7 @@ function makeRequest(path, secret = "secret", body = undefined) {
 function makeKv() {
   const store = new Map();
   const putOptions = new Map();
+  const writesByKey = new Map();
   let putCalls = 0;
   return {
     async get(key) {
@@ -28,11 +29,15 @@ function makeKv() {
     },
     async put(key, value, options = undefined) {
       putCalls += 1;
+      writesByKey.set(key, (writesByKey.get(key) || 0) + 1);
       store.set(key, value);
       putOptions.set(key, options || null);
     },
     putCallCount() {
       return putCalls;
+    },
+    writesFor(key) {
+      return writesByKey.get(key) || 0;
     },
     dump() {
       return Object.fromEntries(store.entries());
@@ -61,6 +66,47 @@ async function responseJson(response) {
   return JSON.parse(await response.text());
 }
 
+async function testGithubBodyTimeoutIsBounded(path = "/api/health") {
+  const originalSetTimeout = globalThis.setTimeout;
+  const pendingStreams = [];
+  let deadline;
+  globalThis.setTimeout = (callback, ms, ...args) =>
+    originalSetTimeout(callback, ms === 10000 ? 15 : ms, ...args);
+  globalThis.fetch = async (_input, init) => {
+    if (path === "/api/wake" && init.method === "GET") {
+      return new Response(JSON.stringify({ state: "Shutdown" }), { status: 200 });
+    }
+    return new Response(new ReadableStream({
+    start(controller) {
+      pendingStreams.push(controller);
+      init.signal.addEventListener("abort", () => {
+        controller.error(new DOMException("GitHub response body timed out", "AbortError"));
+      }, { once: true });
+      controller.enqueue(new TextEncoder().encode('{"state":'));
+    }
+    }), { status: 200 });
+  };
+  try {
+    const response = await Promise.race([
+      worker.fetch(makeRequest(path), baseEnv({ GITHUB_API_RETRY_ATTEMPTS: "1" }), {}),
+      new Promise((_, reject) => {
+        deadline = originalSetTimeout(() => reject(new Error("GitHub body escaped the request deadline")), 500);
+      })
+    ]);
+    const body = await responseJson(response);
+    assert.equal(body.ok, false);
+    assert.equal(body.reason, path === "/api/wake" ? "github_start_request_unreachable" : "github_status_request_unreachable");
+    assert.notEqual(body.error, "internal_error");
+    console.log(`PASS: Worker bounds a stalled GitHub body for ${path} and returns retryable guidance`);
+  } finally {
+    clearTimeout(deadline);
+    globalThis.setTimeout = originalSetTimeout;
+    for (const controller of pendingStreams) {
+      try { controller.error(new Error("test cleanup")); } catch {}
+    }
+  }
+}
+
 async function testFailedSecretRateLimit() {
   const env = baseEnv({ WAKER_KV: makeKv() });
   let last;
@@ -74,6 +120,85 @@ async function testFailedSecretRateLimit() {
   assert.equal(body.retry_after_seconds, 600);
   assert.equal(env.WAKER_KV.putOptions("failed-auth:unknown").expirationTtl, 600);
   console.log("PASS: Worker rate-limits repeated bad wake secrets");
+}
+
+async function testFailedSecretIpv6PrefixSharesBudget() {
+  const kv = makeKv();
+  const env = baseEnv({ WAKER_KV: kv });
+  for (let i = 1; i <= 20; i += 1) {
+    const request = makeRequest("/api/health", "wrong-secret");
+    request.headers.set("cf-connecting-ip", i % 2
+      ? `2001:db8:12:34::${i.toString(16)}`
+      : `2001:0db8:0012:0034:0:0:0:${i.toString(16)}`);
+    const response = await worker.fetch(request, env, {});
+    if (i > 10) assert.equal(response.status, 429);
+  }
+  assert.equal(kv.putCallCount(), 10);
+  assert.equal(Object.keys(kv.dump()).length, 1);
+  const other = makeRequest("/api/health", "wrong-secret");
+  other.headers.set("cf-connecting-ip", "2001:db8:12:35::1");
+  assert.equal((await worker.fetch(other, env, {})).status, 401);
+  console.log("PASS: Worker failed-auth IPv6 aliases share a bounded per-/64 write budget");
+}
+
+async function testWakeIncidentTimestampsAreSampled() {
+  for (const fastPath of ["0", "1"]) {
+    const kv = makeKv();
+    const env = baseEnv({ WAKER_KV: kv, WAKE_FAST_PATH: fastPath, TEST_NOW_UTC: "2026-07-02T00:00:00Z" });
+    globalThis.fetch = async (input) => new Response(
+      String(input).includes("api.github.com") ? JSON.stringify({ state: "Available" }) : "",
+      { status: 200 }
+    );
+    const first = await responseJson(await worker.fetch(makeRequest("/api/wake"), env, {}));
+    assert.equal(first.ok, true);
+    env.TEST_NOW_UTC = "2026-07-02T00:00:05Z";
+    const second = await responseJson(await worker.fetch(makeRequest("/api/wake"), env, {}));
+    assert.equal(second.ok, true);
+    assert.equal(kv.writesFor("quota-incident:behavior-space"), 1, "repeat wake bypassed incident sampling");
+    const incident = JSON.parse(await kv.get("quota-incident:behavior-space"));
+    assert.equal(Boolean(incident.last_successful_start_at), fastPath === "0", "warm probe is not a successful GitHub start");
+  }
+  console.log("PASS: Worker samples repeat wake timestamps and does not invent a start for warm probes");
+}
+
+async function testPrivatePortRedirectClassification() {
+  for (const status of [302, 307]) {
+    for (const location of ["https://github.com/login?return_to=%2F", "https://other.example/login"]) {
+      globalThis.fetch = async (input) => String(input).includes("api.github.com")
+        ? new Response(JSON.stringify({ state: "Available" }), { status: 200 })
+        : new Response("", { status, headers: { location } });
+      const body = await responseJson(await worker.fetch(makeRequest("/api/wake"), baseEnv(), {}));
+      assert.equal(body.route_ready, false);
+      assert.equal(body.route_probe.http_status, status);
+      assert.equal(body.route_probe.route_failure_reason,
+        location.startsWith("https://github.com/") ? "auth_or_visibility_blocked" : "unexpected_redirect");
+    }
+  }
+  console.log("PASS: Worker identifies GitHub login redirects without treating unrelated redirects as authentication");
+}
+
+async function testOptionalPortDoesNotHoldHealthyPrimaryInSettlingLoop() {
+  let optionalCalls = 0;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("api.github.com")) return new Response(JSON.stringify({ state: "Available" }), { status: 200 });
+    if (url.includes("-8443.")) { optionalCalls += 1; return new Response("", { status: 400 }); }
+    return new Response("", { status: 200 });
+  };
+  const kv = makeKv();
+  await kv.put("codespace-registry:v1", JSON.stringify({
+    default_codespace_id: "main",
+    codespaces: [{ id: "main", name: "behavior-space", token_binding: "GITHUB_TOKEN", route_ports: [443, 8443] }]
+  }));
+  const response = await worker.fetch(makeRequest("/api/health"), baseEnv({
+    WAKER_KV: kv, ROUTE_WAIT_MS: "50", ROUTE_POLL_INTERVAL_MS: "1"
+  }), {});
+  const body = await responseJson(response);
+  assert.equal(body.route_ready, true);
+  assert.equal(body.route_probe.port, 443);
+  assert.equal(optionalCalls, 1, "optional non-XHTTP port consumed the full settling loop");
+  assert.equal(body.route_probes[1].usable, false);
+  console.log("PASS: Worker does not hold a healthy primary route behind optional-port settling retries");
 }
 
 async function testFailedSecretRateLimitCapsKvWrites() {
@@ -636,7 +761,7 @@ async function testKvQuotaIncidentHistoryRecordsBlockedAndRecovery() {
   body = await responseJson(response);
   assert.equal(body.quota_incident.first_quota_blocked_at, "2026-06-15T12:00:00.000Z");
   assert.equal(body.quota_incident.latest_quota_blocked_at, "2026-06-15T12:00:00.000Z");
-  assert.equal(body.quota_incident.last_successful_start_at, "2026-07-01T00:05:00.000Z");
+  assert.equal(body.quota_incident.last_successful_start_at, undefined, "warm route recovery did not issue a GitHub start");
   assert.equal(body.quota_incident.quota_drought_active, false);
   assert.equal(body.quota_incident.same_codespace_exists, true);
   console.log("PASS: Worker KV quota incident history records blocked and recovery states");
@@ -848,6 +973,8 @@ async function testScheduledQuotaCronIsDisabledAndThrottledBeforeReset() {
   const incident = JSON.parse(await kv.get("quota-incident:behavior-space"));
   assert.equal(incident.quota_drought_active, true);
   assert.equal(incident.last_successful_health_at, "2026-06-15T00:00:00.000Z");
+  assert.equal(kv.writesFor("quota-incident:behavior-space"), 2, "cron must write the incident once after its initial seed");
+  assert.equal(incident.last_cron_check_at, "2026-06-15T00:00:00.000Z");
   console.log("PASS: Worker scheduled quota survival cron is disabled by default and throttled before reset");
 }
 
@@ -2220,6 +2347,12 @@ async function testWorkerRegistrySelectsBoundTokenAndReturnsSafeDirectory() {
 }
 
 try {
+  await testFailedSecretIpv6PrefixSharesBudget();
+  await testWakeIncidentTimestampsAreSampled();
+  await testPrivatePortRedirectClassification();
+  await testOptionalPortDoesNotHoldHealthyPrimaryInSettlingLoop();
+  await testGithubBodyTimeoutIsBounded();
+  await testGithubBodyTimeoutIsBounded("/api/wake");
   await testFailedSecretRateLimit();
   await testFailedSecretRateLimitCapsKvWrites();
   await testMissingWakeSecretIsConfigurationError();

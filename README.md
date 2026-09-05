@@ -463,6 +463,8 @@ G2rayXCodeLeafy/
 **My Codespace keeps shutting down?**
 Ensure Option `7` in the G2ray panel (Toggle Anti-Sleep Mode) is enabled. The choice is saved under `data/` and restored on interactive and headless starts until you turn it off. This is best-effort: GitHub may still stop the Codespace when quota, budget, idle-timeout policy, or retention/deletion rules apply.
 
+The background outbound keepalive request does not prove that GitHub's idle timer is being reset. GitHub documents editor interaction and terminal input/output as activity; a forwarded service with no such activity can still time out. Use on-demand wake to recover after suspension, and disable Anti-Sleep when conserving compute time is more important than keeping the runtime warm. See [GitHub's idle-timeout rules](https://docs.github.com/en/codespaces/setting-your-user-preferences/setting-your-timeout-period-for-github-codespaces).
+
 **Will it restart after my monthly quota resets?**
 Not by itself while GitHub is blocking or stopping the Codespace, because no code runs inside a stopped Codespace. The Worker can show `HTTP 402`, estimate the next monthly reset, and, if you enabled optional KV/Cron, check conservatively near reset. The same configs work next month only if the same Codespace survives, so mark it as **Keep codespace** before quota runs out. After the monthly included usage resets, reopen it from GitHub or the Worker; `postStartCommand` runs `scripts/post-start.sh`, which calls `g2ray.sh --silent-start`, starts Xray, starts the supervisor, records boot status, and refreshes exported configs.
 

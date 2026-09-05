@@ -463,7 +463,10 @@ set_xhttp_mode() {
         # disruptive Xray restart.
         reapply_config_preserving_uuid_if_exists
     else
-        refresh_config_exports >/dev/null 2>&1 || true
+        if ! refresh_config_exports >/dev/null 2>&1; then
+            log_event WARN "xhttp_mode export_refresh_failed mode=${mode} preference_saved=true"
+            return 1
+        fi
     fi
 }
 
@@ -505,7 +508,8 @@ show_xhttp_mode_manager() {
             echo -e "\n  ${GREEN}XHTTP mode saved: ${mode}.${NC}"
             echo -e "  ${DIM}Existing UUID is preserved. A current auto-mode server stays connected; view configs to copy matching links.${NC}"
         else
-            echo -e "\n  ${RED}Could not save XHTTP mode.${NC}"
+            echo -e "\n  ${RED}Could not finish applying XHTTP mode.${NC}"
+            echo -e "  ${DIM}The preference may be saved, but exports or the engine update failed. Check Diagnostics and refresh exports.${NC}"
         fi
         echo -ne "  ${DIM}Press Enter to return...${NC}"; read -r
     done
@@ -671,7 +675,7 @@ with_file_lock() {
     else
         lock_dir="${lock_file}.d"
         start=$(date +%s 2>/dev/null || printf '0')
-        while ! mkdir "$lock_dir" 2>/dev/null; do
+        while ! _try_claim_lock_dir "$lock_dir"; do
             owner=$(cat "$lock_dir/pid" 2>/dev/null || true)
             if [[ -z "$owner" || ! "$owner" =~ ^[0-9]+$ ]] || ! kill -0 "$owner" 2>/dev/null; then
                 recheck=$(cat "$lock_dir/pid" 2>/dev/null || true)
@@ -685,10 +689,6 @@ with_file_lock() {
             (( now - start >= timeout_sec )) && return 1
             sleep 0.1
         done
-        printf '%s\n' "$self_pid" > "$lock_dir/pid" 2>/dev/null || {
-            rmdir "$lock_dir" 2>/dev/null || true
-            return 1
-        }
         (
             trap 'rm -f "$lock_dir/pid" 2>/dev/null || true; rmdir "$lock_dir" 2>/dev/null || true' EXIT
             "$@"
@@ -801,6 +801,8 @@ rotate_log_file() {
     [[ "$max" =~ ^[0-9]+$ && "$max" -gt 0 ]] || max=1048576
     [[ "$keep" =~ ^[0-9]+$ && "$keep" -gt 0 ]] || keep=3
     [[ -f "$file" ]] || return 0
+    # Do not repeatedly copy an oversized daemon log that cannot be truncated.
+    [[ -w "$file" ]] || return 1
     size=$(wc -c < "$file" 2>/dev/null || echo 0)
     [[ "$size" =~ ^[0-9]+$ ]] || size=0
     (( size < max )) && return 0
@@ -1270,8 +1272,8 @@ resolve_dns_provider_ips_with_sources() {
     pids+=("$!")
     ({ json_dns_ips "https://cloudflare-dns.com/dns-query?name=${domain}&type=A" "accept: application/dns-json" || true; } | awk 'NF {print "dns_cloudflare\t" $0}' > "$tmpdir/dns_cloudflare") &
     pids+=("$!")
-    ({ json_dns_ips "https://dns.quad9.net:5053/dns-query?name=${domain}&type=A" "accept: application/dns-json" || true; } | awk 'NF {print "dns_quad9\t" $0}' > "$tmpdir/dns_quad9") &
-    pids+=("$!")
+    # Quad9 retired its JSON API in May 2025. Its port-443 DoH service uses
+    # DNS wire format, so changing this JSON request's port would still fail.
     if wide_dns_discovery_enabled; then
         local subnet source url_value safe_name
         while IFS= read -r subnet; do
@@ -2507,6 +2509,12 @@ publish_runtime_ports_with_retry() {
 
 repair_codespace_port_route() {
     command -v gh >/dev/null 2>&1 || return 1
+    # Every caller, including panel attach and the settling monitor, must avoid
+    # tearing down a live stream because a separate edge probe failed.
+    if active_tunnel_recent || inbound_tunnel_connection_present; then
+        log_event WARN "route_repair deferred_active_session port=${XRAY_PORT}"
+        return 0
+    fi
     log_event WARN "route_repair begin port=${XRAY_PORT} domain=${PORT_DOMAIN}"
     run_gh codespace ports visibility "${XRAY_PORT}:private" -c "$CODESPACE_NAME" \
         </dev/null >/dev/null 2>&1 || true
@@ -2545,6 +2553,12 @@ wait_for_xhttp_route_ready() {
         # can be reported as timed out solely because the scheduler woke us late.
         # Any following failure resets stable to zero and exits immediately.
         (( elapsed >= max_wait && stable == 0 )) && break
+        # A successful probe is being confirmed, not repaired. Flipping its
+        # visibility now can interrupt clients and undo natural edge recovery.
+        if (( stable > 0 )); then
+            sleep "$ROUTE_READY_STABLE_SLEEP_SEC"
+            continue
+        fi
         if (( attempt == 1 )); then
             ensure_codespace_port_public >/dev/null 2>&1 || true
         elif (( attempt % 5 == 0 )) && mark_route_repair_attempt_if_allowed; then
@@ -2553,11 +2567,7 @@ wait_for_xhttp_route_ready() {
             log_event WARN "runtime_ready reason=${reason} route_wait_repair attempt=${attempt} port=${XRAY_PORT}"
             repair_codespace_port_route >/dev/null 2>&1 || true
         fi
-        if (( stable > 0 )); then
-            sleep "$ROUTE_READY_STABLE_SLEEP_SEC"
-        else
-            sleep 3
-        fi
+        sleep 3
     done
     log_event WARN "runtime_ready reason=${reason} route_wait_timeout xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} wait_sec=${max_wait} stable_probes=${stable}"
     record_route_settling_metric "$reason" "timeout" "${xcode:-0}" "${xms:-0}" "$max_wait" "$attempt"
@@ -2824,17 +2834,20 @@ save_session_uptime() {
     _atomic_write "$SESSION_START_FILE" "$now" || return 1
 }
 
-# Atomically claim a mkdir-based lock directory, then confirm we still own it.
-# The readback guards against a racing stale-lock breaker that could delete and
-# recreate the directory between our mkdir and our pid write. On any mismatch we
-# report failure so the caller retries instead of two holders running at once.
+# Publish a populated directory in one rename. Publishing mkdir before the PID
+# lets another process mistake a live, not-yet-initialized claim for stale state.
 _try_claim_lock_dir() {
-    local dir="$1" op="${2:-}" owner self_pid="${BASHPID:-$$}"
-    mkdir "$dir" 2>/dev/null || return 1
-    printf '%s\n' "$self_pid" > "$dir/pid" 2>/dev/null || true
-    [[ -n "$op" ]] && printf '%s\n' "$op" > "$dir/op" 2>/dev/null || true
-    owner=$(cat "$dir/pid" 2>/dev/null || true)
-    [[ "$owner" == "$self_pid" ]]
+    local dir="$1" op="${2:-}" staging self_pid="${BASHPID:-$$}"
+    [[ ! -e "$dir" && ! -L "$dir" ]] || return 1
+    staging=$(mktemp -d "${dir}.claim.XXXXXX") || return 1
+    if printf '%s\n' "$self_pid" > "$staging/pid" &&
+        { [[ -z "$op" ]] || printf '%s\n' "$op" > "$staging/op"; } &&
+        mv -T -n -- "$staging" "$dir" 2>/dev/null && [[ ! -d "$staging" ]]; then
+        return 0
+    fi
+    rm -f "$staging/pid" "$staging/op" 2>/dev/null || true
+    rmdir "$staging" 2>/dev/null || true
+    return 1
 }
 
 acquire_runtime_lock() {
@@ -3063,6 +3076,23 @@ restore_prestart_config_backup() {
     return 1
 }
 
+prepare_xray_logs() {
+    local file owner
+    owner="$(id -u):$(id -g)"
+    for file in "$LOG_DIR/xray.log" "$LOG_DIR/xray-error.log"; do
+        [[ ! -L "$file" ]] || return 1
+        if [[ -e "$file" ]]; then
+            [[ -f "$file" ]] || return 1
+            if [[ ! -w "$file" ]]; then
+                sudo -n chown "$owner" -- "$file" 2>/dev/null || return 1
+            fi
+        fi
+        # Precreate as the panel user; root Xray retains that ownership.
+        { : >> "$file"; } 2>/dev/null || return 1
+        chmod 600 "$file" 2>/dev/null || return 1
+    done
+}
+
 _start_xray_impl() {
     START_XRAY_LAST_PHASE="preflight"
     if [[ ! -f "$CONFIG_FILE" ]]; then
@@ -3072,7 +3102,12 @@ _start_xray_impl() {
     fi
     local launch_cmd pid config_backup="" _grace
     log_event INFO "start_xray requested port=${XRAY_PORT} config=${CONFIG_FILE}"
-    launch_cmd=$(printf 'ulimit -n "${G2RAY_XRAY_FD_LIMIT:-65536}" 2>/dev/null || true; nohup %q run -c %q </dev/null >%q 2>&1 & printf "%%s\n" "$!"' \
+    if ! prepare_xray_logs; then
+        log_event ERROR "start_xray log_preflight_failed action=preserve_current_engine"
+        echo -e "  ${RED}Could not prepare Xray logs. Current engine was not stopped.${NC}"
+        return 1
+    fi
+    launch_cmd=$(printf 'ulimit -n "${G2RAY_XRAY_FD_LIMIT:-65536}" 2>/dev/null || true; nohup %q run -c %q </dev/null >>%q 2>&1 & printf "%%s\n" "$!"' \
         "$XRAY_BIN" "$CONFIG_FILE" "$LOG_DIR/xray.log")
     config_backup=$(mktemp "${CONFIG_FILE}.prestart.XXXXXX") || {
         log_event ERROR "start_xray config_backup_create_failed"
@@ -3226,7 +3261,7 @@ self_heal_once() {
         fi
         log_event WARN "self_heal edge_unreachable code=${code:-0} bad_count=${bad_count} action=force_reconnect xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0}"
         mark_edge_reconnect_attempt
-        if force_reconnect --no-prompt >/dev/null 2>&1; then
+        if force_reconnect --no-prompt --defer-route-check >/dev/null 2>&1; then
             reset_edge_bad_count
         else
             log_event ERROR "self_heal force_reconnect_failed code=${code:-0}"
@@ -5953,6 +5988,7 @@ JSON
 
 _force_reconnect_impl() {
     local no_prompt="${1:-}" failed=0 expose_failed=false hard_failed=false
+    local verify_mode="${2:-}"
     log_event INFO "force_reconnect begin no_prompt=${no_prompt:-false}"
     echo -e "\n  ${GREEN}⠋${NC} ${WHITE}Running Clean Hard Restart & Reconnect Sequence...${NC}\n"
 
@@ -6004,6 +6040,18 @@ _force_reconnect_impl() {
         failed=1
         log_event WARN "force_reconnect expose_tunnel failed port=${XRAY_PORT}"
         echo -e "${YELLOW}Needs PORTS tab${NC}"
+    fi
+
+    # The supervisor has a short deadline. Let the existing bounded monitor
+    # verify the edge after this operation releases its runtime lock.
+    if [[ "$no_prompt" == "--no-prompt" && "$verify_mode" == "--defer-route-check" ]]; then
+        [[ "$hard_failed" == false ]] || return 1
+        if ! start_headless_route_settling_monitor "self_heal_reconnect"; then
+            log_event ERROR "force_reconnect background_verify_failed"
+            return 1
+        fi
+        log_event INFO "force_reconnect verify_external action=background_settle route_ready=unverified"
+        return "$failed"
     fi
 
     echo -ne "  ${DIM}╰─${NC} Verify External   : "
@@ -6071,6 +6119,11 @@ _ensure_runtime_ready_impl() {
             return 0
         fi
 
+        if [[ "$reason" == "interactive_attach" ]]; then
+            log_event WARN "runtime_ready reason=${reason} route_unusable xhttp_probe=${xcode:-0} action=background_settle"
+            start_headless_route_settling_monitor "$reason" || true
+            return 1
+        fi
         log_event WARN "runtime_ready reason=${reason} route_unusable xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} action=repair"
         repair_codespace_port_route >/dev/null 2>&1 || true
         if wait_for_xhttp_route_ready "$reason"; then
@@ -6091,6 +6144,11 @@ _ensure_runtime_ready_impl() {
             || log_event WARN "runtime_ready reason=${reason} ws_port_public_failed port=${WS_PORT}"
         read -r xcode xms _probe_reason < <(xhttp_probe_metrics external)
         if ! xhttp_status_usable "$xcode"; then
+            if [[ "$reason" == "interactive_attach" ]]; then
+                log_event WARN "runtime_ready reason=${reason} started_route_unusable xhttp_probe=${xcode:-0} action=background_settle"
+                start_headless_route_settling_monitor "$reason" || true
+                return 1
+            fi
             log_event WARN "runtime_ready reason=${reason} started_route_unusable xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} action=repair"
             repair_codespace_port_route >/dev/null 2>&1 || true
             wait_for_xhttp_route_ready "$reason" >/dev/null 2>&1 || true
@@ -6555,6 +6613,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 check_for_updates "$@"
+printf '  Checking local engine and public route...\n'
 ensure_runtime_ready "interactive_attach" >/dev/null 2>&1 || true
 start_background_tasks || log_event WARN "background supervisor_start_deferred reason=interactive_attach"
 sync_anti_sleep_runtime

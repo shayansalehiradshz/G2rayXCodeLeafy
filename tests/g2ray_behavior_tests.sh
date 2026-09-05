@@ -2262,6 +2262,19 @@ JSON
     pass "generated links use the active XHTTP config mode"
 }
 
+test_xhttp_mode_reports_export_failure() {
+    (
+        reset_runtime_paths
+        xhttp_active_inbound_mode() { printf 'auto'; }
+        refresh_config_exports() { return 1; }
+        if set_xhttp_mode "stream-up" >/dev/null 2>&1; then
+            fail "mode manager reported success after exported links failed to refresh"
+        fi
+        [[ "$(xhttp_mode_value)" == "stream-up" ]] || fail "saved mode was lost after export failure"
+    )
+    pass "XHTTP mode reports failed exports while preserving the saved preference"
+}
+
 test_custom_xhttp_extra_json_is_validated() {
     reset_runtime_paths
     PORT_DOMAIN="behavior-space-443.app.github.dev"
@@ -2884,7 +2897,7 @@ test_route_wait_reasserts_port_once_after_persistent_404() {
             probes=$(cat "$probes_file")
             probes=$((probes + 1))
             printf '%s\n' "$probes" > "$probes_file"
-            if (( probes < 5 )); then
+            if (( probes <= 5 )); then
                 printf '404 10 route_settling_404\n'
             else
                 printf '200 11 ready\n'
@@ -2906,6 +2919,34 @@ test_route_wait_reasserts_port_once_after_persistent_404() {
             || fail "route wait did not log the bounded repair"
     )
     pass "route wait reasserts port once after persistent 404"
+}
+
+test_route_wait_does_not_repair_a_recovering_route() {
+    (
+        reset_runtime_paths
+        ROUTE_READY_STABLE_SLEEP_SEC=0
+        local probes_file="$TMP_ROOT/route-wait-recovered-count.txt" repairs=0
+        printf '0\n' > "$probes_file"
+        xhttp_probe_metrics() {
+            local probes
+            probes=$(cat "$probes_file")
+            probes=$((probes + 1))
+            printf '%s\n' "$probes" > "$probes_file"
+            if (( probes < 5 )); then
+                printf '404 10 route_settling_404\n'
+            else
+                printf '200 11 ready\n'
+            fi
+        }
+        sleep() { :; }
+        ensure_codespace_port_public() { return 0; }
+        mark_route_repair_attempt_if_allowed() { return 0; }
+        repair_codespace_port_route() { repairs=$((repairs + 1)); }
+        wait_for_xhttp_route_ready "behavior_recovered" 60 >/dev/null \
+            || fail "route wait rejected a naturally recovered route"
+        [[ "$repairs" -eq 0 ]] || fail "route wait toggled a healthy route private/public"
+    )
+    pass "route wait confirms natural recovery without toggling a healthy port"
 }
 
 test_recover_now_success_clears_nonfatal_port_public_failure() {
@@ -3891,6 +3932,159 @@ test_active_xray_log_rotation_preserves_open_descriptor() {
     pass "active Xray log rotation preserves daemon file descriptors"
 }
 
+test_lock_claim_publishes_owner_atomically() {
+    (
+        reset_runtime_paths
+        local exposed="$TMP_ROOT/exposed-empty-lock"
+        rm -f "$exposed"
+        printf() {
+            if [[ -d "$RUNTIME_LOCK_DIR" && ! -s "$RUNTIME_LOCK_DIR/pid" ]]; then
+                builtin printf 'exposed\n' > "$exposed"
+            fi
+            builtin printf "$@"
+        }
+        _try_claim_lock_dir "$RUNTIME_LOCK_DIR" test || fail "lock claim failed"
+        [[ ! -f "$exposed" ]] || fail "lock directory was visible before its PID was initialized"
+        [[ "$(cat "$RUNTIME_LOCK_DIR/pid")" == "$BASHPID" ]] || fail "lock lost its owner"
+        release_runtime_lock
+    )
+    pass "lock claim publishes initialized ownership atomically"
+}
+
+test_xray_launch_uses_append_and_checks_log_preflight() {
+    (
+        reset_runtime_paths
+        write_test_vless_config
+        local launch_file="$TMP_ROOT/xray-launch-command" stopped="$TMP_ROOT/xray-stopped"
+        upgrade_config_dns() { return 0; }
+        xray_validate_config() { return 0; }
+        stop_xray() { touch "$stopped"; }
+        reset_session_bytes_baseline() { return 0; }
+        sudo() { builtin printf '%s\n' "${3:-}" > "$launch_file"; builtin printf '123456\n'; }
+        _start_xray_impl >/dev/null || fail "mock Xray launch failed"
+        grep -Fq '</dev/null >>' "$launch_file" || fail "Xray launch does not use append-mode logging"
+        [[ -w "$LOG_DIR/xray.log" && -w "$LOG_DIR/xray-error.log" ]] || fail "daemon logs were not precreated for the panel user"
+        rm -f "$stopped"
+        prepare_xray_logs() { return 1; }
+        if _start_xray_impl >/dev/null; then fail "Xray start ignored log preflight failure"; fi
+        [[ ! -f "$stopped" ]] || fail "log preflight failure stopped the old engine"
+    )
+    pass "Xray launches with append logging and checks logs before stopping the current engine"
+}
+
+test_dns_discovery_skips_retired_json_service() {
+    (
+        reset_runtime_paths
+        local calls="$TMP_ROOT/json-dns-calls"
+        : > "$calls"
+        json_dns_ips() { builtin printf '%s\n' "$1" >> "$calls"; builtin printf '20.0.0.1\n'; }
+        wide_dns_discovery_enabled() { return 1; }
+        curl_remote_ip() { return 0; }
+        timeout() { return 0; }
+        resolve_dns_provider_ips_with_sources behavior.example >/dev/null
+        ! grep -Fq 'dns.quad9.net' "$calls" || fail "discovery still sends JSON to retired Quad9 API"
+        grep -Fq 'dns.google/resolve' "$calls" || fail "Google candidate discovery was lost"
+        grep -Fq 'cloudflare-dns.com/dns-query' "$calls" || fail "Cloudflare candidate discovery was lost"
+    )
+    pass "DNS discovery skips retired JSON service and retains working providers"
+}
+
+test_route_repair_preserves_active_sessions_for_all_callers() {
+    (
+        reset_runtime_paths
+        local calls="$TMP_ROOT/repair-visibility-calls"
+        : > "$calls"
+        run_gh() { builtin printf 'toggle\n' >> "$calls"; }
+        ensure_codespace_port_public() { return 0; }
+        ensure_optional_ws_port_public() { return 0; }
+        sleep() { :; }
+        active_tunnel_recent() { return 0; }
+        inbound_tunnel_connection_present() { return 1; }
+        repair_codespace_port_route || fail "active traffic deferral failed"
+        [[ ! -s "$calls" ]] || fail "route repair toggled visibility during active traffic"
+        active_tunnel_recent() { return 1; }
+        inbound_tunnel_connection_present() { return 0; }
+        repair_codespace_port_route || fail "established session deferral failed"
+        [[ ! -s "$calls" ]] || fail "route repair toggled visibility during a quiet established session"
+        inbound_tunnel_connection_present() { return 1; }
+        repair_codespace_port_route || fail "idle broken route repair failed"
+        [[ -s "$calls" ]] || fail "route repair was disabled even without active sessions"
+    )
+    pass "route repair preserves active sessions regardless of its caller"
+}
+
+test_interactive_attach_defers_slow_route_settling() {
+    (
+        reset_runtime_paths
+        write_test_vless_config
+        local deferred="$TMP_ROOT/attach-deferred"
+        _detect_codespace_name() { builtin printf 'behavior-space'; }
+        record_resume_gap() { :; }
+        xray_listener_ready() { return 0; }
+        xhttp_probe_metrics() { builtin printf '404 1 route_settling_404\n'; }
+        repair_codespace_port_route() { fail "interactive attach ran disruptive repair synchronously"; }
+        wait_for_xhttp_route_ready() { fail "interactive attach blocked on route settling"; }
+        start_headless_route_settling_monitor() { builtin printf '%s\n' "$1" > "$deferred"; }
+        if ensure_runtime_ready interactive_attach; then fail "attach falsely reported an unusable route ready"; fi
+        grep -Fxq 'interactive_attach' "$deferred" || fail "attach did not schedule bounded background recovery"
+        [[ ! -d "$RUNTIME_LOCK_DIR" ]] || fail "attach kept the runtime lock during background recovery"
+    )
+    pass "interactive attach returns the panel while route settling continues in the background"
+}
+
+test_supervisor_reconnect_defers_long_route_verification() {
+    (
+        reset_runtime_paths
+        write_test_vless_config
+        local args_file="$TMP_ROOT/supervisor-reconnect-args"
+        ensure_codespace_port_public() { return 0; }
+        ensure_optional_ws_port_public() { return 0; }
+        xray_running() { return 0; }
+        xray_listener_ready() { return 0; }
+        active_tunnel_recent() { return 1; }
+        inbound_tunnel_connection_present() { return 1; }
+        xhttp_probe_metrics() { builtin printf '0 1 transport_error\n'; }
+        curl_http_code() { builtin printf '000\n'; }
+        increment_edge_bad_count() { builtin printf '3\n'; }
+        edge_reconnect_cooldown_active() { return 1; }
+        mark_edge_reconnect_attempt() { :; }
+        force_reconnect() {
+            builtin printf '%s\n' "$*" > "$args_file"
+        }
+        self_heal_once || fail "supervisor deferred reconnect failed"
+        grep -Fxq -- '--no-prompt --defer-route-check' "$args_file" \
+            || fail "supervisor entered long foreground route verification under its short deadline"
+    )
+    (
+        reset_runtime_paths
+        write_test_vless_config
+        local deferred="$TMP_ROOT/reconnect-deferred"
+        _detect_codespace_name() { builtin printf 'behavior-space'; }
+        stop_xray() { return 0; }
+        start_xray() { return 0; }
+        wait_for_port() { return 0; }
+        ensure_codespace_port_public() { return 0; }
+        ensure_optional_ws_port_public() { return 0; }
+        curl_http_code() { fail "deferred reconnect ran foreground edge verification"; }
+        xhttp_probe_metrics() { fail "deferred reconnect ran foreground XHTTP verification"; }
+        start_headless_route_settling_monitor() { builtin printf '%s\n' "$1" > "$deferred"; }
+        force_reconnect --no-prompt --defer-route-check >/dev/null || fail "deferred reconnect failed"
+        grep -Fxq 'self_heal_reconnect' "$deferred" || fail "reconnect did not start background verification"
+        [[ ! -d "$RUNTIME_LOCK_DIR" ]] || fail "reconnect held its lock while the route settled"
+        rm -f "$deferred"
+        start_xray() { return 1; }
+        if force_reconnect --no-prompt --defer-route-check >/dev/null; then fail "deferred reconnect hid an engine start failure"; fi
+        [[ ! -e "$deferred" ]] || fail "reconnect queued verification for an engine that failed to start"
+    )
+    pass "supervisor reconnect releases its lock and verifies routes outside the short supervisor deadline"
+}
+
+test_supervisor_reconnect_defers_long_route_verification
+test_route_repair_preserves_active_sessions_for_all_callers
+test_interactive_attach_defers_slow_route_settling
+test_lock_claim_publishes_owner_atomically
+test_xray_launch_uses_append_and_checks_log_preflight
+test_dns_discovery_skips_retired_json_service
 test_port_visibility_is_throttled
 test_codespace_detection_uses_shared_environment_in_headless_ssh
 test_codespace_detection_uses_local_metadata_when_gh_is_unauthenticated
@@ -4001,6 +4195,7 @@ test_force_reconnect_skips_restart_when_identity_unknown
 test_generated_links_follow_configured_xhttp_path
 test_xhttp_mode_is_persistent_and_link_consistent
 test_xhttp_mode_change_does_not_restart_auto_inbound
+test_xhttp_mode_reports_export_failure
 test_generated_links_use_active_config_mode_over_env_override
 test_custom_xhttp_extra_json_is_validated
 test_websocket_fallback_is_advanced_opt_in
@@ -4027,6 +4222,7 @@ test_doctor_json_sanitizes_invalid_port
 test_route_wait_requires_stable_usable_probes
 test_route_wait_rejects_transient_single_success
 test_route_wait_reasserts_port_once_after_persistent_404
+test_route_wait_does_not_repair_a_recovering_route
 test_recover_now_success_clears_nonfatal_port_public_failure
 test_route_repair_attempts_are_cooldown_limited
 test_recover_now_stops_after_engine_start_failure
