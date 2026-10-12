@@ -1,6 +1,9 @@
 # libXray AAR
 
-Place the official `libXray.aar` here before building a production VPN APK.
+Rebuild the pinned, Android-controller-patched `libXray.aar` here using
+[`scripts/build-libxray-aar.ps1`](../../scripts/build-libxray-aar.ps1) before
+building a functional VPN APK. A generic upstream/latest AAR is not equivalent
+to the attested build recorded in `libXray.properties`.
 
 The Gradle build includes `app/libs/libXray.aar` automatically when the file
 exists. Both `assembleDebug` and `assembleFunctionalDebug` require the AAR to

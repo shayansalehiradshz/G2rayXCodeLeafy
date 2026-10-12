@@ -54,6 +54,8 @@ portable rather than simpler.
   HEV and Xray and exposes true VPN TUN upload/download counters.
 - **Native** uses Xray's Android TUN inbound directly. It is the compatibility
   fallback; the app does not invent device-wide throughput figures for it.
+  Retained HTTP connections stalled after idle during physical-device testing;
+  use Auto/HEV for normal use. See the [verification record](DEVICE_VERIFICATION_2026-10-12.md).
 
 Both engines use a 1500-byte Android VPN MTU. The physical network and the
 Codespaces edge still determine the final latency and throughput, so compare
@@ -251,7 +253,9 @@ the saved profile without printing its link or credentials, starts and stops
 the service, and does not change the persisted engine preference. It transfers
 2 MiB down and 64 KiB up, checks three HTTPS endpoints before and after background
 idle with both a retained connection pool and fresh sockets, and verifies real
-HEV receive counters. It consumes mobile data.
+HEV receive counters. Each phase requires two of three endpoints to complete
+within six seconds; an eventual 200 response after a long stall does not pass.
+This is a regression ceiling, not a latency guarantee. It consumes mobile data.
 
 ```powershell
 .\gradlew.bat :app:connectedDebugAndroidTest `

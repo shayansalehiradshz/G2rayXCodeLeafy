@@ -93,7 +93,7 @@ class LiveVpnDeviceTest {
                 connectivity.getNetworkCapabilities(connectivity.activeNetwork)
                     ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
             )
-            probeHttpsQuorum(client, "initial")
+            assertResponsiveQuorum(probeHttpsQuorum(client, "initial"), "initial")
             transferSample(client)
             if (expectedEngine == ActiveVpnEngine.Hev) {
                 val counters = withTimeout(15_000L) {
@@ -113,9 +113,11 @@ class LiveVpnDeviceTest {
             val afterIdle = VpnStateRepository.state.value
             assertEquals("Service lost the VPN during background idle", TunnelState.Connected, afterIdle.tunnelState)
             scenario.moveToState(Lifecycle.State.RESUMED)
-            probeHttpsQuorum(client, "idle_resume_retained_pool")
+            val retainedResponsive = probeHttpsQuorum(client, "idle_resume_retained_pool")
             client.connectionPool.evictAll()
-            probeHttpsQuorum(client, "idle_resume_fresh_socket")
+            val freshResponsive = probeHttpsQuorum(client, "idle_resume_fresh_socket")
+            assertResponsiveQuorum(retainedResponsive, "idle_resume_retained_pool")
+            assertResponsiveQuorum(freshResponsive, "idle_resume_fresh_socket")
             report("idle_resume_success=true")
         } finally {
             try {
@@ -142,13 +144,13 @@ class LiveVpnDeviceTest {
         }
     }
 
-    private fun probeHttpsQuorum(client: OkHttpClient, phase: String) {
+    private fun probeHttpsQuorum(client: OkHttpClient, phase: String): Int {
         val endpoints = listOf(
             "https://www.gstatic.com/generate_204" to 204,
             "https://cp.cloudflare.com/generate_204" to 204,
             "https://example.com/" to 200
         )
-        var passed = 0
+        var responsive = 0
         for ((url, status) in endpoints) {
             val started = SystemClock.elapsedRealtime()
             try {
@@ -156,16 +158,26 @@ class LiveVpnDeviceTest {
                     .execute().use { response ->
                         val body = response.body?.string().orEmpty()
                         val valid = response.code == status && (status == 204 || body.contains("Example Domain"))
-                        if (valid) passed++
+                        val elapsedMs = SystemClock.elapsedRealtime() - started
+                        val fast = valid && elapsedMs <= RESPONSIVE_ENDPOINT_LIMIT_MS
+                        if (fast) responsive++
                         report("phase=$phase endpoint=${url.substringAfter("https://").substringBefore('/')} " +
-                            "http=${response.code} usable=$valid elapsed_ms=${SystemClock.elapsedRealtime() - started}")
+                            "http=${response.code} usable=$valid responsive=$fast elapsed_ms=$elapsedMs")
                     }
             } catch (error: Exception) {
                 report("phase=$phase endpoint=${url.substringAfter("https://").substringBefore('/')} " +
                     "error=${error.javaClass.simpleName} elapsed_ms=${SystemClock.elapsedRealtime() - started}")
             }
         }
-        assertTrue("Only $passed/3 full-VPN HTTPS endpoints passed during $phase", passed >= 2)
+        return responsive
+    }
+
+    private fun assertResponsiveQuorum(responsive: Int, phase: String) {
+        assertTrue(
+            "Only $responsive/3 full-VPN HTTPS endpoints completed within " +
+                "$RESPONSIVE_ENDPOINT_LIMIT_MS ms during $phase",
+            responsive >= 2
+        )
     }
 
     private fun transferSample(client: OkHttpClient) {
@@ -200,5 +212,7 @@ class LiveVpnDeviceTest {
     private companion object {
         const val DOWNLOAD_BYTES = 2 * 1024 * 1024
         const val UPLOAD_BYTES = 64 * 1024
+        // A generous regression ceiling, not a promise of instant browsing.
+        const val RESPONSIVE_ENDPOINT_LIMIT_MS = 6_000L
     }
 }
