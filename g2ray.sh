@@ -68,6 +68,10 @@ RESUME_GAP_FILE="$DATA_DIR/resume_gap.txt"
 WAKER_METADATA_FILE="$DATA_DIR/waker_metadata.txt"
 WAKER_PROMPT_FILE="$DATA_DIR/.waker_setup_prompted"
 ROUTE_BAD_COUNT_FILE="$DATA_DIR/xhttp_route_bad_count"
+ROUTE_LATENCY_BASELINE_FILE="$DATA_DIR/route_latency_baseline"
+ROUTE_DEGRADED_REQUEST_FILE="$DATA_DIR/route_degraded_request"
+ROUTE_DEGRADED_REFRESH_STAMP_FILE="$DATA_DIR/route_degraded_refresh_stamp"
+UPDATE_AUDIT_FILE="$DATA_DIR/update_audit.log"
 EDGE_BAD_COUNT_FILE="$DATA_DIR/edge_bad_count"
 EDGE_RECONNECT_STAMP_FILE="$DATA_DIR/edge_reconnect_last"
 ROUTE_HEALTH_FILE="$DATA_DIR/route_candidate_health.tsv"
@@ -82,6 +86,7 @@ DNS_CANDIDATE_CACHE_FILE="$DATA_DIR/dns_candidate_cache.tsv"
 BOOT_STATUS_FILE="$DATA_DIR/boot_status.json"
 XHTTP_PATH_CACHE_FILE="$DATA_DIR/xhttp_path_cache"
 XHTTP_MODE_FILE="$DATA_DIR/xhttp_mode.txt"
+XHTTP_LINK_TUNING_FILE="$DATA_DIR/xhttp_link_tuning.txt"
 ANTI_SLEEP_DISABLED_FILE="$DATA_DIR/anti_sleep_mode_disabled"
 LOW_OVERHEAD_FILE="$DATA_DIR/low_overhead_mode"
 LOW_OVERHEAD_DISABLED_FILE="$DATA_DIR/low_overhead_mode_disabled"
@@ -139,6 +144,11 @@ fi
 # Keep the advanced WebSocket fallback alive through idle HTTP intermediaries.
 # XHTTP remains the primary transport; this only affects an enabled WS inbound.
 WS_HEARTBEAT_PERIOD_SEC=30
+# Server-side reorder window for packet-up upload POSTs. Tuned links send many
+# 60 KB POSTs instead of a few 1 MB ones; Xray tears the session down once more
+# than this many arrive out of order, so keep a margin above its default of 30
+# for jittery mobile paths. Worst case is ~6 MB per session at 60 KB per POST.
+XHTTP_SERVER_MAX_BUFFERED_POSTS=100
 CODESPACES_EDGE_PORT="${G2RAY_CODESPACES_EDGE_PORT:-443}"
 PORT_FORWARDING_DOMAIN="${G2RAY_PORT_FORWARDING_DOMAIN:-${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN:-app.github.dev}}"
 PORT_FORWARDING_DOMAIN="${PORT_FORWARDING_DOMAIN#https://}"
@@ -170,6 +180,11 @@ DNS_CACHE_TTL_SEC="${G2RAY_DNS_CACHE_TTL_SEC:-300}"
 ROUTE_FAILURE_COOLDOWN_SEC="${G2RAY_ROUTE_FAILURE_COOLDOWN_SEC:-180}"
 ROUTE_REPAIR_COOLDOWN_SEC="${G2RAY_ROUTE_REPAIR_COOLDOWN_SEC:-180}"
 ROUTE_STATS_MAX_AGE_SEC="${G2RAY_ROUTE_STATS_MAX_AGE_SEC:-604800}"
+ROUTE_DEGRADED_MULTIPLIER="${G2RAY_ROUTE_DEGRADED_MULTIPLIER:-3}"
+ROUTE_DEGRADED_MIN_DELTA_MS="${G2RAY_ROUTE_DEGRADED_MIN_DELTA_MS:-500}"
+ROUTE_DEGRADED_MIN_SAMPLES="${G2RAY_ROUTE_DEGRADED_MIN_SAMPLES:-3}"
+ROUTE_DEGRADED_TRIGGER_COUNT="${G2RAY_ROUTE_DEGRADED_TRIGGER_COUNT:-2}"
+ROUTE_DEGRADED_REFRESH_COOLDOWN_SEC="${G2RAY_ROUTE_DEGRADED_REFRESH_COOLDOWN_SEC:-300}"
 ROUTE_PROBE_CONCURRENCY="${G2RAY_ROUTE_PROBE_CONCURRENCY:-6}"
 ROUTE_PROBE_JITTER_SEC="${G2RAY_ROUTE_PROBE_JITTER_SEC:-0}"
 PORT_PUBLIC_TTL_SEC="${G2RAY_PORT_PUBLIC_TTL_SEC:-300}"
@@ -244,6 +259,11 @@ XRAY_CONFIGTEST_LOG_MAX_AGE_MIN="${G2RAY_XRAY_CONFIGTEST_LOG_MAX_AGE_MIN:-1440}"
 [[ "$EXTERNAL_PROBE_TIMEOUT_SEC" =~ ^[0-9]+$ && "$EXTERNAL_PROBE_TIMEOUT_SEC" -ge 1 ]] || EXTERNAL_PROBE_TIMEOUT_SEC=5
 [[ "$CONNECT_TIMEOUT_SEC" =~ ^[0-9]+$ && "$CONNECT_TIMEOUT_SEC" -ge 1 ]] || CONNECT_TIMEOUT_SEC=2
 [[ "$XRAY_CONFIGTEST_LOG_MAX_AGE_MIN" =~ ^[0-9]+$ && "$XRAY_CONFIGTEST_LOG_MAX_AGE_MIN" -ge 60 ]] || XRAY_CONFIGTEST_LOG_MAX_AGE_MIN=1440
+[[ "$ROUTE_DEGRADED_MULTIPLIER" =~ ^[1-9][0-9]?$ && "$ROUTE_DEGRADED_MULTIPLIER" -ge 2 && "$ROUTE_DEGRADED_MULTIPLIER" -le 10 ]] || ROUTE_DEGRADED_MULTIPLIER=3
+[[ "$ROUTE_DEGRADED_MIN_DELTA_MS" =~ ^[1-9][0-9]{0,4}$ ]] || ROUTE_DEGRADED_MIN_DELTA_MS=500
+[[ "$ROUTE_DEGRADED_MIN_SAMPLES" =~ ^[1-9][0-9]?$ && "$ROUTE_DEGRADED_MIN_SAMPLES" -ge 3 ]] || ROUTE_DEGRADED_MIN_SAMPLES=3
+[[ "$ROUTE_DEGRADED_TRIGGER_COUNT" =~ ^[1-9][0-9]?$ && "$ROUTE_DEGRADED_TRIGGER_COUNT" -ge 2 ]] || ROUTE_DEGRADED_TRIGGER_COUNT=2
+[[ "$ROUTE_DEGRADED_REFRESH_COOLDOWN_SEC" =~ ^[1-9][0-9]{1,4}$ && "$ROUTE_DEGRADED_REFRESH_COOLDOWN_SEC" -ge 60 ]] || ROUTE_DEGRADED_REFRESH_COOLDOWN_SEC=300
 [[ "$ACTIVE_TRAFFIC_WINDOW_SEC" =~ ^[0-9]+$ ]] || ACTIVE_TRAFFIC_WINDOW_SEC=180
 [[ "$G2RAY_SUPERVISOR_VERSION_CHECK_TICKS" =~ ^[0-9]+$ && "$G2RAY_SUPERVISOR_VERSION_CHECK_TICKS" -ge 1 ]] || G2RAY_SUPERVISOR_VERSION_CHECK_TICKS=15
 [[ "$G2RAY_LATENCY_FOCUS_ROUTE_REFRESH_TICKS" =~ ^[0-9]+$ && "$G2RAY_LATENCY_FOCUS_ROUTE_REFRESH_TICKS" -ge 1 ]] || G2RAY_LATENCY_FOCUS_ROUTE_REFRESH_TICKS=15
@@ -482,17 +502,81 @@ xhttp_mode_summary() {
     esac
 }
 
+# Packet-up writes one upload POST at a time, and GitHub's edge drains each POST
+# body through a 64 KiB HTTP/2 stream window. With Xray's 1 MB default POSTs a
+# single upload measured ~0.46 MB/s; 60 KB POSTs fit inside that window and
+# measured 1.5-2.8 MB/s on the same path with unchanged latency and download
+# (2026-10 A/B through a Codespace). The xmux block pins the pinned core's own
+# defaults (3 connections; client defaults differ across Xray releases and 6
+# connections measured ~450 ms slower to first byte) and adds an HTTP/2 PING
+# health check so a silently dead edge connection is retired within ~35 s
+# instead of stalling every new request routed onto it.
+XHTTP_TUNED_EXTRA_JSON='{"scMaxEachPostBytes":60000,"scMinPostsIntervalMs":10,"xmux":{"maxConnections":3,"hMaxRequestTimes":"600-900","hMaxReusableSecs":"1800-3000","hKeepAlivePeriod":20}}'
+
+xhttp_link_tuning_enabled() {
+    local value="${G2RAY_XHTTP_LINK_TUNING:-}"
+    if [[ -z "$value" && -f "$XHTTP_LINK_TUNING_FILE" ]]; then
+        value=$(awk 'NF{gsub(/[[:space:]]/,"");print;exit}' "$XHTTP_LINK_TUNING_FILE" 2>/dev/null || true)
+    fi
+    value=$(printf '%s' "${value:-on}" | tr '[:upper:]' '[:lower:]')
+    case "$value" in
+        0|false|no|off|disabled) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+set_xhttp_link_tuning() {
+    local state="${1:-}"
+    case "$state" in
+        on|off) ;;
+        *) return 1 ;;
+    esac
+    _atomic_write "$XHTTP_LINK_TUNING_FILE" "$state" || return 1
+    log_event INFO "xhttp_link_tuning preference set state=${state}"
+    [[ -s "$CONFIG_FILE" ]] || return 0
+    if ! refresh_config_exports >/dev/null 2>&1; then
+        log_event WARN "xhttp_link_tuning export_refresh_failed state=${state} preference_saved=true"
+        return 1
+    fi
+}
+
+xhttp_link_tuning_summary() {
+    if [[ -n "${G2RAY_XHTTP_EXTRA_JSON:-}" ]] && xhttp_extra_json_valid "$G2RAY_XHTTP_EXTRA_JSON"; then
+        printf 'custom (G2RAY_XHTTP_EXTRA_JSON overrides the built-in tuning)'
+    elif xhttp_link_tuning_enabled; then
+        printf 'on (60 KB upload POSTs + HTTP/2 health check)'
+    else
+        printf 'off (Xray client defaults; ~4x slower uploads through GitHub edge)'
+    fi
+}
+
+# The XHTTP `extra` object exported in client links: a valid custom object wins,
+# otherwise the measured upload tuning unless the user turned it off.
+xhttp_link_extra_json() {
+    if [[ -n "${G2RAY_XHTTP_EXTRA_JSON:-}" ]]; then
+        if xhttp_extra_json_valid "$G2RAY_XHTTP_EXTRA_JSON"; then
+            printf '%s' "$G2RAY_XHTTP_EXTRA_JSON"
+            return 0
+        fi
+        log_event WARN "xhttp_extra_json invalid action=ignore_custom_extra"
+    fi
+    xhttp_link_tuning_enabled || return 0
+    printf '%s' "$XHTTP_TUNED_EXTRA_JSON"
+}
+
 show_xhttp_mode_manager() {
     local choice mode
     while true; do
         refresh_screen
         echo -e "  ${GREEN}XHTTP Client Link Mode${NC}\n"
-        echo -e "  Current : ${WHITE}$(xhttp_mode_summary)${NC}\n"
+        echo -e "  Current       : ${WHITE}$(xhttp_mode_summary)${NC}"
+        echo -e "  Upload tuning : ${WHITE}$(xhttp_link_tuning_summary)${NC}\n"
         echo -e "  ${DIM}The server accepts all supported modes; this controls newly exported links.${NC}\n"
-        echo -e "  ${RED}1)${NC} packet-up  ${DIM}Best default behind GitHub/Codespaces HTTP edge${NC}"
-        echo -e "  ${RED}2)${NC} stream-up  ${DIM}Experimental; test for upload/browsing behavior${NC}"
-        echo -e "  ${RED}3)${NC} stream-one ${DIM}Experimental; most picky through reverse proxies${NC}"
-        echo -e "  ${RED}4)${NC} auto       ${DIM}Let client/core choose where supported${NC}"
+        echo -e "  ${RED}1)${NC} packet-up  ${DIM}Recommended; the only mode measured working through GitHub's edge${NC}"
+        echo -e "  ${RED}2)${NC} stream-up  ${YELLOW}Failed every request through the Codespaces edge in tests${NC}"
+        echo -e "  ${RED}3)${NC} stream-one ${YELLOW}Failed every request through the Codespaces edge in tests${NC}"
+        echo -e "  ${RED}4)${NC} auto       ${DIM}Xray resolves this to packet-up for these TLS links${NC}"
+        echo -e "  ${RED}5)${NC} Toggle upload tuning ${DIM}(turn off only for a client that rejects the extra parameter)${NC}"
         echo -e "  ${RED}0)${NC} Return\n"
         echo -ne "  ${GREEN}Select:${NC} "
         read -r choice
@@ -501,9 +585,27 @@ show_xhttp_mode_manager() {
             2) mode="stream-up" ;;
             3) mode="stream-one" ;;
             4) mode="auto" ;;
+            5)
+                local next_state=on
+                xhttp_link_tuning_enabled && next_state=off
+                if set_xhttp_link_tuning "$next_state"; then
+                    echo -e "\n  ${GREEN}Upload tuning ${next_state}. Exported links were refreshed; re-import them in your client.${NC}"
+                else
+                    echo -e "\n  ${RED}Upload tuning was saved as ${next_state}, but exports could not be refreshed.${NC}"
+                fi
+                echo -ne "  ${DIM}Press Enter to return...${NC}"; read -r
+                continue
+                ;;
             0) return 0 ;;
             *) echo -e "  ${RED}Invalid option.${NC}"; sleep 1; continue ;;
         esac
+        if [[ "$mode" == "stream-up" || "$mode" == "stream-one" ]]; then
+            echo -e "\n  ${YELLOW}${mode} links failed every request through GitHub's Codespaces edge in measured tests.${NC}"
+            echo -ne "  ${GREEN}Export ${mode} links anyway? (y/n):${NC} "
+            local confirm_mode
+            read -r confirm_mode
+            [[ "$confirm_mode" =~ ^[Yy]$ ]] || continue
+        fi
         if set_xhttp_mode "$mode"; then
             echo -e "\n  ${GREEN}XHTTP mode saved: ${mode}.${NC}"
             echo -e "  ${DIM}Existing UUID is preserved. A current auto-mode server stays connected; view configs to copy matching links.${NC}"
@@ -1699,6 +1801,7 @@ reset_route_candidate_state() {
 
 reset_route_candidate_cache() {
     rm -f "$ROUTE_HEALTH_FILE" "$ROUTE_STATS_FILE" "$LAST_GOOD_ROUTE_FILE" "$ROUTE_COOLDOWN_FILE" "$DNS_CANDIDATE_CACHE_FILE" 2>/dev/null || true
+    rm -f "$ROUTE_LATENCY_BASELINE_FILE" "$ROUTE_DEGRADED_REQUEST_FILE" "$ROUTE_DEGRADED_REFRESH_STAMP_FILE" 2>/dev/null || true
     log_event INFO "route_candidate cache_reset"
 }
 
@@ -2248,6 +2351,40 @@ tracked_panel_has_local_changes() {
     return 1
 }
 
+panel_version_of_file() {
+    local candidate="${1:-}"
+    [[ -s "$candidate" ]] || return 1
+    sed -nE 's/^[[:space:]]*readonly G2RAY_ID="G2ray Panel v([0-9]+\.[0-9]+\.[0-9]+)"[[:space:]]*$/\1/p' "$candidate" | awk 'NR==1 {print}'
+}
+
+version_is_older() {
+    local candidate="${1:-}" running="${2:-}" first
+    [[ "$candidate" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$running" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    [[ "$candidate" != "$running" ]] || return 1
+    first=$(printf '%s\n%s\n' "$candidate" "$running" | sort -V | awk 'NR==1 {print}')
+    [[ "$first" == "$candidate" ]]
+}
+
+update_candidate_version_ok() {
+    local candidate_version running="${2:-${G2RAY_ID##* v}}"
+    candidate_version=$(panel_version_of_file "${1:-}") || return 1
+    [[ "$candidate_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$running" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    [[ "${G2RAY_AUTO_UPDATE_FORCE:-0}" == 1 ]] && return 0
+    # This project ships fixes without bumping the panel marker every commit.
+    # Reject downgrades, not legitimate changed scripts with the same version.
+    ! version_is_older "$candidate_version" "$running"
+}
+
+record_update_audit() {
+    local decision="$1" from="$2" to="$3" sha="${4:-unknown}" source_id ts
+    source_id=$(fingerprint_secret "$RAW_BASE_URL")
+    ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    rotate_log_file "$UPDATE_AUDIT_FILE" || return 1
+    printf '%s\t%s\tfrom=%s\tto=%s\tsha256=%s\tsource_id=%s\n' \
+        "$ts" "$decision" "$from" "$to" "$sha" "$source_id" >> "$UPDATE_AUDIT_FILE" || return 1
+    chmod 600 "$UPDATE_AUDIT_FILE" 2>/dev/null || true
+}
+
 check_for_updates() {
     [[ "${G2RAY_AUTO_UPDATE:-0}" == "1" ]] || return 0
     latency_focus_enabled && return 0
@@ -2257,7 +2394,9 @@ check_for_updates() {
         return 0
     fi
     clear; draw_logo
-    local tmp="" staged=""
+    local tmp="" staged="" candidate_version running_version="${G2RAY_ID##* v}" candidate_sha before_sha download_status=0
+    before_sha=$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}' || true)
+    [[ "$before_sha" =~ ^[0-9a-f]{64}$ ]] || return 0
     tmp=$(mktemp "${TMPDIR:-/tmp}/g2ray_remote.XXXXXX") || {
         printf "\r  %b✖%b %bUpdate check failed (no temp file).    %b\n" "$RED" "$NC" "$DIM" "$NC"
         sleep 1
@@ -2269,25 +2408,49 @@ check_for_updates() {
         printf "\r  %b%s%b %bChecking for latest updates...%b" "$GREEN" "${frames[i]}" "$NC" "$WHITE" "$NC"
         i=$(( (i+1) % 10 )); sleep 0.1
     done
-    wait "$pid" || true
-    if verify_update_candidate "$tmp"; then
-        if ! cmp -s "$0" "$tmp"; then
+    wait "$pid" || download_status=$?
+    if (( download_status == 0 )) && verify_update_candidate "$tmp"; then
+        candidate_version=$(panel_version_of_file "$tmp")
+        candidate_sha=$(sha256sum "$tmp" 2>/dev/null | awk '{print $1}')
+        if ! update_candidate_version_ok "$tmp" "$running_version"; then
+            record_update_audit refused_version "$running_version" "${candidate_version:-unknown}" "$candidate_sha" || true
+            printf '\r  Update refused: invalid version or downgrade.\n'
+        elif ! cmp -s "$SCRIPT_PATH" "$tmp"; then
             printf "\r  %b✔%b %bUpdate found! Installing...              %b\n" "$GREEN" "$NC" "$WHITE" "$NC"
-            staged=$(mktemp "${TMPDIR:-/tmp}/g2ray_update.XXXXXX") || {
+            # Stage beside the destination so rename is atomic across filesystems.
+            staged=$(mktemp "$SCRIPT_PATH.update.XXXXXX") || {
+                record_update_audit apply_failed "$running_version" "$candidate_version" "$candidate_sha" || true
                 printf "  %b✖%b %bUpdate staging failed.%b\n" "$RED" "$NC" "$DIM" "$NC"
                 rm -f "$tmp" 2>/dev/null || true
                 sleep 1
                 return 0
             }
-            cp "$tmp" "$staged"
-            chmod +x "$staged"
-            mv -f "$staged" "$0"
+            if ! cp "$tmp" "$staged" || ! chmod --reference="$SCRIPT_PATH" "$staged" || ! chmod u+x "$staged"; then
+                record_update_audit apply_failed "$running_version" "$candidate_version" "$candidate_sha" || true
+                rm -f "$tmp" "$staged" 2>/dev/null || true
+                return 0
+            fi
+            if [[ "$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')" != "$before_sha" ]]; then
+                record_update_audit changed_during_check "$running_version" "$candidate_version" "$candidate_sha" || true
+                printf '  Update skipped: the local panel changed during the download.\n'
+                rm -f "$tmp" "$staged" 2>/dev/null || true
+                return 0
+            fi
+            if ! mv -f "$staged" "$SCRIPT_PATH"; then
+                record_update_audit apply_failed "$running_version" "$candidate_version" "$candidate_sha" || true
+                printf '  Update could not be installed; the previous panel is unchanged.\n'
+                rm -f "$tmp" "$staged" 2>/dev/null || true
+                return 0
+            fi
+            record_update_audit applied "$running_version" "$candidate_version" "$candidate_sha" || true
             printf "  %b✔%b %bUpdate applied! Restarting...%b\n" "$GREEN" "$NC" "$WHITE" "$NC"
-            sleep 1.5; exec bash "$0" "$@"
+            rm -f "$tmp" 2>/dev/null || true
+            sleep 1.5; exec bash "$SCRIPT_PATH" "$@"
         else
             printf "\r  %b✔%b %bSystem is fully up to date.               %b\n" "$GREEN" "$NC" "$DIM" "$NC"
         fi
     else
+        record_update_audit rejected "$running_version" unknown "$(sha256sum "$tmp" 2>/dev/null | awk '{print $1}')" || true
         printf "\r  %b✖%b %bUpdate check failed (network or 404).     %b\n" "$RED" "$NC" "$DIM" "$NC"
     fi
     rm -f "$tmp" "$staged" 2>/dev/null || true
@@ -2975,7 +3138,7 @@ upgrade_config_dns() {
         log_event WARN "config_dns temp_create_failed"
         return 1
     }
-    if jq --argjson ws_heartbeat "$WS_HEARTBEAT_PERIOD_SEC" '
+    if jq --argjson ws_heartbeat "$WS_HEARTBEAT_PERIOD_SEC" --argjson max_buffered_posts "$XHTTP_SERVER_MAX_BUFFERED_POSTS" '
       .dns = {
         "servers": ["localhost", "168.63.129.16", "1.1.1.1", "1.0.0.1", "8.8.8.8"],
         "queryStrategy": "UseIPv4",
@@ -2998,6 +3161,8 @@ upgrade_config_dns() {
         )
       | (.inbounds[]? | select(.sniffing? and .sniffing.destOverride?) | .sniffing.destOverride) |= (map(select(. != "quic")))
       | (.inbounds[]? | select(.tag == "vless-in" and .streamSettings.xhttpSettings?) | .streamSettings.xhttpSettings.mode) = "auto"
+      | (.inbounds[]? | select(.tag == "vless-in" and .streamSettings.xhttpSettings?) | .streamSettings.xhttpSettings.scMaxBufferedPosts) |=
+          (if . == null or . < $max_buffered_posts then $max_buffered_posts else . end)
       | (.inbounds[]? | select(.tag == "vless-ws" and .streamSettings.wsSettings?) | .streamSettings.wsSettings.heartbeatPeriod) = $ws_heartbeat
       | (.outbounds[]? | select(.protocol == "blackhole") | .settings.response.type) = "none"
       | (.policy.levels["0"].handshake) |=
@@ -3192,6 +3357,72 @@ health_probe() {
     log_event INFO "health engine=${engine} listener=${listener} external_code=${code:-0} xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} xhttp_route_usable=${xhttp_route_usable} domain=${PORT_DOMAIN}"
 }
 
+observe_route_latency() {
+    local code="${1:-0}" ms="${2:-0}" key="${PORT_DOMAIN}" old_key="" stamp=0 baseline=0 samples=0 count=0 now degraded=false
+    now=$(date +%s)
+    if [[ -s "$ROUTE_LATENCY_BASELINE_FILE" ]]; then
+        read -r old_key stamp baseline samples count < "$ROUTE_LATENCY_BASELINE_FILE" || true
+    fi
+    if [[ "$old_key" != "$key" || ! "$stamp" =~ ^(0|[1-9][0-9]{0,11})$ || ! "$baseline" =~ ^(0|[1-9][0-9]{0,5})$ \
+        || ! "$samples" =~ ^(0|[1-9][0-9]{0,6})$ || ! "$count" =~ ^(0|[1-9][0-9]{0,2})$ ]] \
+        || (( now < stamp || now - stamp > 1800 )); then
+        baseline=0; samples=0; count=0
+    fi
+    if ! xhttp_status_usable "$code" || [[ ! "$ms" =~ ^(0|[1-9][0-9]{0,5})$ ]]; then
+        # A failed probe breaks the consecutive chain, not the latency baseline.
+        if (( samples > 0 )); then
+            _atomic_write "$ROUTE_LATENCY_BASELINE_FILE" "$key $stamp $baseline $samples 0" || return 1
+        fi
+        return 0
+    fi
+    if (( samples >= ROUTE_DEGRADED_MIN_SAMPLES && baseline > 0 \
+        && ms >= baseline * ROUTE_DEGRADED_MULTIPLIER && ms >= baseline + ROUTE_DEGRADED_MIN_DELTA_MS )); then
+        degraded=true
+        count=$((count + 1))
+        (( count > ROUTE_DEGRADED_TRIGGER_COUNT )) && count="$ROUTE_DEGRADED_TRIGGER_COUNT"
+        baseline=$((baseline + (ms - baseline) / 10))
+    else
+        count=0
+        (( samples == 0 )) && baseline="$ms" || baseline=$(((baseline * 7 + ms * 3) / 10))
+    fi
+    samples=$((samples + 1))
+    (( samples > 1000000 )) && samples=1000000
+    _atomic_write "$ROUTE_LATENCY_BASELINE_FILE" "$key $now $baseline $samples $count" || return 1
+    [[ "$degraded" == true ]] || return 0
+    (( count >= ROUTE_DEGRADED_TRIGGER_COUNT )) || return 0
+    (( $(stamp_age_sec "$ROUTE_DEGRADED_REFRESH_STAMP_FILE") >= ROUTE_DEGRADED_REFRESH_COOLDOWN_SEC )) || return 0
+    route_refresh_retry_allowed || return 0
+    _atomic_write "$ROUTE_DEGRADED_REQUEST_FILE" "$key $now" || return 1
+    _atomic_write "$ROUTE_DEGRADED_REFRESH_STAMP_FILE" "$now" || return 1
+    log_event WARN "self_heal route_degraded xhttp_probe_ms=${ms} action=queue_route_refresh"
+}
+
+refresh_degraded_routes_if_requested() {
+    local key stamp now status=0
+    [[ -s "$ROUTE_DEGRADED_REQUEST_FILE" ]] || return 0
+    read -r key stamp < "$ROUTE_DEGRADED_REQUEST_FILE" || return 1
+    now=$(date +%s)
+    if [[ "$key" != "$PORT_DOMAIN" || ! "$stamp" =~ ^(0|[1-9][0-9]{0,11})$ ]] || (( now < stamp || now - stamp > 600 )); then
+        rm -f "$ROUTE_DEGRADED_REQUEST_FILE" 2>/dev/null || true
+        return 0
+    fi
+    route_refresh_retry_allowed || return 0
+    rm -f "$ROUTE_DEGRADED_REQUEST_FILE" || return 1
+    # Run outside the shorter self-heal deadline. --force bypasses a fresh
+    # cache, but the existing route lock, retry backoff and deadlines remain.
+    write_background_supervisor_heartbeat >/dev/null 2>&1 || true
+    run_with_deadline "$G2RAY_SUPERVISOR_ROUTE_REFRESH_TIMEOUT_SEC" refresh_route_candidate_health --force || status=$?
+    write_background_supervisor_heartbeat >/dev/null 2>&1 || true
+    if (( status != 0 )); then
+        log_event WARN "route_degraded refresh_failed action=retain_exports"
+        return 0
+    fi
+    if [[ "$(route_refresh_state_value consecutive_failures)" == 0 ]] && route_health_cache_fresh; then
+        run_with_deadline "$G2RAY_SUPERVISOR_EXPORT_TIMEOUT_SEC" refresh_config_exports_if_changed || true
+    fi
+    write_background_supervisor_heartbeat >/dev/null 2>&1 || true
+}
+
 self_heal_once() {
     [[ -f "$CONFIG_FILE" ]] || return 0
     local reason="" code xcode xms bad_count threshold traffic_active=false traffic_signal=none
@@ -3210,6 +3441,7 @@ self_heal_once() {
     fi
 
     if [[ -n "$reason" ]]; then
+        observe_route_latency 0 0 >/dev/null 2>&1 || true
         log_event WARN "self_heal restart reason=${reason}"
         if start_xray >/dev/null 2>&1 && wait_for_port >/dev/null 2>&1; then
             log_event INFO "self_heal restart_ok reason=${reason}"
@@ -3221,6 +3453,7 @@ self_heal_once() {
     fi
 
     read -r xcode xms _probe_reason < <(xhttp_probe_metrics external)
+    observe_route_latency "$xcode" "$xms" >/dev/null 2>&1 || true
     if xhttp_status_usable "$xcode"; then
         reset_route_bad_count
         reset_edge_bad_count
@@ -3301,6 +3534,7 @@ _background_tasks() {
         force_public_runtime_ports "supervisor_start" >/dev/null 2>&1 || true
         run_with_deadline "$G2RAY_SUPERVISOR_STATS_TIMEOUT_SEC" save_xray_stats >/dev/null 2>&1 || true
         run_with_deadline "$G2RAY_SUPERVISOR_SELF_HEAL_TIMEOUT_SEC" self_heal_once >/dev/null 2>&1 || true
+        refresh_degraded_routes_if_requested >/dev/null 2>&1 || true
         if ! latency_focus_enabled || ! route_health_cache_fresh; then
             run_with_deadline "$G2RAY_SUPERVISOR_ROUTE_REFRESH_TIMEOUT_SEC" refresh_route_candidate_health >/dev/null 2>&1 || true
             if route_health_cache_exportable || ! config_export_artifacts_match_current_uuid; then
@@ -3336,6 +3570,7 @@ _background_tasks() {
         [[ -f "$CONFIG_FILE" ]] || continue
         run_with_deadline "$G2RAY_SUPERVISOR_STATS_TIMEOUT_SEC" save_xray_stats >/dev/null 2>&1 || true
         run_with_deadline "$G2RAY_SUPERVISOR_SELF_HEAL_TIMEOUT_SEC" self_heal_once >/dev/null 2>&1 || true
+        refresh_degraded_routes_if_requested >/dev/null 2>&1 || true
         save_session_uptime >/dev/null 2>&1 || true
         if active_tunnel_recent; then
             (( ++health_tick >= 15 )) && { run_with_deadline "$G2RAY_SUPERVISOR_HEALTH_TIMEOUT_SEC" health_probe >/dev/null 2>&1; health_tick=0; }
@@ -3890,7 +4125,7 @@ JSONEOF
       },
       "streamSettings": {
         "network": "xhttp", "security": "none",
-        "xhttpSettings": { "mode": "${xhttp_accept_mode}", "path": "/" },
+        "xhttpSettings": { "mode": "${xhttp_accept_mode}", "path": "/", "scMaxBufferedPosts": ${XHTTP_SERVER_MAX_BUFFERED_POSTS} },
         "sockopt": { "tcpKeepAliveInterval": ${TCP_KEEPALIVE_INTERVAL_SEC}, "tcpKeepAliveIdle": ${TCP_KEEPALIVE_IDLE_SEC} }
       },
       "sniffing": { "enabled": true, "destOverride": ${sniff_dest}, "routeOnly": false }
@@ -4128,16 +4363,8 @@ generate_link_for_address() {
     [[ "$path" == /* ]] || path="/${path}"
     encoded_path=$(url_encode_query_value "$path")
     xhttp_mode=$(xhttp_config_mode)
-    # Keep exported links broadly compatible: omit XHTTP `extra` unless the user
-    # explicitly supplies a complete, valid object for a known-compatible client.
     local extra_json=""
-    if [[ -n "${G2RAY_XHTTP_EXTRA_JSON:-}" ]]; then
-        if xhttp_extra_json_valid "$G2RAY_XHTTP_EXTRA_JSON"; then
-            extra_json="$G2RAY_XHTTP_EXTRA_JSON"
-        else
-            log_event WARN "xhttp_extra_json invalid action=omit_extra"
-        fi
-    fi
+    extra_json=$(xhttp_link_extra_json)
     [[ -n "$extra_json" ]] && extra_param="&extra=$(url_encode_query_value "$extra_json")"
     printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2&insecure=0&allowInsecure=0&type=xhttp&host=%s&path=%s&mode=%s%s#G2rayXCodeLeafy|%s' \
         "$uuid" "$address" "$CODESPACES_EDGE_PORT" "$PORT_DOMAIN" "$PORT_DOMAIN" "$encoded_path" "$(url_encode_query_value "$xhttp_mode")" "$extra_param" "${GITHUB_USER:-User}${label_suffix}"
@@ -4338,16 +4565,20 @@ update_route_candidate_stats() {
     awk -F '\t' -v OFS='\t' \
         -v target="$ip" -v code="$code" -v ms="$ms" -v usable="$usable" -v checked="$checked" -v source="$source" -v reason="$reason" \
         -v cutoff="$stats_cutoff" '
-        function emit(ip, samples, successes, failures, avg, min, max, last_ms, last_code, last_usable, last_checked, ewma, recent_failures, last_reason) {
+        function expired(stamp) {
+            # Bookworm mawk does not support interval expressions such as {4}.
+            return cutoff != "" && stamp ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ && stamp < cutoff
+        }
+        function emit(ip, samples, successes, failures, avg, min, max, last_ms, last_code, last_usable, last_checked, ewma, recent_failures, last_reason, variation) {
             if (samples < 1) samples = 1
-            printf "%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%d\t%d\t%s\n",
+            printf "%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%d\t%d\t%s\t%d\n",
                 ip, samples, successes, failures, avg, min, max,
                 last_ms, last_code, last_usable, last_checked,
-                ewma, recent_failures, last_reason
+                ewma, recent_failures, last_reason, variation
         }
         $1 == target {
             found = 1
-            stale = (cutoff != "" && NF >= 11 && $11 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}T/ && $11 < cutoff)
+            stale = (NF >= 11 && expired($11))
             samples = stale ? 1 : (($2 ~ /^[0-9]+$/) ? $2 + 1 : 1)
             successes = stale ? 0 : (($3 ~ /^[0-9]+$/) ? $3 + 0 : 0)
             failures = stale ? 0 : (($4 ~ /^[0-9]+$/) ? $4 + 0 : 0)
@@ -4356,7 +4587,10 @@ update_route_candidate_stats() {
             max = stale ? 0 : (($7 ~ /^[0-9]+$/) ? $7 + 0 : 0)
             ewma = stale ? 0 : (($12 ~ /^[0-9]+$/) ? $12 + 0 : avg)
             recent_failures = stale ? 0 : (($13 ~ /^[0-9]+$/) ? $13 + 0 : 0)
+            variation = stale ? 0 : (($15 ~ /^[0-9]+$/) ? $15 + 0 : 0)
             if (usable == "true") {
+                deviation = (successes == 0) ? 0 : ((ms >= avg) ? ms - avg : avg - ms)
+                variation = int((variation * 7 + deviation * 3) / 10 + 0.5)
                 successes += 1
                 avg = (successes == 1) ? ms : int((((avg * (successes - 1)) + ms) / successes) + 0.5)
                 min = (min == 0 || ms < min) ? ms : min
@@ -4369,11 +4603,11 @@ update_route_candidate_stats() {
                 ewma = (ewma == 0) ? penalty_ms : int(((ewma * 7 + penalty_ms * 3) / 10) + 0.5)
                 recent_failures += 1
             }
-            emit(target, samples, successes, failures, avg, min, max, ms, code, usable, checked, ewma, recent_failures, reason)
+            emit(target, samples, successes, failures, avg, min, max, ms, code, usable, checked, ewma, recent_failures, reason, variation)
             next
         }
         NF >= 1 {
-            if ($1 != target && cutoff != "" && NF >= 11 && $11 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}T/ && $11 < cutoff) next
+            if ($1 != target && NF >= 11 && expired($11)) next
             print
         }
         END {
@@ -4386,7 +4620,7 @@ update_route_candidate_stats() {
                 max = (usable == "true") ? ms : 0
                 ewma = (usable == "true") ? ms : ((ms > 0) ? ms : 9999)
                 recent_failures = (usable == "true") ? 0 : 1
-                emit(target, samples, successes, failures, avg, min, max, ms, code, usable, checked, ewma, recent_failures, reason)
+                emit(target, samples, successes, failures, avg, min, max, ms, code, usable, checked, ewma, recent_failures, reason, 0)
             }
         }
     ' "$ROUTE_STATS_FILE" 2>/dev/null > "$tmp" || { rm -f "$tmp"; return 1; }
@@ -4730,7 +4964,7 @@ cached_usable_fallback_ips() {
     cache_age=$(file_age_sec "$ROUTE_HEALTH_FILE")
     [[ "$ROUTE_HEALTH_EXPORT_MAX_AGE_SEC" =~ ^[0-9]+$ ]] || ROUTE_HEALTH_EXPORT_MAX_AGE_SEC=21600
     if (( cache_age > ROUTE_HEALTH_EXPORT_MAX_AGE_SEC )); then
-        log_event WARN "fallback_route_filter stale_cache age_sec=${cache_age} max_age_sec=${ROUTE_HEALTH_EXPORT_MAX_AGE_SEC} action=domain_only"
+        [[ "${1:-}" == --quiet ]] || log_event WARN "fallback_route_filter stale_cache age_sec=${cache_age} max_age_sec=${ROUTE_HEALTH_EXPORT_MAX_AGE_SEC} action=domain_only"
         return 1
     fi
     pinned=$(pinned_route_value)
@@ -4746,6 +4980,7 @@ cached_usable_fallback_ips() {
                 latest[$1] = ($8 ~ /^[0-9]+$/) ? $8 + 0 : 0
                 ewma[$1] = ($12 ~ /^[0-9]+$/) ? $12 + 0 : avg[$1]
                 recent_failures[$1] = ($13 ~ /^[0-9]+$/) ? $13 + 0 : 0
+                variation[$1] = ($15 ~ /^[0-9]+$/) ? $15 + 0 : 0
             }
             next
         }
@@ -4762,16 +4997,34 @@ cached_usable_fallback_ips() {
             route_score = score_ms + success_penalty
             pinned_rank = (ip == pinned) ? 0 : 1
             last_good_rank = (ip == last_good) ? 0 : 1
-            printf "%d\t%08d\t%08d\t%04d\t%08d\t%d\t%s\t%s\t%s\n",
-                pinned_rank, route_score, score_ms, success_penalty, last_ms, last_good_rank, ip, $3, $4
+            printf "%d\t%08d\t%08d\t%04d\t%08d\t%08d\t%d\t%s\t%s\t%s\n",
+                pinned_rank, route_score, score_ms, success_penalty, variation[ip], last_ms, last_good_rank, ip, $3, $4
         }
-    ' "$stats_input" "$ROUTE_HEALTH_FILE" 2>/dev/null | sort -k1,1n -k2,2n -k3,3n -k4,4n -k5,5n -k6,6n \
-        | while IFS=$'\t' read -r _pinned _route_score _avg _success _latest _last_good ip _code _ms; do
+    ' "$stats_input" "$ROUTE_HEALTH_FILE" 2>/dev/null | sort -k1,1n -k2,2n -k3,3n -k4,4n -k5,5n -k6,6n -k7,7n \
+        | while IFS=$'\t' read -r _pinned _route_score _avg _success _variation _latest _last_good ip _code _ms; do
             valid_ipv4 "$ip" || continue
             candidate_blacklisted "$ip" && continue
             route_candidate_cooldown_active "$ip" && ! route_candidate_cooldown_bypass "$ip" && continue
             printf '%s\n' "$ip"
         done | awk '!seen[$0]++ {print}'
+}
+
+menu_best_route_summary() {
+    local ip ewma pinned age suffix="" max_age="$ROUTE_HEALTH_EXPORT_MAX_AGE_SEC"
+    [[ -s "$ROUTE_HEALTH_FILE" ]] || { printf 'no cached probes yet'; return 0; }
+    age=$(file_age_sec "$ROUTE_HEALTH_FILE")
+    if (( age > max_age )); then
+        printf 'expired cache (option 17)'
+        return 0
+    fi
+    (( age > ROUTE_HEALTH_TTL_SEC )) && suffix=' [stale cache]'
+    ip=$(cached_usable_fallback_ips --quiet | awk 'NR==1 {print}' || true)
+    [[ -n "$ip" ]] || { printf 'no usable cached routes'; return 0; }
+    ewma=$(awk -F '\t' -v ip="$ip" '$1==ip {print ($12 ~ /^[0-9]+$/) ? $12 : $5; exit}' "$ROUTE_STATS_FILE" 2>/dev/null || true)
+    [[ "$ewma" =~ ^[0-9]+$ ]] || ewma='?'
+    pinned=$(pinned_route_value)
+    [[ "$ip" == "$pinned" ]] && suffix="${suffix} [pinned]"
+    printf '%s (server probe EWMA %sms)%s' "$ip" "$ewma" "$suffix"
 }
 
 route_candidate_health_summary() {
@@ -4823,6 +5076,7 @@ route_candidate_health_summary() {
                 latest[$1] = ($8 ~ /^[0-9]+$/) ? $8 + 0 : 0
                 ewma[$1] = ($12 ~ /^[0-9]+$/) ? $12 + 0 : avg[$1]
                 recent_failures[$1] = ($13 ~ /^[0-9]+$/) ? $13 + 0 : 0
+                variation[$1] = ($15 ~ /^[0-9]+$/) ? $15 + 0 : 0
                 last_reason[$1] = (NF >= 14 && $14 != "") ? $14 : "unknown"
             }
             next
@@ -4844,13 +5098,13 @@ route_candidate_health_summary() {
             pinned_rank = (ip == pinned) ? 0 : 1
             source = (NF >= 6 && $6 != "") ? $6 : "unknown"
             reason = (NF >= 7 && $7 != "") ? $7 : ((ip in last_reason) ? last_reason[ip] : "unknown")
-            line = sprintf("%-15s HTTP %-3s last=%sms avg=%sms success=%s/%s recent=%sms recent_fail=%s confidence=%s usable=%s source=%s reason=%s",
-                ip, $3, last_ms, avg_ms, ok, total, score_ms, recent, confidence, record_usable ? "true" : "false", source, reason)
-            printf "%d\t%d\t%08d\t%08d\t%04d\t%08d\t%s\t%s\n",
-                pinned_rank, usable_rank, route_score, score_ms, success_penalty, last_ms, ip, line
+            line = sprintf("%-15s HTTP %-3s last=%sms avg=%sms success=%s/%s recent=%sms probe_variation=%sms recent_fail=%s confidence=%s usable=%s source=%s reason=%s",
+                ip, $3, last_ms, avg_ms, ok, total, score_ms, variation[ip], recent, confidence, record_usable ? "true" : "false", source, reason)
+            printf "%d\t%d\t%08d\t%08d\t%04d\t%08d\t%08d\t%s\t%s\n",
+                pinned_rank, usable_rank, route_score, score_ms, success_penalty, variation[ip], last_ms, ip, line
         }
-    ' "$stats_input" "$ROUTE_HEALTH_FILE" 2>/dev/null | sort -k1,1n -k2,2n -k3,3n -k4,4n -k5,5n -k6,6n \
-        | while IFS=$'\t' read -r _pinned _usable _route_score _avg _success _latest ip line; do
+    ' "$stats_input" "$ROUTE_HEALTH_FILE" 2>/dev/null | sort -k1,1n -k2,2n -k3,3n -k4,4n -k5,5n -k6,6n -k7,7n \
+        | while IFS=$'\t' read -r _pinned _usable _route_score _avg _success _variation _latest ip line; do
             candidate_blacklisted "$ip" && continue
             printf '%s\n' "$line"
         done
@@ -5245,8 +5499,47 @@ generate_ordered_links() {
     printf '%s\n' "$ws_links" | awk 'NF'
 }
 
+config_export_route_ips() {
+    local link authority ip
+    while IFS= read -r link; do
+        [[ "$link" == vless://* ]] || continue
+        authority="${link#vless://}"
+        authority="${authority%%\?*}"
+        authority="${authority##*@}"
+        ip="${authority%%:*}"
+        valid_ipv4 "$ip" && printf '%s\n' "$ip"
+    done <<< "${1:-}" | awk '!seen[$0]++'
+}
+
+route_quality_json() {
+    local ips="${1:-}" result
+    [[ -n "$ips" && -s "$ROUTE_STATS_FILE" ]] || { printf '[]'; return 0; }
+    # jq handles string escaping, including corrupt TSV timestamps. Capture
+    # output first so a failing parser cannot append [] after partial JSON.
+    if result=$(jq -Rn --arg ips "$ips" '
+        def numeric: if test("^[0-9]{1,12}$") then tonumber else 0 end;
+        def latency($fallback): if test("^[0-9]{1,6}$") and tonumber > 0 then tonumber else ($fallback | numeric) end;
+        [inputs | split("\t") | select(length >= 11)] as $rows |
+        ($ips | split("\n") | map(select(length > 0))) as $order |
+        [range(0; $order | length) as $i | $order[$i] as $ip |
+         first($rows[] | select(.[0] == $ip)) as $r |
+         {ip: $ip, rank: ($i + 1), samples: ($r[1] | numeric), successes: ($r[2] | numeric),
+          avg_latency_ms: ($r[4] | numeric), last_latency_ms: ($r[7] | numeric),
+          ewma_latency_ms: (($r[11] // "") | latency($r[4])),
+          probe_variation_ms: (($r[14] // "0") | numeric), last_checked: $r[10]}]
+    ' "$ROUTE_STATS_FILE" 2>/dev/null); then
+        printf '%s' "$result"
+    else
+        printf '[]'
+    fi
+}
+
 write_config_metadata() {
-    local count="$1" hash="$2" generated max_links payload xray_port ws_port
+    local count="$1" hash="$2" links="${3:-}" generated max_links payload xray_port ws_port route_quality
+    route_quality=$(route_quality_json "$(config_export_route_ips "$links")")
+    if ! jq -e 'type == "array" and all(.[]; type == "object")' >/dev/null 2>&1 <<< "$route_quality"; then
+        route_quality='[]'
+    fi
     max_links=$(safe_max_fallback_links)
     generated=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')
     [[ "$count" =~ ^[0-9]+$ ]] || count=0
@@ -5275,7 +5568,10 @@ write_config_metadata() {
   "ws_front_domain": "$(json_escape "$(ws_front_domain_value 2>/dev/null || true)")",
   "low_overhead": $(low_overhead_enabled && printf true || printf false),
   "latency_focus": $(latency_focus_enabled && printf true || printf false),
-  "domain_link_exported": $(domain_link_export_enabled && printf true || printf false)
+  "domain_link_exported": $(domain_link_export_enabled && printf true || printf false),
+  "xhttp_link_tuning": $(xhttp_link_tuning_enabled && printf true || printf false),
+  "route_probe_scope": "codespace_side_options_not_client_ping",
+  "routes": ${route_quality}
 }
 JSON
     ) || return 1
@@ -5296,6 +5592,9 @@ write_codespace_import_bundle() {
         printf '  "configs": [\n'
         while IFS= read -r link; do
             [[ -n "$link" ]] || continue
+            # The G2Ray Android app applies its own XHTTP transport tuning and
+            # releases before this change reject links that carry `extra`.
+            link=$(printf '%s' "$link" | sed -E 's/&extra=[^&#]*//')
             if [[ "$first" != true ]]; then printf ',\n'; fi
             printf '    "%s"' "$(json_escape "$link")"
             first=false
@@ -5318,7 +5617,7 @@ write_config_exports_from_links() {
     write_codespace_import_bundle "$links" || return 1
     count=$(printf '%s\n' "$links" | awk 'NF {c++} END {print c+0}')
     hash=$(fingerprint_secret "$links")
-    write_config_metadata "$count" "$hash" || return 1
+    write_config_metadata "$count" "$hash" "$links" || return 1
     log_event INFO "config_exports refreshed count=${count} hash=${hash}"
 }
 
@@ -5369,6 +5668,7 @@ export_input_hash() {
         printf 'max_links=%s\n' "$(safe_max_fallback_links)"
         printf 'ws_max_links=%s\n' "$(safe_ws_fallback_links)"
         printf 'xhttp_mode=%s\n' "$(xhttp_config_mode)"
+        printf 'xhttp_extra=%s\n' "$(fingerprint_secret "$(xhttp_link_extra_json 2>/dev/null || true)")"
         printf 'domain_export=%s\n' "$(domain_link_export_enabled && printf true || printf false)"
         printf 'ws_enabled=%s\n' "$(ws_fallback_enabled && printf true || printf false)"
         printf 'ws_front=%s\n' "$(ws_front_domain_value 2>/dev/null || true)"
@@ -5448,9 +5748,47 @@ refresh_config_exports_if_changed() {
     with_file_lock "$EXPORT_LOCK_FILE" 45 _refresh_config_exports_if_changed_impl "$@"
 }
 
+kernel_tcp_value() {
+    local key="${1:-}" value
+    case "$key" in
+        tcp_congestion_control|tcp_available_congestion_control|tcp_allowed_congestion_control|tcp_slow_start_after_idle) ;;
+        *) printf 'unknown'; return 0 ;;
+    esac
+    value=$(cat "/proc/sys/net/ipv4/$key" 2>/dev/null | awk 'NF {$1=$1; print; exit}' || true)
+    printf '%s' "${value:-unknown}"
+}
+
+runtime_tuning_diagnostics() {
+    local installed expected state=unknown policy
+    installed=$(timeout 3 "$XRAY_BIN" version 2>/dev/null | awk 'NR==1 && $1=="Xray" {print $2}' || true)
+    expected=$(awk '$1=="ARG" && $2 ~ /^XRAY_VERSION=/ {sub(/^XRAY_VERSION=/,"",$2); print $2; exit}' \
+        "$BASE_DIR/.devcontainer/Dockerfile" 2>/dev/null || true)
+    installed=${installed#v}
+    expected=${expected#v}
+    expected=${expected%$'\r'}
+    [[ "$installed" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || installed=unknown
+    [[ "$expected" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || expected=unknown
+    if [[ "$installed" != unknown && "$expected" != unknown ]]; then
+        [[ "$installed" == "$expected" ]] && state=matches || state=different
+    fi
+    printf 'Xray binary: installed=%s image_pin=%s state=%s\n' "$installed" "$expected" "$state"
+    if [[ "$state" == different ]]; then
+        printf 'Image drift: git pull does not rebuild the container; a planned container rebuild applies its default pin.\n'
+    fi
+    # Read the config on disk, not the profile preference (which may be pending).
+    policy=$(jq -r '(.policy.levels["0"] // {}) as $p |
+        "level=0 connIdle=\($p.connIdle // "core-default") uplinkOnly=\($p.uplinkOnly // "core-default") downlinkOnly=\($p.downlinkOnly // "core-default") direct_congestion=\([.outbounds[]? | select(.tag=="direct") | .streamSettings.sockopt.tcpCongestion] | first // "kernel-default")"' \
+        "$CONFIG_FILE" 2>/dev/null || true)
+    printf 'Config policy: %s\n' "${policy:-unavailable}"
+    printf 'TCP kernel: default=%s available=%s allowed=%s slow_start_after_idle=%s\n' \
+        "$(kernel_tcp_value tcp_congestion_control)" "$(kernel_tcp_value tcp_available_congestion_control)" \
+        "$(kernel_tcp_value tcp_allowed_congestion_control)" "$(kernel_tcp_value tcp_slow_start_after_idle)"
+}
+
 log_diagnostic_snapshot() {
     local reason="${1:-diagnostics}" local_probe local_ms edge_probe edge_ms engine listener supervisor ts
-    local waker_url waker_codespace waker_fp waker_at
+    local waker_url waker_codespace waker_fp waker_at tuning="${2:-}"
+    [[ -n "$tuning" ]] || tuning=$(runtime_tuning_diagnostics)
     ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')
     read -r local_probe local_ms _probe_reason < <(xhttp_probe_metrics local)
     read -r edge_probe edge_ms _probe_reason < <(xhttp_probe_metrics external)
@@ -5475,6 +5813,8 @@ log_diagnostic_snapshot() {
         printf 'edge_xhttp_options: HTTP %s latency_ms=%s usable=%s\n' "${edge_probe:-0}" "${edge_ms:-0}" "$(xhttp_status_usable "$edge_probe" && printf true || printf false)"
         printf 'supervisor: %s\n' "${supervisor:-unknown}"
         printf 'self_heal: %s\n' "$(self_heal_state_summary)"
+        printf 'runtime_tuning:\n'
+        printf '%s\n' "$tuning" | sed 's/^/  /'
         printf 'resume_gap:\n'
         resume_gap_summary | sed 's/^/  /'
         printf 'last_known_state:\n'
@@ -5596,6 +5936,10 @@ create_support_bundle() {
     copy_redacted_log_family "$LOG_DIR/xray-error.log" "$tmp/logs/xray-error.log"
     copy_redacted_file "$ROUTE_HEALTH_FILE" "$tmp/state/route_candidate_health.tsv"
     copy_redacted_file "$ROUTE_STATS_FILE" "$tmp/state/route_candidate_stats.tsv"
+    copy_redacted_file "$ROUTE_LATENCY_BASELINE_FILE" "$tmp/state/route_latency_baseline"
+    copy_redacted_file "$ROUTE_DEGRADED_REQUEST_FILE" "$tmp/state/route_degraded_request"
+    copy_redacted_file "$ROUTE_DEGRADED_REFRESH_STAMP_FILE" "$tmp/state/route_degraded_refresh_stamp"
+    copy_redacted_log_family "$UPDATE_AUDIT_FILE" "$tmp/state/update_audit.log"
     copy_redacted_file "$LAST_GOOD_ROUTE_FILE" "$tmp/state/last_good_route.txt"
     copy_redacted_file "$DNS_CANDIDATE_CACHE_FILE" "$tmp/state/dns_candidate_cache.tsv"
     copy_redacted_file "$ROUTE_SETTLING_HISTORY_FILE" "$tmp/state/route_settling_history.tsv"
@@ -5627,7 +5971,9 @@ create_support_bundle() {
 show_diagnostics() {
     refresh_screen
     log_event INFO "diagnostics opened"
-    log_diagnostic_snapshot "interactive"
+    local runtime_tuning
+    runtime_tuning=$(runtime_tuning_diagnostics)
+    log_diagnostic_snapshot "interactive" "$runtime_tuning"
     echo -e "\n  ${RED}● Diagnostics${NC}\n"
     echo -e "  Identity : ${WHITE}${CODESPACE_NAME}${NC}"
     echo -e "  Domain   : ${WHITE}${PORT_DOMAIN}${NC}"
@@ -5768,6 +6114,7 @@ show_diagnostics() {
     echo -e "  ${DIM}These files persist across panel screens and are rotated by size.${NC}"
 
     echo -e "\n  ${WHITE}${B}Runtime Tuning${NC}"
+    printf '%s\n' "$runtime_tuning" | sed 's/^/  /'
     echo -e "  Performance profile : ${WHITE}$(effective_performance_profile)${NC} ${DIM}(saved=${PERFORMANCE_PROFILE})${NC}"
     echo -e "  Low-overhead mode   : ${WHITE}$(low_overhead_summary)${NC}"
     echo -e "  Latency focus mode  : ${WHITE}$(latency_focus_summary)${NC}"
@@ -6255,6 +6602,7 @@ print_doctor_json() {
   "low_overhead": $(low_overhead_enabled && printf true || printf false),
   "latency_focus": $(latency_focus_enabled && printf true || printf false),
   "xhttp_mode": "$(json_escape "$(xhttp_mode_value)")",
+  "xhttp_link_tuning": $(xhttp_link_tuning_enabled && printf true || printf false),
   "performance_profile": "$(json_escape "$(effective_performance_profile)")",
   "saved_performance_profile": "$(json_escape "$PERFORMANCE_PROFILE")",
   "log_file": "$(json_escape "$LOG_FILE")",
@@ -6353,6 +6701,10 @@ bench_rebind_runtime_paths() {
     WAKER_METADATA_FILE="$DATA_DIR/waker_metadata.txt"
     WAKER_PROMPT_FILE="$DATA_DIR/.waker_setup_prompted"
     ROUTE_BAD_COUNT_FILE="$DATA_DIR/xhttp_route_bad_count"
+    ROUTE_LATENCY_BASELINE_FILE="$DATA_DIR/route_latency_baseline"
+    ROUTE_DEGRADED_REQUEST_FILE="$DATA_DIR/route_degraded_request"
+    ROUTE_DEGRADED_REFRESH_STAMP_FILE="$DATA_DIR/route_degraded_refresh_stamp"
+    UPDATE_AUDIT_FILE="$DATA_DIR/update_audit.log"
     EDGE_BAD_COUNT_FILE="$DATA_DIR/edge_bad_count"
     EDGE_RECONNECT_STAMP_FILE="$DATA_DIR/edge_reconnect_last"
     ROUTE_HEALTH_FILE="$DATA_DIR/route_candidate_health.tsv"
@@ -6362,6 +6714,7 @@ bench_rebind_runtime_paths() {
     BOOT_STATUS_FILE="$DATA_DIR/boot_status.json"
     XHTTP_PATH_CACHE_FILE="$DATA_DIR/xhttp_path_cache"
     XHTTP_MODE_FILE="$DATA_DIR/xhttp_mode.txt"
+    XHTTP_LINK_TUNING_FILE="$DATA_DIR/xhttp_link_tuning.txt"
     LOW_OVERHEAD_FILE="$DATA_DIR/low_overhead_mode"
     LOW_OVERHEAD_DISABLED_FILE="$DATA_DIR/low_overhead_mode_disabled"
     LOW_OVERHEAD_PREV_PROFILE_FILE="$DATA_DIR/low_overhead_previous_profile.txt"
@@ -6519,6 +6872,39 @@ if [[ "${1:-}" == "--profile" || "${1:-}" == "profile" ]]; then
         exit 1
     fi
     printf 'Profile %s saved; it will be used when you generate a config.\n' "$2"
+    exit 0
+fi
+
+if [[ "${1:-}" == "--generate" || "${1:-}" == "generate" ]]; then
+    case "${2:-}" in
+        --keep-uuid) G2RAY_PRESERVE_UUID=1 ;;
+        --new-uuid) G2RAY_PRESERVE_UUID=0 ;;
+        "")
+            if [[ -s "$CONFIG_FILE" ]]; then
+                printf 'A config already exists. Use "generate --keep-uuid" to re-apply settings without changing client links,\n' >&2
+                printf 'or "generate --new-uuid" to replace the UUID (every client must re-import).\n' >&2
+                exit 2
+            fi
+            ;;
+        *) printf 'Usage: g2ray.sh generate [--keep-uuid|--new-uuid]\n' >&2; exit 2 ;;
+    esac
+    if generate_config; then
+        start_background_tasks || log_event WARN "background supervisor_start_deferred reason=generate_command"
+        printf 'Config generated. Exports: %s\n' "$MOBILE_CONFIG_FILE"
+        exit 0
+    fi
+    printf 'Config generation failed; the previous config was kept if one existed.\n' >&2
+    exit 1
+fi
+
+if [[ "${1:-}" == "--link-tuning" || "${1:-}" == "link-tuning" ]]; then
+    case "${2:-status}" in
+        on|enable|enabled) set_xhttp_link_tuning on || exit 1 ;;
+        off|disable|disabled) set_xhttp_link_tuning off || exit 1 ;;
+        status) ;;
+        *) printf 'Usage: g2ray.sh link-tuning [on|off|status]\n' >&2; exit 2 ;;
+    esac
+    printf 'xhttp_link_tuning=%s\n' "$(xhttp_link_tuning_summary)"
     exit 0
 fi
 
@@ -6688,6 +7074,7 @@ while true; do
     fi
 
     echo -e "  ${WHITE}${B}Engine Status  :${NC} $(echo -e "$_STATUS")"
+    echo -e "  ${WHITE}${B}Server Route   :${NC} ${WHITE}$(menu_best_route_summary 2>/dev/null || true)${NC}"
     echo -e "  ${WHITE}${B}Anti-Sleep Mode:${NC} $(echo -e "$_KA")\n"
     echo -e "  ${DIM}Educational/research use only. Follow local laws and platform rules.${NC}\n"
     echo -e "  ${WHITE}${B}● CORE CONTROLS${NC}"
@@ -6734,7 +7121,7 @@ while true; do
             for _LINK in "${_VLESS_IP_ARRAY[@]}"; do
                 [[ -n "$_LINK" ]] || continue
                 if ((${#_CONFIG_LINKS[@]} == 0)); then
-                    _CONFIG_LABELS+=("Recommended IP link (try this first)")
+                    _CONFIG_LABELS+=("Recommended IP link (Codespace-side ranking; test on your network)")
                 else
                     _CONFIG_LABELS+=("IP fallback link $((${#_CONFIG_LINKS[@]} + 1))")
                 fi

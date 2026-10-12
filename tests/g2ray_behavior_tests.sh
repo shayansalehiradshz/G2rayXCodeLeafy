@@ -28,6 +28,10 @@ reset_runtime_paths() {
     UUID_FILE="$DATA_DIR/uuid.txt"
     ROUTE_HEALTH_FILE="$DATA_DIR/route_candidate_health.tsv"
     ROUTE_STATS_FILE="$DATA_DIR/route_candidate_stats.tsv"
+    ROUTE_LATENCY_BASELINE_FILE="$DATA_DIR/route_latency_baseline"
+    ROUTE_DEGRADED_REQUEST_FILE="$DATA_DIR/route_degraded_request"
+    ROUTE_DEGRADED_REFRESH_STAMP_FILE="$DATA_DIR/route_degraded_refresh_stamp"
+    UPDATE_AUDIT_FILE="$DATA_DIR/update_audit.log"
     ROUTE_COOLDOWN_FILE="$DATA_DIR/route_candidate_cooldowns.tsv"
     ROUTE_REFRESH_STATE_FILE="$DATA_DIR/route_refresh_state.tsv"
     ROUTE_STATE_LOCK_FILE="$DATA_DIR/route-state.lock"
@@ -38,6 +42,7 @@ reset_runtime_paths() {
     BOOT_STATUS_FILE="$DATA_DIR/boot_status.json"
     XHTTP_PATH_CACHE_FILE="$DATA_DIR/xhttp_path_cache"
     XHTTP_MODE_FILE="$DATA_DIR/xhttp_mode.txt"
+    XHTTP_LINK_TUNING_FILE="$DATA_DIR/xhttp_link_tuning.txt"
     ANTI_SLEEP_DISABLED_FILE="$DATA_DIR/anti_sleep_mode_disabled"
     LOW_OVERHEAD_FILE="$DATA_DIR/low_overhead_mode"
     LOW_OVERHEAD_DISABLED_FILE="$DATA_DIR/low_overhead_mode_disabled"
@@ -104,6 +109,12 @@ reset_runtime_paths() {
     ROUTE_FAILURE_COOLDOWN_SEC=180
     LAST_GOOD_ROUTE_MAX_AGE_SEC=1800
     PERFORMANCE_PROFILE=balanced
+    ROUTE_DEGRADED_MULTIPLIER=3
+    ROUTE_DEGRADED_MIN_DELTA_MS=500
+    ROUTE_DEGRADED_MIN_SAMPLES=3
+    ROUTE_DEGRADED_TRIGGER_COUNT=2
+    ROUTE_DEGRADED_REFRESH_COOLDOWN_SEC=300
+    unset G2RAY_XHTTP_LINK_TUNING
     unset G2RAY_LOW_OVERHEAD G2RAY_LATENCY_FOCUS G2RAY_PERFORMANCE_PROFILE G2RAY_EXPORT_DOMAIN_LINK G2RAY_XHTTP_EXTRA_JSON G2RAY_XHTTP_MODE G2RAY_ENABLE_WS_FALLBACK G2RAY_WS_PORT G2RAY_WS_MAX_FALLBACK_LINKS G2RAY_BENCH_MOCK G2RAY_BENCH_ISOLATED G2RAY_PORT_FORWARDING_DOMAIN GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN
 }
 
@@ -125,6 +136,407 @@ source "$SCRIPT"
 ORIGINAL_RUN_GH="$(declare -f run_gh)"
 ORIGINAL_XRAY_RUNNING="$(declare -f xray_running)"
 reset_runtime_paths
+
+test_probe_variation_tracks_successes_and_preserves_legacy_rows() {
+    reset_runtime_paths
+    local now legacy
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    legacy=$(printf '20.0.0.2\t5\t5\t0\t100\t100\t100\t100\t200\ttrue\t%s' "$now")
+    printf '%s\n' "$legacy" > "$ROUTE_STATS_FILE"
+    update_route_candidate_stats 20.0.0.1 200 100
+    update_route_candidate_stats 20.0.0.1 200 100
+    update_route_candidate_stats 20.0.0.1 200 300
+    [[ "$(awk -F '\t' '$1=="20.0.0.1" {print NF ":" $15}' "$ROUTE_STATS_FILE")" == '15:60' ]] || fail 'probe variation EWMA is not 60'
+    grep -Fxq "$legacy" "$ROUTE_STATS_FILE" || fail 'unrelated legacy row changed'
+    update_route_candidate_stats 20.0.0.1 0 0
+    [[ "$(awk -F '\t' '$1=="20.0.0.1" {print $15}' "$ROUTE_STATS_FILE")" == 60 ]] || fail 'failed probe changed variation'
+    update_route_candidate_stats 20.0.0.2 200 110
+    [[ "$(awk -F '\t' '$1=="20.0.0.2" {print NF ":" $15}' "$ROUTE_STATS_FILE")" == '15:3' ]] || fail 'legacy row did not upgrade safely'
+    pass 'probe variation tracks successes, ignores failures, and migrates legacy rows'
+}
+
+test_probe_variation_only_breaks_route_score_ties() {
+    reset_runtime_paths
+    local now routes summary
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    printf '20.0.0.1\t10\t10\t0\t100\t100\t100\t100\t200\ttrue\t%s\t100\t0\tready\t10000\n' "$now" > "$ROUTE_STATS_FILE"
+    printf '20.0.0.2\t10\t10\t0\t100\t100\t100\t100\t200\ttrue\t%s\t100\t0\tready\t0\n' "$now" >> "$ROUTE_STATS_FILE"
+    printf '20.0.0.3\t10\t10\t0\t90\t90\t90\t90\t200\ttrue\t%s\t90\t0\tready\t20000\n' "$now" >> "$ROUTE_STATS_FILE"
+    for ip in 20.0.0.1 20.0.0.2 20.0.0.3; do printf '%s\t%s\t200\t100\ttrue\tcache\tready\n' "$now" "$ip" >> "$ROUTE_HEALTH_FILE"; done
+    routes=$(cached_usable_fallback_ips)
+    [[ "$routes" == $'20.0.0.3\n20.0.0.2\n20.0.0.1' ]] || fail "variation displaced a faster route: $routes"
+    summary=$(route_candidate_health_summary | awk '/^20\./ {print $1}')
+    [[ "$summary" == "$routes" ]] || fail 'diagnostic order differs from export order'
+    pass 'probe variation breaks ties without displacing a faster route'
+}
+
+test_menu_route_summary_is_quiet_and_cache_only() {
+    (
+        reset_runtime_paths
+        [[ "$(menu_best_route_summary)" == 'no cached probes yet' ]] || fail 'empty menu state is misleading'
+        local now before
+        now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        printf '%s\t20.0.0.1\t200\t100\ttrue\tcache\tready\n' "$now" > "$ROUTE_HEALTH_FILE"
+        printf '20.0.0.1\t5\t5\t0\t100\t100\t100\t100\t200\ttrue\t%s\n' "$now" > "$ROUTE_STATS_FILE"
+        printf '20.0.0.1\n' > "$PINNED_ROUTE_FILE"
+        [[ "$(menu_best_route_summary)" == '20.0.0.1 (server probe EWMA 100ms) [pinned]' ]] || fail 'menu ignores pinned legacy route'
+        before=$(wc -c < "$LOG_FILE")
+        curl() { fail 'menu probed the network'; }
+        file_age_sec() { printf '350'; }
+        [[ "$(menu_best_route_summary)" == *'[stale cache]'* ]] || fail 'provisional old cache was not marked stale'
+        file_age_sec() { printf '999999'; }
+        [[ "$(menu_best_route_summary)" == 'expired cache (option 17)' ]] || fail 'expired route was shown as current'
+        [[ "$(wc -c < "$LOG_FILE")" == "$before" ]] || fail 'rendering menu wrote stale-cache warnings'
+    )
+    pass 'server route menu is cache-only, quiet, and honest about stale data'
+}
+
+test_degraded_probe_queues_without_scanning_or_restarting() {
+    (
+        reset_runtime_paths
+        refresh_route_candidate_health() { fail 'health observation scanned routes'; }
+        start_xray() { fail 'latency caused an engine restart'; }
+        repair_codespace_port_route() { fail 'latency changed port visibility'; }
+        for i in 1 2 3; do observe_route_latency 200 100; done
+        observe_route_latency 200 900
+        [[ ! -e "$ROUTE_DEGRADED_REQUEST_FILE" ]] || fail 'one spike queued a refresh'
+        observe_route_latency 200 900
+        [[ -s "$ROUTE_DEGRADED_REQUEST_FILE" ]] || fail 'consecutive degradation did not queue a scan'
+        rm -f "$ROUTE_DEGRADED_REQUEST_FILE"
+        observe_route_latency 200 5000
+        [[ ! -e "$ROUTE_DEGRADED_REQUEST_FILE" ]] || fail 'degradation ignored its cooldown'
+    )
+    pass 'degradation queues a cooldown-limited scan without touching the engine or ports'
+}
+
+test_degraded_probe_resets_chain_on_outage_or_healthy_sample() {
+    reset_runtime_paths
+    local old_stamp
+    for i in 1 2 3; do observe_route_latency 200 100; done
+    observe_route_latency 200 900
+    observe_route_latency 0 0
+    observe_route_latency 200 900
+    [[ ! -e "$ROUTE_DEGRADED_REQUEST_FILE" ]] || fail 'outage did not break consecutive samples'
+    observe_route_latency 200 100
+    observe_route_latency 200 900
+    [[ ! -e "$ROUTE_DEGRADED_REQUEST_FILE" ]] || fail 'healthy probe did not reset degradation'
+    old_stamp=$(( $(date +%s) - 1900 ))
+    printf '%s %s 100 10 1\n' "$PORT_DOMAIN" "$old_stamp" > "$ROUTE_LATENCY_BASELINE_FILE"
+    observe_route_latency 200 900
+    [[ ! -e "$ROUTE_DEGRADED_REQUEST_FILE" ]] || fail 'expired baseline triggered a refresh after suspension'
+    printf 'other-space 1 100 10 1\n' > "$ROUTE_LATENCY_BASELINE_FILE"
+    observe_route_latency 200 900
+    [[ ! -e "$ROUTE_DEGRADED_REQUEST_FILE" ]] || fail 'another Codespace baseline was reused'
+    printf '%s 008 008 008 008\n' "$PORT_DOMAIN" > "$ROUTE_LATENCY_BASELINE_FILE"
+    observe_route_latency 200 900 || fail 'corrupt leading-zero state raised an arithmetic error'
+    pass 'degradation resets across outages, healthy probes, suspension, identity changes, and corrupt state'
+}
+
+test_degraded_refresh_forces_fresh_scan_outside_health_deadline() {
+    (
+        reset_runtime_paths
+        local calls="$TMP_ROOT/degraded-calls"
+        : > "$calls"
+        printf '%s %s\n' "$PORT_DOMAIN" "$(date +%s)" > "$ROUTE_DEGRADED_REQUEST_FILE"
+        write_background_supervisor_heartbeat() { printf 'heartbeat\n' >> "$calls"; }
+        run_with_deadline() { printf 'deadline=%s function=%s\n' "$1" "$2" >> "$calls"; shift; "$@"; }
+        refresh_route_candidate_health() { [[ "${1:-}" == --force ]] || fail 'degraded scan did not bypass fresh cache'; route_refresh_record_success; }
+        refresh_config_exports_if_changed() { printf 'exports\n' >> "$calls"; }
+        route_health_cache_fresh() { return 0; }
+        refresh_degraded_routes_if_requested
+        [[ ! -e "$ROUTE_DEGRADED_REQUEST_FILE" ]] || fail 'degraded request was not consumed'
+        grep -Fq 'function=refresh_route_candidate_health' "$calls" || fail 'route deadline was not used'
+        grep -Fxq exports "$calls" || fail 'successful rerank did not refresh exports'
+        [[ "$(grep -c heartbeat "$calls")" == 3 ]] || fail 'long scan failed to maintain heartbeat'
+        [[ "$(grep -c deadline= "$calls")" == 2 ]] || fail 'degraded refresh added a nested self-heal deadline'
+    )
+    pass 'degraded refresh forces a real scan outside the health deadline and maintains heartbeat'
+}
+
+test_degraded_refresh_respects_backoff_and_retains_failed_exports() {
+    (
+        reset_runtime_paths
+        printf '%s %s\n' "$PORT_DOMAIN" "$(date +%s)" > "$ROUTE_DEGRADED_REQUEST_FILE"
+        route_refresh_retry_allowed() { return 1; }
+        refresh_route_candidate_health() { fail 'backoff was bypassed'; }
+        refresh_degraded_routes_if_requested
+        [[ -s "$ROUTE_DEGRADED_REQUEST_FILE" ]] || fail 'backoff lost pending request'
+        route_refresh_retry_allowed() { return 0; }
+        local heartbeats="$TMP_ROOT/degraded-failure-heartbeats"
+        : > "$heartbeats"
+        write_background_supervisor_heartbeat() { printf 'heartbeat\n' >> "$heartbeats"; }
+        run_with_deadline() { return 124; }
+        refresh_config_exports_if_changed() { fail 'timed-out scan overwrote exports'; }
+        refresh_degraded_routes_if_requested
+        [[ ! -e "$ROUTE_DEGRADED_REQUEST_FILE" ]] || fail 'timed-out request was not consumed'
+        [[ "$(wc -l < "$heartbeats")" -eq 2 ]] || fail 'timed-out scan failed to renew the supervisor heartbeat'
+    )
+    pass 'degraded refresh respects backoff and keeps exports when a scan times out'
+}
+
+test_route_quality_uses_export_snapshot_and_escapes_timestamps() {
+    reset_runtime_paths
+    local links quality
+    printf '20.0.0.1\t10\t10\t0\t100\t100\t100\t100\t200\ttrue\tbad"\\stamp\t100\t0\tready\t60\n' > "$ROUTE_STATS_FILE"
+    printf '20.0.0.2\t5\t5\t0\t200\t200\t200\t200\t200\ttrue\tlegacy\n' >> "$ROUTE_STATS_FILE"
+    links=$'vless://test@20.0.0.2:443?type=xhttp\nvless://test@20.0.0.1:443?type=xhttp\nvless://test@20.0.0.2:443?type=ws\nvless://test@domain.example:443?type=xhttp'
+    write_config_exports_from_links "$links"
+    jq -e '.routes | length == 2' "$CONFIG_META_FILE" >/dev/null || fail 'metadata contains duplicate or domain routes'
+    jq -e '.routes[0].ip == "20.0.0.2" and .routes[0].rank == 1 and .routes[0].probe_variation_ms == 0 and .routes[0].ewma_latency_ms == 200 and .routes[1].ip == "20.0.0.1" and .routes[1].probe_variation_ms == 60' "$CONFIG_META_FILE" >/dev/null || fail 'route metadata lost export order or legacy stats'
+    quality=$(route_quality_json '20.0.0.1')
+    [[ "$(jq -r '.[0].last_checked' <<< "$quality")" == 'bad"\stamp' ]] || fail 'timestamp escaping corrupted metadata'
+    write_config_exports_from_links 'vless://test@domain.example:443?type=xhttp'
+    jq -e '.routes == []' "$CONFIG_META_FILE" >/dev/null || fail 'domain-only export advertised unrelated cached IPs'
+    pass 'metadata describes actual exported routes and escapes corrupt legacy timestamps'
+}
+
+test_route_quality_rejects_partial_json_and_parser_failures() {
+    (
+        reset_runtime_paths
+        route_quality_json() { printf '[broken]'; }
+        write_config_exports_from_links 'vless://test@20.0.0.1:443?type=xhttp'
+        jq -e '.routes == []' "$CONFIG_META_FILE" >/dev/null || fail 'bracket-wrapped malformed JSON survived validation'
+    )
+    (
+        reset_runtime_paths
+        printf 'row\n' > "$ROUTE_STATS_FILE"
+        jq() { printf '[partial'; return 1; }
+        [[ "$(route_quality_json '20.0.0.1')" == '[]' ]] || fail 'failed parser appended [] to truncated JSON'
+    )
+    pass 'metadata rejects malformed arrays and discards partial parser output'
+}
+
+test_route_quality_rejects_unbounded_numbers_and_invalid_ewma() {
+    reset_runtime_paths
+    local quality
+    printf '20.0.0.1\t99999999999999999999999999999999999\t1\t0\t200\t200\t200\t200\t200\ttrue\tstamp\tbroken\t0\tready\t99999999999999999999999999999999999\n' > "$ROUTE_STATS_FILE"
+    quality=$(route_quality_json '20.0.0.1')
+    jq -e '.[0].samples == 0 and .[0].probe_variation_ms == 0 and .[0].ewma_latency_ms == 200' <<< "$quality" >/dev/null || fail 'corrupt stats became nonfinite metadata or a false zero-latency route'
+    pass 'metadata bounds corrupt numbers and falls back from invalid EWMA to average latency'
+}
+
+test_updater_version_gate_preserves_same_version_fixes() {
+    (
+        reset_runtime_paths
+        local panel="$TMP_ROOT/candidate-panel"
+        printf '# G2ray Panel v9.9.9\nreadonly G2RAY_ID="G2ray Panel v1.4.3"\n' > "$panel"
+        [[ "$(panel_version_of_file "$panel")" == 1.4.3 ]] || fail 'updater parsed a version from a comment'
+        update_candidate_version_ok "$panel" 1.4.3 || fail 'same-version fixes were disabled'
+        if update_candidate_version_ok "$panel" 1.4.4; then fail 'downgrade was allowed'; fi
+        version_is_older 1.9.9 1.10.0 || fail 'numeric version ordering is broken'
+        G2RAY_AUTO_UPDATE_FORCE=1 update_candidate_version_ok "$panel" 1.4.4 || fail 'explicit downgrade override failed'
+        printf 'readonly G2RAY_ID="G2ray Panel vbogus"\n' > "$panel"
+        if G2RAY_AUTO_UPDATE_FORCE=1 update_candidate_version_ok "$panel" 1.4.3; then fail 'force accepted an unparseable version'; fi
+    )
+    pass 'updater blocks downgrades without rejecting same-version bug fixes or parsing comments'
+}
+
+test_update_audit_is_bounded_and_hides_source_credentials() {
+    (
+        reset_runtime_paths
+        RAW_BASE_URL='https://user:password@example.invalid/raw?token=secret'
+        LOG_MAX_BYTES=1
+        record_update_audit refused_version 1.4.3 1.4.2 abc
+        record_update_audit applied 1.4.3 1.4.4 def
+        [[ -s "$UPDATE_AUDIT_FILE.1" ]] || fail 'update audit did not rotate'
+        grep -Fq 'applied' "$UPDATE_AUDIT_FILE" || fail 'update decision was lost'
+        if grep -Eq 'password|token=|secret' "$UPDATE_AUDIT_FILE" "$UPDATE_AUDIT_FILE.1"; then fail 'audit exposed authenticated source URL'; fi
+    )
+    pass 'update audit is bounded and never records authenticated source URLs'
+}
+
+test_updater_failed_replace_never_reports_applied() {
+    (
+        reset_runtime_paths
+        SCRIPT_PATH="$TMP_ROOT/update-panel.sh"
+        cp "$SCRIPT" "$SCRIPT_PATH"
+        G2RAY_AUTO_UPDATE=1
+        clear() { :; }; draw_logo() { :; }; sleep() { :; }
+        latency_focus_enabled() { return 1; }; tracked_panel_has_local_changes() { return 1; }
+        curl() {
+            local output=""
+            while (($#)); do [[ "$1" == -o ]] && { output="$2"; break; }; shift; done
+            printf 'readonly G2RAY_ID="G2ray Panel v1.4.4"\n' > "$output"
+        }
+        verify_update_candidate() { return 0; }
+        mv() { return 1; }
+        exec() { fail 'failed update restarted the panel'; }
+        check_for_updates >/dev/null
+        grep -Fq 'apply_failed' "$UPDATE_AUDIT_FILE" || fail 'failed replacement was not audited'
+        if grep -Fq $'\tapplied\t' "$UPDATE_AUDIT_FILE"; then fail 'audit claimed an unapplied update'; fi
+        cmp -s "$SCRIPT" "$SCRIPT_PATH" || fail 'failed replacement changed the previous panel'
+    )
+    pass 'failed update replacement keeps the panel and never audits success'
+}
+
+test_updater_preserves_edits_made_during_download() {
+    (
+        reset_runtime_paths
+        SCRIPT_PATH="$TMP_ROOT/update-race-panel.sh"
+        cp "$SCRIPT" "$SCRIPT_PATH"
+        G2RAY_AUTO_UPDATE=1
+        clear() { :; }; draw_logo() { :; }; sleep() { :; }
+        latency_focus_enabled() { return 1; }; tracked_panel_has_local_changes() { return 1; }
+        curl() {
+            local output=""
+            while (($#)); do [[ "$1" == -o ]] && { output="$2"; break; }; shift; done
+            printf 'readonly G2RAY_ID="G2ray Panel v1.4.4"\n' > "$output"
+            printf '\n# concurrent local edit\n' >> "$SCRIPT_PATH"
+        }
+        verify_update_candidate() { return 0; }
+        exec() { fail 'updater overwrote a concurrent edit'; }
+        check_for_updates >/dev/null
+        grep -Fq changed_during_check "$UPDATE_AUDIT_FILE" || fail 'concurrent edit was not protected'
+        grep -Fq '# concurrent local edit' "$SCRIPT_PATH" || fail 'concurrent edit was lost'
+    )
+    pass 'updater preserves local edits made while a download is in flight'
+}
+
+test_updater_success_stages_locally_and_preserves_permissions() {
+    (
+        reset_runtime_paths
+        local before_mode
+        SCRIPT_PATH="$TMP_ROOT/update-success-panel.sh"
+        cp "$SCRIPT" "$SCRIPT_PATH"
+        chmod 755 "$SCRIPT_PATH"
+        before_mode=$(stat -c '%a' "$SCRIPT_PATH")
+        G2RAY_AUTO_UPDATE=1
+        clear() { :; }; draw_logo() { :; }; sleep() { :; }
+        latency_focus_enabled() { return 1; }; tracked_panel_has_local_changes() { return 1; }
+        curl() {
+            local output=""
+            while (($#)); do [[ "$1" == -o ]] && { output="$2"; break; }; shift; done
+            printf '#!/usr/bin/env bash\nreadonly G2RAY_ID="G2ray Panel v1.4.3"\n' > "$output"
+        }
+        verify_update_candidate() { return 0; }
+        mv() {
+            [[ "$2" == "$SCRIPT_PATH.update."* ]] || fail 'update was not staged beside its destination'
+            command mv "$@"
+        }
+        exec() {
+            [[ "$1" == bash && "$2" == "$SCRIPT_PATH" ]] || fail 'update restarted a different panel'
+            printf 'restarted\n' > "$TMP_ROOT/update-success-restarted"
+        }
+        check_for_updates >/dev/null
+        [[ "$(panel_version_of_file "$SCRIPT_PATH")" == 1.4.3 ]] || fail 'same-version changed panel was not installed'
+        [[ "$(stat -c '%a' "$SCRIPT_PATH")" == "$before_mode" ]] || fail 'replacement changed panel permissions'
+        [[ -s "$TMP_ROOT/update-success-restarted" ]] || fail 'successful replacement did not restart the panel'
+        grep -Fq $'\tapplied\t' "$UPDATE_AUDIT_FILE" || fail 'successful replacement was not audited'
+    )
+    pass 'successful same-version update uses an atomic local rename and preserves permissions'
+}
+
+test_updater_refuses_downgrade_end_to_end() {
+    (
+        reset_runtime_paths
+        SCRIPT_PATH="$TMP_ROOT/update-downgrade-panel.sh"
+        cp "$SCRIPT" "$SCRIPT_PATH"
+        G2RAY_AUTO_UPDATE=1
+        unset G2RAY_AUTO_UPDATE_FORCE
+        clear() { :; }; draw_logo() { :; }; sleep() { :; }
+        latency_focus_enabled() { return 1; }; tracked_panel_has_local_changes() { return 1; }
+        curl() {
+            local output=""
+            while (($#)); do [[ "$1" == -o ]] && { output="$2"; break; }; shift; done
+            sed 's/^readonly G2RAY_ID="G2ray Panel v1\.4\.3"$/readonly G2RAY_ID="G2ray Panel v1.4.2"/' "$SCRIPT" > "$output"
+        }
+        mv() { fail 'downgrade attempted to replace the panel'; }
+        exec() { fail 'downgrade restarted the panel'; }
+        check_for_updates >/dev/null
+        cmp -s "$SCRIPT" "$SCRIPT_PATH" || fail 'downgrade changed the installed panel'
+        grep -Fq $'\trefused_version\tfrom=1.4.3\tto=1.4.2\t' "$UPDATE_AUDIT_FILE" || fail 'downgrade was not rejected after real structural validation'
+    )
+    pass 'updater rejects a structurally valid downgrade without replacing or restarting the panel'
+}
+
+test_updater_rejects_failed_download_even_if_candidate_is_valid_bash() {
+    (
+        reset_runtime_paths
+        SCRIPT_PATH="$TMP_ROOT/update-incomplete-panel.sh"
+        cp "$SCRIPT" "$SCRIPT_PATH"
+        G2RAY_AUTO_UPDATE=1
+        clear() { :; }; draw_logo() { :; }; sleep() { :; }
+        latency_focus_enabled() { return 1; }; tracked_panel_has_local_changes() { return 1; }
+        curl() {
+            local output=""
+            while (($#)); do [[ "$1" == -o ]] && { output="$2"; break; }; shift; done
+            sed 's/^readonly G2RAY_ID="G2ray Panel v1\.4\.3"$/readonly G2RAY_ID="G2ray Panel v1.4.4"/' "$SCRIPT" > "$output"
+            return 28
+        }
+        verify_update_candidate() { fail 'failed download reached structural validation'; }
+        mv() { fail 'failed download attempted to replace the panel'; }
+        exec() { fail 'failed download restarted the panel'; }
+        check_for_updates >/dev/null
+        cmp -s "$SCRIPT" "$SCRIPT_PATH" || fail 'failed download changed the installed panel'
+        grep -Fq $'\trejected\t' "$UPDATE_AUDIT_FILE" || fail 'failed download was not audited'
+    )
+    pass 'updater refuses failed downloads even when their partial contents look like valid Bash'
+}
+
+test_updater_audits_failed_staging() {
+    (
+        reset_runtime_paths
+        SCRIPT_PATH="$TMP_ROOT/update-stage-failed-panel.sh"
+        cp "$SCRIPT" "$SCRIPT_PATH"
+        G2RAY_AUTO_UPDATE=1
+        clear() { :; }; draw_logo() { :; }; sleep() { :; }
+        latency_focus_enabled() { return 1; }; tracked_panel_has_local_changes() { return 1; }
+        curl() {
+            local output=""
+            while (($#)); do [[ "$1" == -o ]] && { output="$2"; break; }; shift; done
+            printf '#!/usr/bin/env bash\nreadonly G2RAY_ID="G2ray Panel v1.4.4"\n' > "$output"
+        }
+        verify_update_candidate() { return 0; }
+        mktemp() {
+            [[ "$1" == "$SCRIPT_PATH.update."* ]] && return 1
+            command mktemp "$@"
+        }
+        exec() { fail 'failed staging restarted the panel'; }
+        check_for_updates >/dev/null
+        cmp -s "$SCRIPT" "$SCRIPT_PATH" || fail 'failed staging changed the installed panel'
+        grep -Fq $'\tapply_failed\t' "$UPDATE_AUDIT_FILE" || fail 'failed staging was not audited'
+    )
+    pass 'updater audits failed staging without changing or restarting the panel'
+}
+
+test_self_heal_integrates_degradation_without_disruption() {
+    (
+        reset_runtime_paths
+        write_test_vless_config
+        ensure_codespace_port_public() { return 0; }
+        ensure_optional_ws_port_public() { return 0; }
+        xray_running() { return 0; }
+        xray_listener_ready() { return 0; }
+        xhttp_probe_metrics() { printf '200 900 ready\n'; }
+        start_xray() { fail 'HTTP 200 latency spike restarted a working engine'; }
+        repair_codespace_port_route() { fail 'HTTP 200 latency spike reset the public route'; }
+        for i in 1 2 3; do observe_route_latency 200 100; done
+        self_heal_once
+        [[ ! -e "$ROUTE_DEGRADED_REQUEST_FILE" ]] || fail 'self-heal queued a scan after one spike'
+        self_heal_once
+        [[ -s "$ROUTE_DEGRADED_REQUEST_FILE" ]] || fail 'self-heal did not pass usable latencies to degradation tracking'
+    )
+    pass 'real self-heal queues consecutive degradation without restarting the engine or resetting ports'
+}
+
+test_xhttp_upload_tuning_is_reversible_and_bundle_compatible() {
+    reset_runtime_paths
+    local link
+    printf '11111111-2222-4333-8444-555555555555\n' > "$UUID_FILE"
+    write_test_vless_config
+    jq -e '.scMaxEachPostBytes == 60000 and .scMinPostsIntervalMs == 10 and .xmux.maxConnections >= 1 and .xmux.maxConnections <= 6 and .xmux.hKeepAlivePeriod > 0' <<< "$XHTTP_TUNED_EXTRA_JSON" >/dev/null || fail 'measured tuning is invalid or unbounded'
+    link=$(generate_link_for_address 20.0.0.1)
+    [[ "$link" == *"extra=$(url_encode_query_value "$XHTTP_TUNED_EXTRA_JSON")"* ]] || fail 'tuned links lost their extra object'
+    write_codespace_import_bundle "$link"
+    jq -e '.configs[0] | contains("extra=") | not' "$CODESPACE_BUNDLE_FILE" >/dev/null || fail 'legacy app bundle gained an incompatible extra parameter'
+    G2RAY_XHTTP_LINK_TUNING=off
+    link=$(generate_link_for_address 20.0.0.1)
+    [[ "$link" != *'&extra='* ]] || fail 'upload tuning off switch does not work'
+    unset G2RAY_XHTTP_LINK_TUNING
+    set_xhttp_link_tuning off
+    xhttp_link_tuning_enabled && fail 'saved upload tuning off switch was ignored'
+    pass 'upload tuning has a real off switch and preserves legacy Android bundle compatibility'
+}
 
 test_port_visibility_is_throttled() {
     reset_runtime_paths
@@ -655,9 +1067,21 @@ EOF
 
     local row
     row=$(awk -F '\t' '$1 == "20.0.0.1" {print $0}' "$ROUTE_STATS_FILE")
-    [[ "$row" == $'20.0.0.1\t1\t1\t0\t120\t120\t120\t120\t200\ttrue\t'*$'\t120\t0\tready' ]] \
+    [[ "$row" == $'20.0.0.1\t1\t1\t0\t120\t120\t120\t120\t200\ttrue\t'*$'\t120\t0\tready\t0' ]] \
         || fail "expired target history was not reset before recording a fresh route sample: $row"
     pass "route candidate stats reset expired target history"
+}
+
+test_route_candidate_stats_prune_expired_non_target_rows() {
+    reset_runtime_paths
+    ROUTE_STATS_MAX_AGE_SEC=60
+    local fresh
+    fresh=$(printf '20.0.0.3\t5\t5\t0\t100\t100\t100\t100\t200\ttrue\t%s' "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
+    printf '20.0.0.2\t5\t5\t0\t100\t100\t100\t100\t200\ttrue\t2000-01-01T00:00:00Z\n%s\n' "$fresh" > "$ROUTE_STATS_FILE"
+    update_route_candidate_stats 20.0.0.1 200 120 cache ready
+    if grep -Fq '20.0.0.2' "$ROUTE_STATS_FILE"; then fail 'expired unrelated stats were retained by the platform AWK'; fi
+    grep -Fxq "$fresh" "$ROUTE_STATS_FILE" || fail 'fresh unrelated stats were pruned or rewritten'
+    pass 'route history pruning works with the platform AWK and preserves fresh unrelated rows'
 }
 
 test_xray_stats_use_inbound_counters_only() {
@@ -2277,6 +2701,7 @@ test_xhttp_mode_reports_export_failure() {
 
 test_custom_xhttp_extra_json_is_validated() {
     reset_runtime_paths
+    G2RAY_XHTTP_LINK_TUNING=off
     PORT_DOMAIN="behavior-space-443.app.github.dev"
     GITHUB_USER="tester"
     printf '11111111-2222-3333-4444-555555555555\n' > "$UUID_FILE"
@@ -3262,6 +3687,11 @@ test_support_bundle_redacts_sensitive_material() {
     printf '2026-05-30T00:00:00Z\t20.0.0.1\t200\t10\ttrue\n' > "$ROUTE_HEALTH_FILE"
     printf '20.0.0.1\t1\t1\t0\t10\t10\t10\t10\t200\ttrue\t2026-05-30T00:00:00Z\t10\t0\tready\n' > "$ROUTE_STATS_FILE"
     printf 'ip=20.0.0.1\nchecked_at=2026-05-30T00:00:00Z\n' > "$LAST_GOOD_ROUTE_FILE"
+    printf '%s 1 100 5 1\n' "$PORT_DOMAIN" > "$ROUTE_LATENCY_BASELINE_FILE"
+    printf '%s 1\n' "$PORT_DOMAIN" > "$ROUTE_DEGRADED_REQUEST_FILE"
+    printf '1\n' > "$ROUTE_DEGRADED_REFRESH_STAMP_FILE"
+    printf 'refused_version\tfrom=1.4.3\tto=1.4.2\tsha256=abc\n' > "$UPDATE_AUDIT_FILE"
+    printf 'older update decision\n' > "$UPDATE_AUDIT_FILE.1"
     XRAY_BIN="$TMP_ROOT/missing-xray"
     xray_running() { return 0; }
     is_port_open() { return 0; }
@@ -3276,6 +3706,9 @@ test_support_bundle_redacts_sensitive_material() {
     tar -xzf "$bundle" -C "$extract"
     [[ -s "$extract/doctor.json" ]] || fail "support bundle missing doctor JSON"
     [[ -s "$extract/logs/g2ray.log" ]] || fail "support bundle missing redacted app log"
+    for file in route_latency_baseline route_degraded_request route_degraded_refresh_stamp update_audit.log update_audit.log.1; do
+        [[ -s "$extract/state/$file" ]] || fail "support bundle missing route/update evidence: $file"
+    done
     if grep -R -Fq "$uuid" "$extract" || grep -R -Fq "$bearer" "$extract" || grep -R -Fq "$github_token" "$extract" || grep -R -Fq "$structured_token" "$extract" || grep -R -Fq "$metadata_token" "$extract" || grep -R -Fq "$vless" "$extract"; then
         fail "support bundle leaked sensitive material"
     fi
@@ -3564,6 +3997,8 @@ test_self_heal_keeps_failure_count_when_route_repair_fails() {
         increment_route_bad_count() { printf '2\n'; }
         mark_route_repair_attempt_if_allowed() { return 0; }
         repair_codespace_port_route() { return 1; }
+        active_tunnel_recent() { return 1; }
+        inbound_tunnel_connection_present() { return 1; }
         reset_route_bad_count() { printf 'reset\n' >> "$TMP_ROOT/unexpected-route-reset"; }
         reset_edge_bad_count() { return 0; }
 
@@ -4079,6 +4514,34 @@ test_supervisor_reconnect_defers_long_route_verification() {
     pass "supervisor reconnect releases its lock and verifies routes outside the short supervisor deadline"
 }
 
+test_runtime_diagnostics_report_deployed_versions_and_policy() {
+    (
+        reset_runtime_paths
+        local BASE_DIR="$TMP_ROOT/runtime-diagnostics" output
+        mkdir -p "$BASE_DIR/.devcontainer"
+        printf 'FROM debian:bookworm-slim\nARG XRAY_VERSION=v26.7.28\n' > "$BASE_DIR/.devcontainer/Dockerfile"
+        timeout() { printf 'Xray 26.5.9 (Xray, Penetrates Everything.)\n'; }
+        printf '{"policy":{"levels":{"0":{"connIdle":900,"uplinkOnly":2,"downlinkOnly":5}}},"outbounds":[{"tag":"direct","streamSettings":{"sockopt":{"tcpCongestion":"cubic"}}}]}' > "$CONFIG_FILE"
+        kernel_tcp_value() { printf 'test-%s' "$1"; }
+        output=$(runtime_tuning_diagnostics)
+        [[ "$output" == *'installed=26.5.9 image_pin=26.7.28 state=different'* ]] || fail "diagnostics hid the deployed core mismatch"
+        [[ "$output" == *'connIdle=900 uplinkOnly=2 downlinkOnly=5'* ]] || fail "diagnostics did not read policy from config"
+        [[ "$output" == *'direct_congestion=cubic'* ]] || fail "diagnostics did not expose the configured socket override"
+        [[ "$output" == *'default=test-tcp_congestion_control'* && "$output" == *'available=test-tcp_available_congestion_control'* ]] || fail "diagnostics did not report observed kernel settings"
+        timeout() { printf 'Xray 26.7.28 (Xray, Penetrates Everything.)\n'; }
+        [[ "$(runtime_tuning_diagnostics)" == *'state=matches'* ]] || fail "matching core version was flagged different"
+        timeout() { return 1; }
+        [[ "$(runtime_tuning_diagnostics)" == *'installed=unknown'* ]] || fail "missing core output was treated as a known version"
+        printf 'not-json' > "$CONFIG_FILE"
+        [[ "$(runtime_tuning_diagnostics)" == *'Config policy: unavailable'* ]] || fail "invalid config silently reported default policy"
+        printf '{}' > "$CONFIG_FILE"
+        output=$(runtime_tuning_diagnostics)
+        [[ "$output" == *'uplinkOnly=core-default'* && "$output" == *'direct_congestion=kernel-default'* ]] || fail "omitted policy or sockopt was misreported"
+    )
+    pass "runtime diagnostics distinguish installed core, image pin, configured policy, and kernel state"
+}
+
+test_runtime_diagnostics_report_deployed_versions_and_policy
 test_supervisor_reconnect_defers_long_route_verification
 test_route_repair_preserves_active_sessions_for_all_callers
 test_interactive_attach_defers_slow_route_settling
@@ -4108,6 +4571,7 @@ test_cached_route_order_does_not_overweight_tiny_reliability_delta
 test_last_good_route_decays_before_breaking_ties
 test_route_candidate_stats_track_average_and_success_rate
 test_route_candidate_stats_reset_expired_target_history
+test_route_candidate_stats_prune_expired_non_target_rows
 test_xray_stats_use_inbound_counters_only
 test_save_xray_stats_marks_active_traffic_when_counters_increase
 test_atomic_write_handles_mktemp_failure
@@ -4240,3 +4704,23 @@ test_support_bundle_can_include_network_metadata_when_opted_in
 test_support_bundle_handles_relative_log_dir
 test_support_bundle_includes_rotated_logs
 test_support_bundle_marks_unreadable_optional_logs
+test_probe_variation_tracks_successes_and_preserves_legacy_rows
+test_probe_variation_only_breaks_route_score_ties
+test_menu_route_summary_is_quiet_and_cache_only
+test_degraded_probe_queues_without_scanning_or_restarting
+test_degraded_probe_resets_chain_on_outage_or_healthy_sample
+test_degraded_refresh_forces_fresh_scan_outside_health_deadline
+test_degraded_refresh_respects_backoff_and_retains_failed_exports
+test_self_heal_integrates_degradation_without_disruption
+test_route_quality_uses_export_snapshot_and_escapes_timestamps
+test_route_quality_rejects_partial_json_and_parser_failures
+test_route_quality_rejects_unbounded_numbers_and_invalid_ewma
+test_updater_version_gate_preserves_same_version_fixes
+test_update_audit_is_bounded_and_hides_source_credentials
+test_updater_failed_replace_never_reports_applied
+test_updater_preserves_edits_made_during_download
+test_updater_success_stages_locally_and_preserves_permissions
+test_updater_refuses_downgrade_end_to_end
+test_updater_rejects_failed_download_even_if_candidate_is_valid_bash
+test_updater_audits_failed_staging
+test_xhttp_upload_tuning_is_reversible_and_bundle_compatible

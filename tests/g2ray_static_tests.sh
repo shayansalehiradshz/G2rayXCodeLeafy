@@ -428,10 +428,25 @@ test_connection_keepalive_and_halfclose_are_tuned() {
     fi
     grep_fixed 'G2RAY_XHTTP_EXTRA_JSON' "$SCRIPT" \
         || fail 'exported links cannot carry an explicitly requested XHTTP extra object'
-    if grep -Fq 'XHTTP_LINK_KEEPALIVE' "$SCRIPT" || grep -Fq 'hKeepAlivePeriod' "$SCRIPT"; then
-        fail 'exported links still inject a default XHTTP keepalive extra parameter'
-    fi
-    pass 'TCP keepalive and half-close timeouts are tuned without a default XHTTP extra parameter'
+    grep_fixed 'G2RAY_XHTTP_LINK_TUNING' "$SCRIPT" \
+        || fail 'measured XHTTP link tuning has no compatibility escape hatch'
+    grep_fixed 'xhttp_link_tuning_enabled || return 0' "$SCRIPT" \
+        || fail 'XHTTP link tuning cannot be disabled without changing the server'
+    pass 'TCP keepalive, half-close timeouts, and reversible XHTTP link tuning are present'
+}
+
+test_xhttp_links_carry_measured_upload_tuning() {
+    grep_fixed 'XHTTP_TUNED_EXTRA_JSON=' "$SCRIPT" \
+        || fail 'built-in XHTTP tuning object is missing'
+    grep_fixed '"scMaxEachPostBytes":60000,"scMinPostsIntervalMs":10' "$SCRIPT" \
+        || fail 'XHTTP upload POST sizing changed without updating the measured contract'
+    grep_fixed '"maxConnections":3' "$SCRIPT" \
+        || fail 'XHTTP tuning no longer bounds connection concurrency'
+    grep_fixed 'extra_json=$(xhttp_link_extra_json)' "$SCRIPT" \
+        || fail 'XHTTP link rendering bypasses the reversible tuning preference'
+    grep_fixed 'extra_param="&extra=$(url_encode_query_value "$extra_json")"' "$SCRIPT" \
+        || fail 'XHTTP link extra is not URL-encoded'
+    pass 'XHTTP links preserve the bounded upload tuning and encode its JSON'
 }
 
 test_performance_profile_is_persistent_and_bench_is_isolated() {
@@ -2152,6 +2167,7 @@ test_generated_config_uses_resilient_dns_fallback
 test_daemon_logs_use_copytruncate_rotation
 test_tcp_fast_open_is_gated_and_outbound_only
 test_connection_keepalive_and_halfclose_are_tuned
+test_xhttp_links_carry_measured_upload_tuning
 test_performance_profile_is_persistent_and_bench_is_isolated
 test_generated_links_include_domain_and_ip_variants
 test_websocket_fallback_is_advanced_opt_in
