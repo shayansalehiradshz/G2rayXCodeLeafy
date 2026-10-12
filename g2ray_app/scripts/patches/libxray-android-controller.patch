@@ -1,0 +1,68 @@
+diff --git a/controller/controller_android.go b/controller/controller_android.go
+index b7f3d39..4ce62a6 100644
+--- a/controller/controller_android.go
++++ b/controller/controller_android.go
+@@ -4,24 +4,59 @@ package controller
+ 
+ import (
+ 	"fmt"
++	"sync"
+ 	"syscall"
+ 
+ 	corenet "github.com/xtls/xray-core/common/net"
+ 	xinternet "github.com/xtls/xray-core/transport/internet"
+ )
+ 
++var (
++	dialerControllerMu   sync.RWMutex
++	dialerController     func(fd uintptr) bool
++	dialerControllerOnce sync.Once
++
++	listenerControllerMu   sync.RWMutex
++	listenerController     func(fd uintptr) bool
++	listenerControllerOnce sync.Once
++)
++
++func applyDialerController(fd uintptr) bool {
++	dialerControllerMu.RLock()
++	controller := dialerController
++	dialerControllerMu.RUnlock()
++	return controller == nil || controller(fd)
++}
++
++func applyListenerController(fd uintptr) bool {
++	listenerControllerMu.RLock()
++	controller := listenerController
++	listenerControllerMu.RUnlock()
++	return controller == nil || controller(fd)
++}
++
+ // RegisterDialerController -> callback before connection begins.
+ // Depends on xray:api:beta
+ func RegisterDialerController(controller func(fd uintptr) bool) {
+-	xinternet.RegisterDialerController(func(network, address string, conn syscall.RawConn) error {
+-		return protectSocket(conn, controller)
++	dialerControllerMu.Lock()
++	dialerController = controller
++	dialerControllerMu.Unlock()
++	dialerControllerOnce.Do(func() {
++		xinternet.RegisterDialerController(func(network, address string, conn syscall.RawConn) error {
++			return protectSocket(conn, applyDialerController)
++		})
+ 	})
+ }
+ 
+ // RegisterListenerController -> callback before listener begins.
+ // Depends on xray:api:beta
+ func RegisterListenerController(controller func(fd uintptr) bool) {
+-	xinternet.RegisterListenerController(func(network, address string, conn syscall.RawConn) error {
+-		return protectSocket(conn, controller)
++	listenerControllerMu.Lock()
++	listenerController = controller
++	listenerControllerMu.Unlock()
++	listenerControllerOnce.Do(func() {
++		xinternet.RegisterListenerController(func(network, address string, conn syscall.RawConn) error {
++			return protectSocket(conn, applyListenerController)
++		})
+ 	})
+ }

@@ -1,0 +1,29 @@
+package com.g2ray.client.model
+
+data class StoredG2RayProfile(
+    val id: String,
+    val accountId: String,
+    val displayName: String,
+    val rawUri: String,
+    val transport: Transport,
+    val address: String,
+    val port: Int,
+    val sni: String,
+    val hostHeader: String,
+    val path: String,
+    val isDefault: Boolean,
+    val createdAt: Long,
+    val updatedAt: Long,
+    val lastDelayMs: Long? = null,
+    val lastDelayTestedAt: Long? = null,
+    val lastDelayP95Ms: Long? = null,
+    val lastDelayJitterMs: Long? = null,
+    val lastDelaySuccessfulSamples: Int = 0,
+    val lastDelaySampleCount: Int = 0,
+    val delayFailureCount: Int = 0,
+    val lastDelayError: String? = null,
+    val lastDownloadBps: Long? = null,
+    val lastUploadBps: Long? = null,
+    val lastThroughputTestedAt: Long? = null,
+    val lastThroughputError: String? = null
+)

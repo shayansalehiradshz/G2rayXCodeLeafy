@@ -1,0 +1,6 @@
+{
+  "name": "G2Ray Client",
+  "description": "Android VPN client for personal G2Ray Codespaces testing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

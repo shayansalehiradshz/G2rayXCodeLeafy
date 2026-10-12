@@ -1,0 +1,48 @@
+name: Android Tests
+
+on:
+  push:
+    paths:
+      - "g2ray_app/**"
+      - ".github/workflows/android-tests.yml"
+  pull_request:
+    paths:
+      - "g2ray_app/**"
+      - ".github/workflows/android-tests.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: g2ray_app
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+          cache-dependency-path: |
+            g2ray_app/**/*.gradle*
+            g2ray_app/gradle.properties
+            g2ray_app/gradle/libs.versions.toml
+            g2ray_app/gradle/wrapper/gradle-wrapper.properties
+      - name: Install Android platform
+        run: sdkmanager "platforms;android-36.1" "build-tools;36.0.0"
+      - name: Test source and verify native build inputs
+        run: >-
+          bash ./gradlew :app:testDebugUnitTest :app:lintDebug
+          :app:verifyHevBundle :app:verifyLibXrayBuildContract
+          --no-daemon --console=plain

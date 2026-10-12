@@ -51,6 +51,12 @@ The panel writes copy-ready configs and a base64 subscription file inside your C
 
 Every export refresh also writes `g2ray-codespace-bundle.json` locally. It contains that Codespace's name, Worker selection name, and its VLESS links, but never a Worker URL, GitHub token, or wake key. The Android client can extract the links from this private bundle after you select or create the matching Codespace entry.
 
+### Android Client
+
+The Android VPN source is in [`g2ray_app`](g2ray_app/README.md) in this same repository. Open that folder, not the repository root, as the Android Studio project. See its [build instructions](g2ray_app/README.md#production-core) and [device test matrix](g2ray_app/PRODUCTION_TEST_MATRIX.md).
+
+The checked-in native HEV libraries have pinned checksum metadata. The large `libXray.aar`, SDK-local settings, signing keys, and APK outputs are intentionally not committed. Rebuild the pinned AAR using the app's script before producing a functional APK. Android CI checks source tests, lint, HEV checksums, and the core build contract without pretending that coreless tests prove a working VPN.
+
 <div align="center">
 
 | Private Client Import |

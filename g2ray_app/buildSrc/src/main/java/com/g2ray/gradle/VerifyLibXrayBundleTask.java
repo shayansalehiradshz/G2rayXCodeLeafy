@@ -1,0 +1,175 @@
+package com.g2ray.gradle;
+
+import java.io.InputStream;
+import java.net.URL;
+import java.net.URLClassLoader;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.util.Arrays;
+import java.util.HexFormat;
+import java.util.Properties;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
+import org.gradle.api.DefaultTask;
+import org.gradle.api.GradleException;
+import org.gradle.api.file.RegularFileProperty;
+import org.gradle.api.provider.Property;
+import org.gradle.api.tasks.Input;
+import org.gradle.api.tasks.InputFile;
+import org.gradle.api.tasks.Internal;
+import org.gradle.api.tasks.PathSensitive;
+import org.gradle.api.tasks.PathSensitivity;
+import org.gradle.api.tasks.TaskAction;
+import org.gradle.work.DisableCachingByDefault;
+
+@DisableCachingByDefault(because = "Native bundle verification must inspect the current local artifact")
+public abstract class VerifyLibXrayBundleTask extends DefaultTask {
+    @Internal
+    public abstract RegularFileProperty getAarFile();
+
+    @Internal
+    public abstract RegularFileProperty getMetadataFile();
+
+    @InputFile
+    @PathSensitive(PathSensitivity.RELATIVE)
+    public abstract RegularFileProperty getControllerPatch();
+
+    @Input
+    public abstract Property<Boolean> getRequired();
+
+    @Input
+    public String getAarPath() {
+        return getAarFile().getAsFile().get().getAbsolutePath();
+    }
+
+    @Input
+    public String getMetadataPath() {
+        return getMetadataFile().getAsFile().get().getAbsolutePath();
+    }
+
+    @TaskAction
+    public void verifyBundle() throws Exception {
+        Path aar = Path.of(getAarPath());
+        Path metadata = Path.of(getMetadataPath());
+        boolean aarExists = Files.isRegularFile(aar);
+        boolean metadataExists = Files.isRegularFile(metadata);
+
+        if (!aarExists) {
+            if (getRequired().get()) {
+                throw new GradleException("This build requires app/libs/libXray.aar and its metadata");
+            }
+            return;
+        }
+        if (!metadataExists) {
+            throw new GradleException(
+                "app/libs/libXray.aar requires app/libs/libXray.properties"
+            );
+        }
+
+        Properties properties = new Properties();
+        try (InputStream input = Files.newInputStream(metadata)) {
+            properties.load(input);
+        }
+        String expectedHash = properties.getProperty("libxray.sha256", "").trim();
+        if (expectedHash.isEmpty()) {
+            throw new GradleException("libXray metadata is missing libxray.sha256");
+        }
+
+        String actualHash = sha256(aar);
+        if (!actualHash.equalsIgnoreCase(expectedHash)) {
+            throw new GradleException(
+                "app/libs/libXray.aar does not match the pinned SHA-256; rebuild it with scripts/build-libxray-aar.ps1"
+            );
+        }
+
+        String expectedPatchHash = properties
+            .getProperty("libxray.android.controller.patch.sha256", "")
+            .trim();
+        String actualPatchHash = sha256(getControllerPatch().getAsFile().get().toPath());
+        if (!actualPatchHash.equalsIgnoreCase(expectedPatchHash)) {
+            throw new GradleException(
+                "The bundled libXray AAR was not built with the current Android controller patch"
+            );
+        }
+
+        verifyJavaApi(aar);
+    }
+
+    private static void verifyJavaApi(Path aar) throws Exception {
+        Path classesJar = Files.createTempFile("g2ray-libxray-classes-", ".jar");
+        try {
+            try (ZipFile zip = new ZipFile(aar.toFile())) {
+                ZipEntry entry = zip.getEntry("classes.jar");
+                if (entry == null) {
+                    throw new GradleException("The bundled libXray AAR does not contain classes.jar");
+                }
+                try (InputStream input = zip.getInputStream(entry)) {
+                    Files.copy(input, classesJar, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                }
+            }
+
+            try (URLClassLoader loader = new URLClassLoader(
+                new URL[] { classesJar.toUri().toURL() },
+                ClassLoader.getPlatformClassLoader()
+            )) {
+                Class<?> libXray = Class.forName("libXray.LibXray", false, loader);
+                boolean controllers = hasMethod(libXray, "registerDialerController", 1) &&
+                    hasMethod(libXray, "registerListenerController", 1);
+                boolean modern = hasStringMethod(libXray, "invoke", 1);
+                boolean legacy = hasNumericMethod(libXray, "setTunFd") &&
+                    hasStringMethod(libXray, "newXrayRunFromJSONRequest", 2) &&
+                    hasStringMethod(libXray, "runXrayFromJSON", 1) &&
+                    hasStringMethod(libXray, "stopXray", 0) &&
+                    hasMethod(libXray, "getXrayState", 0) &&
+                    hasStringMethod(libXray, "ping", 1);
+                if (!controllers || (!modern && !legacy)) {
+                    throw new GradleException(
+                        "The bundled libXray Java API is incompatible with the app bridge; " +
+                        "expected invoke(String) or the complete legacy lifecycle API"
+                    );
+                }
+            }
+        } finally {
+            Files.deleteIfExists(classesJar);
+        }
+    }
+
+    private static boolean hasMethod(Class<?> type, String name, int parameterCount) {
+        return Arrays.stream(type.getMethods()).anyMatch(method ->
+            method.getName().equalsIgnoreCase(name) &&
+                method.getParameterCount() == parameterCount
+        );
+    }
+
+    private static boolean hasStringMethod(Class<?> type, String name, int parameterCount) {
+        return Arrays.stream(type.getMethods()).anyMatch(method ->
+            method.getName().equalsIgnoreCase(name) &&
+                method.getParameterCount() == parameterCount &&
+                method.getReturnType().equals(String.class)
+        );
+    }
+
+    private static boolean hasNumericMethod(Class<?> type, String name) {
+        return Arrays.stream(type.getMethods()).anyMatch(method -> {
+            if (!method.getName().equalsIgnoreCase(name) || method.getParameterCount() != 1) {
+                return false;
+            }
+            Class<?> parameter = method.getParameterTypes()[0];
+            return parameter.equals(int.class) || parameter.equals(Integer.class) ||
+                parameter.equals(long.class) || parameter.equals(Long.class);
+        });
+    }
+
+    private static String sha256(Path path) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        try (InputStream input = Files.newInputStream(path)) {
+            byte[] buffer = new byte[1024 * 1024];
+            int read;
+            while ((read = input.read(buffer)) >= 0) {
+                digest.update(buffer, 0, read);
+            }
+        }
+        return HexFormat.of().withUpperCase().formatHex(digest.digest());
+    }
+}

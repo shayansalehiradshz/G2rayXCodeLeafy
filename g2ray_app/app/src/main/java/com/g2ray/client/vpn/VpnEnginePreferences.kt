@@ -1,0 +1,83 @@
+package com.g2ray.client.vpn
+
+import android.content.Context
+import com.g2ray.client.data.EncryptedPrefsStore
+import com.g2ray.client.data.SecureKeyValueStore
+import com.g2ray.client.model.VpnEngineMode
+
+/** Persists the user's engine preference independently of a VPN service restart. */
+class VpnEnginePreferences internal constructor(
+    private val store: SecureKeyValueStore
+) {
+    constructor(context: Context) : this(EncryptedPrefsStore(context.applicationContext))
+
+    fun getMode(): VpnEngineMode = VpnEngineMode.fromStorage(store.getString(PREF_VPN_ENGINE_MODE, null))
+
+    fun setMode(mode: VpnEngineMode) {
+        store.putString(PREF_VPN_ENGINE_MODE, mode.storageValue)
+    }
+
+    fun isFastDnsEnabled(): Boolean = readBoolean(PREF_FAST_DNS_ENABLED)
+
+    fun setFastDnsEnabled(enabled: Boolean) {
+        store.putString(PREF_FAST_DNS_ENABLED, enabled.toString())
+    }
+
+    fun isIpv4OnlyEnabled(): Boolean = readBoolean(PREF_IPV4_ONLY_ENABLED)
+
+    fun setIpv4OnlyEnabled(enabled: Boolean) {
+        store.putString(PREF_IPV4_ONLY_ENABLED, enabled.toString())
+    }
+
+    fun isDpiCompatibilityEnabled(): Boolean = readBoolean(PREF_DPI_COMPATIBILITY_ENABLED)
+
+    fun setDpiCompatibilityEnabled(enabled: Boolean) {
+        store.putString(PREF_DPI_COMPATIBILITY_ENABLED, enabled.toString())
+    }
+
+    fun isAutoRouteOptimizationEnabled(): Boolean {
+        return readBoolean(PREF_AUTO_ROUTE_OPTIMIZATION_ENABLED, defaultValue = true)
+    }
+
+    fun setAutoRouteOptimizationEnabled(enabled: Boolean) {
+        store.putString(PREF_AUTO_ROUTE_OPTIMIZATION_ENABLED, enabled.toString())
+    }
+
+    fun isSeamlessFailoverEnabled(): Boolean {
+        return readBoolean(PREF_SEAMLESS_FAILOVER_ENABLED, defaultValue = true)
+    }
+
+    fun setSeamlessFailoverEnabled(enabled: Boolean) {
+        store.putString(PREF_SEAMLESS_FAILOVER_ENABLED, enabled.toString())
+    }
+
+    fun getLastRouteOptimizationAttemptAt(accountId: String): Long {
+        return store.getString(routeOptimizationAttemptKey(accountId), null)
+            ?.toLongOrNull()
+            ?.coerceAtLeast(0L)
+            ?: 0L
+    }
+
+    fun setLastRouteOptimizationAttemptAt(accountId: String, timestampMs: Long) {
+        store.putString(routeOptimizationAttemptKey(accountId), timestampMs.coerceAtLeast(0L).toString())
+    }
+
+    private fun readBoolean(key: String, defaultValue: Boolean = false): Boolean {
+        return store.getString(key, null)?.toBooleanStrictOrNull() ?: defaultValue
+    }
+
+    private fun routeOptimizationAttemptKey(accountId: String): String {
+        require(accountId.isNotBlank()) { "Account ID is empty" }
+        return "$PREF_ROUTE_OPTIMIZATION_ATTEMPT_PREFIX$accountId"
+    }
+
+    companion object {
+        private const val PREF_VPN_ENGINE_MODE = "vpn_engine_mode"
+        private const val PREF_FAST_DNS_ENABLED = "vpn_fast_dns_enabled"
+        private const val PREF_IPV4_ONLY_ENABLED = "vpn_ipv4_only_enabled"
+        private const val PREF_DPI_COMPATIBILITY_ENABLED = "vpn_dpi_compatibility_enabled"
+        private const val PREF_AUTO_ROUTE_OPTIMIZATION_ENABLED = "vpn_auto_route_optimization_enabled"
+        private const val PREF_SEAMLESS_FAILOVER_ENABLED = "vpn_seamless_failover_enabled"
+        private const val PREF_ROUTE_OPTIMIZATION_ATTEMPT_PREFIX = "vpn_route_optimization_attempt_"
+    }
+}
