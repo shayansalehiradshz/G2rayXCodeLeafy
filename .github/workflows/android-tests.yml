@@ -39,8 +39,11 @@ jobs:
             g2ray_app/gradle.properties
             g2ray_app/gradle/libs.versions.toml
             g2ray_app/gradle/wrapper/gradle-wrapper.properties
-      - name: Install Android platform
-        run: sdkmanager "platforms;android-36.1" "build-tools;36.0.0"
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: "platform-tools platforms;android-36.1 build-tools;36.0.0"
+          log-accepted-android-sdk-licenses: false
       - name: Test source and verify native build inputs
         run: >-
           bash ./gradlew :app:testDebugUnitTest :app:lintDebug
