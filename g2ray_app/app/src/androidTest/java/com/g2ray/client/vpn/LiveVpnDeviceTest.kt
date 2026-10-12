@@ -26,6 +26,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import okhttp3.ConnectionPool
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -56,6 +57,7 @@ class LiveVpnDeviceTest {
             // No SOCKS proxy, socket protection, or underlying-network binding:
             // these requests must traverse Android's default full-device VPN.
             .proxy(Proxy.NO_PROXY)
+            .connectionPool(ConnectionPool(5, 10, TimeUnit.MINUTES))
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(20, TimeUnit.SECONDS)
             .writeTimeout(20, TimeUnit.SECONDS)
@@ -111,25 +113,32 @@ class LiveVpnDeviceTest {
             val afterIdle = VpnStateRepository.state.value
             assertEquals("Service lost the VPN during background idle", TunnelState.Connected, afterIdle.tunnelState)
             scenario.moveToState(Lifecycle.State.RESUMED)
+            probeHttpsQuorum(client, "idle_resume_retained_pool")
             client.connectionPool.evictAll()
             probeHttpsQuorum(client, "idle_resume_fresh_socket")
             report("idle_resume_success=true")
         } finally {
-            if (startRequested) {
-                scenario.moveToState(Lifecycle.State.RESUMED)
-                scenario.onActivity { activity ->
-                    activity.startService(Intent(activity, G2RayVpnService::class.java).apply {
-                        action = G2RayVpnService.ACTION_STOP
-                    })
+            try {
+                if (startRequested) {
+                    scenario.moveToState(Lifecycle.State.RESUMED)
+                    scenario.onActivity { activity ->
+                        activity.startService(Intent(activity, G2RayVpnService::class.java).apply {
+                            action = G2RayVpnService.ACTION_STOP
+                        })
+                    }
+                    withTimeout(15_000L) {
+                        VpnStateRepository.state.first { it.tunnelState == TunnelState.Disconnected }
+                    }
                 }
-                withTimeout(15_000L) {
-                    VpnStateRepository.state.first { it.tunnelState == TunnelState.Disconnected }
+            } finally {
+                try {
+                    scenario.close()
+                } finally {
+                    client.dispatcher.cancelAll()
+                    client.connectionPool.evictAll()
+                    client.dispatcher.executorService.shutdown()
                 }
             }
-            scenario.close()
-            client.dispatcher.cancelAll()
-            client.connectionPool.evictAll()
-            client.dispatcher.executorService.shutdown()
         }
     }
 

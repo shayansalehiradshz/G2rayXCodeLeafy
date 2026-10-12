@@ -250,7 +250,8 @@ connect one test phone. The Codespace must already be available. This test uses
 the saved profile without printing its link or credentials, starts and stops
 the service, and does not change the persisted engine preference. It transfers
 2 MiB down and 64 KiB up, checks three HTTPS endpoints before and after background
-idle, and verifies real HEV receive counters. It consumes mobile data.
+idle with both a retained connection pool and fresh sockets, and verifies real
+HEV receive counters. It consumes mobile data.
 
 ```powershell
 .\gradlew.bat :app:connectedDebugAndroidTest `
