@@ -47,5 +47,6 @@ jobs:
       - name: Test source and verify native build inputs
         run: >-
           bash ./gradlew :app:testDebugUnitTest :app:lintDebug
+          :app:compileDebugAndroidTestKotlin
           :app:verifyHevBundle :app:verifyLibXrayBuildContract
           --no-daemon --console=plain

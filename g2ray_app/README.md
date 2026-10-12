@@ -239,6 +239,32 @@ Use the release Android App Bundle for distribution so stores deliver only the
 phone's ABI instead of a universal APK containing all native architectures.
 Follow `PRODUCTION_TEST_MATRIX.md` before describing a build as production-ready.
 
+## On-device Network Verification
+
+The ordinary instrumentation suite checks packaged native loading and config
+startup without contacting a real proxy server. `LiveVpnDeviceTest` is a separate,
+opt-in check of the full Android VPN path, not just the local SOCKS listener.
+
+Select a working saved profile, grant VPN permission in the app, stop VPN, and
+connect one test phone. The Codespace must already be available. This test uses
+the saved profile without printing its link or credentials, starts and stops
+the service, and does not change the persisted engine preference. It transfers
+2 MiB down and 64 KiB up, checks three HTTPS endpoints before and after background
+idle, and verifies real HEV receive counters. It consumes mobile data.
+
+```powershell
+.\gradlew.bat :app:connectedDebugAndroidTest `
+  "-Pandroid.testInstrumentationRunnerArguments.class=com.g2ray.client.vpn.LiveVpnDeviceTest" `
+  "-Pandroid.testInstrumentationRunnerArguments.liveVpn=true" `
+  "-Pandroid.testInstrumentationRunnerArguments.engine=hev" `
+  "-Pandroid.testInstrumentationRunnerArguments.idleSeconds=300"
+```
+
+Repeat with `engine=xray_native` to check Native independently. Without
+`liveVpn=true`, the test is skipped. The repository's root Android CI compiles
+these tests and runs unit tests and lint; it does not claim phone, long-video,
+network-handoff, or long-session coverage.
+
 ## Notes
 
 - Generated configs and wake secrets are private. Do not publish them in a repository.
