@@ -31,6 +31,7 @@ data class WorkerWakeResponse(
     val status: Int? = null,
     val codespace_id: String? = null,
     val codespace_label: String? = null,
+    val codespace: String? = null,
     val start_accepted: Boolean? = null,
     val state: String? = null,
     val route_ready: Boolean? = null,

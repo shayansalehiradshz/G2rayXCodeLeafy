@@ -470,6 +470,23 @@ class AccountRepositoryTest {
     }
 
     @Test
+    fun partialDelaySuccessDoesNotEraseKnownFailuresOrEndpointErrors() {
+        val store = InMemorySecureStore()
+        val repository = AccountRepository(store)
+        val account = repository.addAccount("Partial", "https://worker.example", null)
+        val parsed = VlessUriParser.parseFirstProfile("vless://00000000-0000-0000-0000-000000000000@example.com:443?encryption=none&security=tls&sni=example.com&type=ws&host=example.com&path=%2F").getOrThrow()
+        val profile = repository.importProfile(account.id, parsed.name, parsed.rawUri, parsed)
+        repository.recordProfileDelay(profile.id, false, null, "timeout")
+        repository.recordProfileDelay(profile.id, true, 150L, "two endpoints timed out", successfulSamples = 1, sampleCount = 3)
+        val reloaded = AccountRepository(store).profiles.value.single()
+        assertEquals(150L, reloaded.lastDelayMs)
+        assertEquals(1, reloaded.delayFailureCount)
+        assertEquals("two endpoints timed out", reloaded.lastDelayError)
+        assertEquals(1, reloaded.lastDelaySuccessfulSamples)
+        assertEquals(3, reloaded.lastDelaySampleCount)
+    }
+
+    @Test
     fun testProfileDelayHealthIsPersistedAcrossReload() {
         val store = InMemorySecureStore()
         val repo1 = AccountRepository(store)

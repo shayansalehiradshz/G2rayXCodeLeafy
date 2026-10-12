@@ -14,6 +14,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Call
 import okhttp3.Callback
@@ -33,7 +34,8 @@ data class RunningRouteResult(
     val success: Boolean,
     val error: String? = null,
     val latencyMs: Long? = null,
-    val failureScope: RouteFailureScope = if (success) RouteFailureScope.None else RouteFailureScope.Unknown
+    val failureScope: RouteFailureScope = if (success) RouteFailureScope.None else RouteFailureScope.Unknown,
+    val retryAllowed: Boolean = true
 )
 
 enum class RouteFailureScope {
@@ -338,6 +340,10 @@ class XrayCoreManager : TunnelCore {
     private val _lastError = MutableStateFlow<String?>(null)
     val lastError: StateFlow<String?> = _lastError.asStateFlow()
     private var consecutiveStateQueryFailures = 0
+    private val nativeRuntime by lazy {
+        if (bridge is ReflectionXrayBridge) NativeRuntimeCoordinator.process else NativeRuntimeCoordinator()
+    }
+    private var nativeLease: NativeRuntimeCoordinator.Lease? = null
 
     fun isAvailable(): Boolean = bridge.isAvailable()
 
@@ -349,6 +355,18 @@ class XrayCoreManager : TunnelCore {
     }
 
     fun measureDelay(
+        profile: G2RayProfile,
+        datDir: String,
+        timeoutSeconds: Int = 8,
+        testUrl: String = "https://www.google.com/generate_204",
+        dpiCompatibilityEnabled: Boolean = false
+    ): XrayPingResult {
+        val lease = nativeRuntime.tryAcquireProbe()
+            ?: return XrayPingResult(false, null, "VPN owns the native runtime; delay test deferred")
+        return lease.use { measureDelayOwned(profile, datDir, timeoutSeconds, testUrl, dpiCompatibilityEnabled) }
+    }
+
+    private fun measureDelayOwned(
         profile: G2RayProfile,
         datDir: String,
         timeoutSeconds: Int = 8,
@@ -532,6 +550,23 @@ class XrayCoreManager : TunnelCore {
         finalTestUrl: String? = DEFAULT_PREFLIGHT_URLS.getOrNull(2),
         dpiCompatibilityEnabled: Boolean = false
     ): List<XrayDelaySummary>? {
+        val lease = nativeRuntime.tryAcquireProbe() ?: return profiles.map {
+            XrayDelaySummary(false, null, null, null, 0, 0, "VPN owns the native runtime; batch test deferred")
+        }
+        return lease.use {
+            measureDelayQuickBatchOwned(profiles, datDir, timeoutSeconds, testUrl, retryTestUrl, finalTestUrl, dpiCompatibilityEnabled)
+        }
+    }
+
+    private fun measureDelayQuickBatchOwned(
+        profiles: List<G2RayProfile>,
+        datDir: String,
+        timeoutSeconds: Int = 3,
+        testUrl: String = DEFAULT_PREFLIGHT_URLS.first(),
+        retryTestUrl: String? = DEFAULT_PREFLIGHT_URLS.getOrNull(1),
+        finalTestUrl: String? = DEFAULT_PREFLIGHT_URLS.getOrNull(2),
+        dpiCompatibilityEnabled: Boolean = false
+    ): List<XrayDelaySummary>? {
         if (profiles.isEmpty()) return emptyList()
         if (profiles.size > 5) return null
         val capabilities = bridge.capabilities()
@@ -652,6 +687,25 @@ class XrayCoreManager : TunnelCore {
         datDir: String,
         dpiCompatibilityEnabled: Boolean = false
     ): RoutePerformanceSummary {
+        if (nativeLease != null) {
+            return RoutePerformanceSummary(false, error = "Native runtime is already owned by this manager")
+        }
+        val lease = nativeRuntime.tryAcquireProbe()
+            ?: return RoutePerformanceSummary(false, error = "VPN owns the native runtime; throughput test deferred")
+        nativeLease = lease
+        try {
+            return measureRoutePerformanceOwned(profile, datDir, dpiCompatibilityEnabled)
+        } finally {
+            releaseStoppedNativeLease()
+            if (nativeLease != null) withContext(kotlinx.coroutines.NonCancellable) { stop() }
+        }
+    }
+
+    private suspend fun measureRoutePerformanceOwned(
+        profile: G2RayProfile,
+        datDir: String,
+        dpiCompatibilityEnabled: Boolean = false
+    ): RoutePerformanceSummary {
         if (!bridge.isAvailable()) {
             return RoutePerformanceSummary(false, error = MISSING_CORE_MESSAGE)
         }
@@ -660,6 +714,7 @@ class XrayCoreManager : TunnelCore {
         repeat(DELAY_PORT_ATTEMPTS) { attempt ->
             val localPort = portAllocator()
             var runAttempted = false
+            var runtimeStopped = true
             val result = try {
                 require(localPort in 1..65_535) { "Could not allocate a local performance-test port" }
                 bridge.registerDialerController { true }
@@ -685,7 +740,13 @@ class XrayCoreManager : TunnelCore {
             } catch (error: Exception) {
                 RoutePerformanceSummary(false, error = error.localizedMessage ?: error.javaClass.simpleName)
             } finally {
-                if (runAttempted) runCatching { bridge.stop() }
+                if (runAttempted) {
+                    runCatching { bridge.stop() }
+                    runtimeStopped = runCatching { !bridge.getState() }.getOrDefault(false)
+                }
+            }
+            if (!runtimeStopped) {
+                return RoutePerformanceSummary(false, error = "Performance-test runtime has not stopped; refusing to replace it")
             }
             lastResult = result
             if (result.success || !isAddressInUse(result.error) || attempt + 1 >= DELAY_PORT_ATTEMPTS) {
@@ -723,11 +784,26 @@ class XrayCoreManager : TunnelCore {
             return
         }
 
+        if (nativeLease != null) {
+            stop()
+            if (nativeLease != null) {
+                _lastError.value = "Previous native runtime has not stopped; refusing to replace it"
+                _state.value = TunnelCoreState.Error
+                return
+            }
+        }
+        nativeLease = withTimeoutOrNull(20_000L) { nativeRuntime.acquireVpn() }
+        if (nativeLease == null) {
+            _lastError.value = "Native runtime is still busy; retrying must wait for its owner to stop"
+            _state.value = TunnelCoreState.Error
+            return
+        }
+
         _lastError.value = null
         _state.value = TunnelCoreState.Starting
         healthSocksPort = null
-        runningRouteProbe.reset()
         try {
+            runningRouteProbe.reset()
             bridge.registerDialerController(protectSocket)
             bridge.registerListenerController(protectListenerSocket)
             // HEV owns the Android TUN FD and forwards it to this loopback
@@ -760,6 +836,11 @@ class XrayCoreManager : TunnelCore {
                 lastStartupError = result.error ?: "Local SOCKS listener did not become ready after starting Xray"
                 runCatching { bridge.stop() }
                 healthSocksPort = null
+                if (runCatching { bridge.getState() }.getOrDefault(true)) {
+                    _lastError.value = "Xray did not stop after failed startup; refusing to replace its runtime"
+                    _state.value = TunnelCoreState.Error
+                    return
+                }
                 if (attempt + 1 >= START_PORT_ATTEMPTS || (!result.success && !isAddressInUse(lastStartupError))) {
                     _lastError.value = lastStartupError
                     _state.value = TunnelCoreState.Error
@@ -779,6 +860,8 @@ class XrayCoreManager : TunnelCore {
             healthSocksPort = null
             _lastError.value = e.localizedMessage ?: e.javaClass.simpleName
             _state.value = TunnelCoreState.Error
+        } finally {
+            if (_state.value != TunnelCoreState.Connected) releaseStoppedNativeLease()
         }
     }
 
@@ -832,6 +915,11 @@ class XrayCoreManager : TunnelCore {
     override suspend fun stop() {
         _state.value = TunnelCoreState.Stopping
         runningRouteProbe.reset()
+        if (bridge is ReflectionXrayBridge && nativeLease == null) {
+            healthSocksPort = null
+            _state.value = TunnelCoreState.Disconnected
+            return
+        }
         if (!bridge.isAvailable()) {
             healthSocksPort = null
             consecutiveStateQueryFailures = 0
@@ -860,6 +948,8 @@ class XrayCoreManager : TunnelCore {
             coreStopped
         } ?: false
         if (stopped) {
+            nativeLease?.close()
+            nativeLease = null
             consecutiveStateQueryFailures = 0
             _lastError.value = null
             _state.value = TunnelCoreState.Disconnected
@@ -873,6 +963,13 @@ class XrayCoreManager : TunnelCore {
         val value = error.orEmpty()
         return value.contains("address already in use", ignoreCase = true) ||
             value.contains("EADDRINUSE", ignoreCase = true)
+    }
+
+    private fun releaseStoppedNativeLease() {
+        if (runCatching { !bridge.getState() }.getOrDefault(false)) {
+            nativeLease?.close()
+            nativeLease = null
+        }
     }
 
 }

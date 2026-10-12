@@ -8,8 +8,19 @@ import com.g2ray.client.model.ActiveVpnEngine
 import com.g2ray.client.model.G2RayProfile
 import com.g2ray.client.model.StoredG2RayProfile
 import com.g2ray.client.model.Transport
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
 
+@RunWith(RobolectricTestRunner::class)
 class G2RayVpnServiceTest {
+    @Test
+    fun repeatedProbeFailuresEventuallyRecoverEvenWithBackgroundPayload() {
+        assertFalse(G2RayVpnService.routeHealthFailureRequiresRecovery(2, false))
+        assertTrue(G2RayVpnService.routeHealthFailureRequiresRecovery(3, false))
+        assertFalse(G2RayVpnService.routeHealthFailureRequiresRecovery(3, true))
+        assertTrue(G2RayVpnService.routeHealthFailureRequiresRecovery(6, true))
+    }
+
     @Test
     fun optionalEndpointDnsFailureDoesNotBreakSelectedRoute() {
         val selected = liveProfile("203.0.113.1")
@@ -604,27 +615,27 @@ class G2RayVpnServiceTest {
 
     @Test
     fun onlyReceivedHevTrafficProvesTheRouteStillCarriesResponses() {
-        val previous = TrafficBytes(rxBytes = 100L, txBytes = 200L)
+        val previous = TrafficBytes(rxBytes = 100L, txBytes = 200L, rxTcpPayloadBytes = 50L)
 
         assertTrue(
             G2RayVpnService.measuredResponseTrafficAdvanced(
                 ActiveVpnEngine.Hev,
                 previous,
-                TrafficBytes(rxBytes = 101L, txBytes = 200L)
+                TrafficBytes(rxBytes = 101L, txBytes = 200L, rxTcpPayloadBytes = 51L)
             )
         )
         assertFalse(
             G2RayVpnService.measuredResponseTrafficAdvanced(
                 ActiveVpnEngine.Hev,
                 previous,
-                TrafficBytes(rxBytes = 100L, txBytes = 201L)
+                TrafficBytes(rxBytes = 100L, txBytes = 201L, rxTcpPayloadBytes = 50L)
             )
         )
         assertFalse(
             G2RayVpnService.measuredResponseTrafficAdvanced(
                 ActiveVpnEngine.XrayNative,
                 previous,
-                TrafficBytes(rxBytes = 101L, txBytes = 200L)
+                TrafficBytes(rxBytes = 101L, txBytes = 200L, rxTcpPayloadBytes = 51L)
             )
         )
         assertFalse(
@@ -638,8 +649,8 @@ class G2RayVpnServiceTest {
 
     @Test
     fun failedReverificationDoesNotRestartAHevTunnelWhoseResponsesResumed() {
-        val previous = TrafficBytes(rxBytes = 100L, txBytes = 200L)
-        val resumed = TrafficBytes(rxBytes = 101L, txBytes = 220L)
+        val previous = TrafficBytes(rxBytes = 100L, txBytes = 200L, rxTcpPayloadBytes = 50L)
+        val resumed = TrafficBytes(rxBytes = 101L, txBytes = 220L, rxTcpPayloadBytes = 51L)
 
         assertTrue(
             G2RayVpnService.shouldSuppressRouteRecoveryAfterFailedReverification(
@@ -677,6 +688,39 @@ class G2RayVpnServiceTest {
                 currentTraffic = resumed
             )
         )
+    }
+
+    @Test
+    fun localSynAckAndAckPacketsCannotProveUpstreamHealth() {
+        val previous = TrafficBytes(0L, 0L, rxTcpPayloadBytes = 0L)
+        val localSynAck = TrafficBytes(44L, 40L, 1L, 1L, rxTcpPayloadBytes = 0L)
+        assertFalse(G2RayVpnService.measuredResponseTrafficAdvanced(ActiveVpnEngine.Hev, previous, localSynAck))
+        assertFalse(G2RayVpnService.shouldSuppressRouteRecoveryAfterFailedReverification(
+            RunningRouteResult(false, "route unavailable", failureScope = RouteFailureScope.XrayRoute),
+            ActiveVpnEngine.Hev, previous, localSynAck
+        ))
+        assertFalse(G2RayVpnService.measuredResponseTrafficAdvanced(
+            ActiveVpnEngine.Hev, TrafficBytes(0L, 0L), TrafficBytes(44L, 40L)
+        ))
+        assertFalse(G2RayVpnService.shouldSuppressRouteRecoveryAfterFailedReverification(
+            RunningRouteResult(false, "TUN unavailable", failureScope = RouteFailureScope.PacketEngine),
+            ActiveVpnEngine.Hev, previous, localSynAck.copy(rxTcpPayloadBytes = 100L)
+        ))
+    }
+
+    @Test
+    fun alternateTransportGetsAReservedSlotEvenWithSixUnmeasuredXhttpIps() {
+        val uuid = "00000000-0000-0000-0000-000000000000"
+        fun uri(address: String, transport: String) =
+            "vless://$uuid@$address:443?encryption=none&security=tls&sni=example.com&host=example.com&type=$transport&path=%2F&mode=packet-up&alpn=h2"
+        val profiles = (1..8).map {
+            storedProfile("xhttp-$it", "20.0.0.$it", it.toLong(), uri("20.0.0.$it", "xhttp"))
+        } + storedProfile("working-ws", "20.0.0.1", 99L, uri("20.0.0.1", "ws"))
+        val selected = G2RayVpnService.selectAlternativeProfiles(
+            profiles, "account", uri("20.0.0.99", "xhttp"), maxCandidates = 6
+        )
+        assertEquals(6, selected.size)
+        assertEquals("working-ws", selected[1].id)
     }
 
     @Test
@@ -990,7 +1034,9 @@ class G2RayVpnServiceTest {
     @Test
     fun seamlessRoutePoolOnlyTrustsFreshSuccessfulPersistedMeasurements() {
         val now = 10_000L
-        val fresh = storedProfile("fresh", "20.0.0.1", 80).copy(lastDelayTestedAt = 9_000L)
+        val fresh = storedProfile("fresh", "20.0.0.1", 80).copy(
+            lastDelayTestedAt = 9_000L, lastDelaySuccessfulSamples = 3, lastDelaySampleCount = 3
+        )
         val stale = fresh.copy(id = "stale", lastDelayTestedAt = 1_000L)
         val future = fresh.copy(id = "future", lastDelayTestedAt = 11_000L)
         val failing = fresh.copy(id = "failing", delayFailureCount = 1)
@@ -999,6 +1045,12 @@ class G2RayVpnServiceTest {
         assertFalse(G2RayVpnService.persistedRouteMeasurementFresh(stale, now, maxAgeMs = 2_000L))
         assertFalse(G2RayVpnService.persistedRouteMeasurementFresh(future, now, maxAgeMs = 2_000L))
         assertFalse(G2RayVpnService.persistedRouteMeasurementFresh(failing, now, maxAgeMs = 2_000L))
+        assertFalse(G2RayVpnService.persistedRouteMeasurementFresh(
+            fresh.copy(lastDelaySuccessfulSamples = 1, lastDelaySampleCount = 3), now
+        ))
+        assertFalse(G2RayVpnService.persistedRouteMeasurementFresh(
+            fresh.copy(lastDelaySuccessfulSamples = 1, lastDelaySampleCount = 1), now
+        ))
     }
 
     private fun liveProfile(address: String, mode: String = "packet-up"): G2RayProfile {

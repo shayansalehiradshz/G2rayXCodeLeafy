@@ -10,6 +10,37 @@ import retrofit2.Response
 import java.io.IOException
 
 class WorkerRouteCoordinatorTest {
+    @Test
+    fun aHealthyDifferentCodespaceCannotSatisfyTheRequestedWake() = runTest {
+        val api = FakeWorkerApiService(wakeHandler = {
+            Response.success(WorkerWakeResponse(ok = true, route_ready = true, codespace = "wrong-space"))
+        })
+        val result = WorkerRouteCoordinator(api, nowMs = { 0L }).ensureRouteReady(
+            listOf("worker.example"), "secret", expectedCodespaceName = "selected-space"
+        )
+        assertTrue(result is WorkerRouteOutcome.Failed)
+        assertEquals(1, api.calls.size)
+    }
+
+    @Test
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    fun deadlineCancelsAnInFlightWorkerRequestNotJustItsPollLoop() = runTest {
+        var cancelled = false
+        val api = FakeWorkerApiService(wakeHandler = {
+            try {
+                kotlinx.coroutines.awaitCancellation()
+            } finally {
+                cancelled = true
+            }
+        })
+        val result = WorkerRouteCoordinator(api, nowMs = { testScheduler.currentTime }).ensureRouteReady(
+            listOf("worker.example"), "secret", maxWaitMs = 500L
+        )
+        assertTrue(result is WorkerRouteOutcome.TimedOut)
+        assertTrue(cancelled)
+        assertEquals(500L, testScheduler.currentTime)
+    }
+
     private class FakeWorkerApiService(
         private val wakeHandler: suspend (String) -> Response<WorkerWakeResponse>,
         private val healthHandler: suspend (String) -> Response<WorkerWakeResponse> = wakeHandler

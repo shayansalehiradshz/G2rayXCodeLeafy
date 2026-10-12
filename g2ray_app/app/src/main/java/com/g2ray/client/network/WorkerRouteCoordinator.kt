@@ -8,6 +8,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Dns
 import okhttp3.OkHttpClient
 import okhttp3.ConnectionPool
@@ -112,6 +113,7 @@ object WorkerNetwork {
             .addInterceptor(logging)
             .connectTimeout(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
             .readTimeout(READ_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            .callTimeout(55, TimeUnit.SECONDS)
             .apply {
                 if (dnsLookup != null) {
                     dns(object : Dns {
@@ -236,6 +238,7 @@ class WorkerRouteCoordinator(
         codespaceId: String? = null,
         maxWaitMs: Long = 3 * 60 * 1000L,
         maxAttempts: Int = 40,
+        expectedCodespaceName: String? = null,
         onProgress: (WorkerRouteProgress) -> Unit = {}
     ): WorkerRouteOutcome {
         val normalizedBases = workerBaseUrls
@@ -268,7 +271,9 @@ class WorkerRouteCoordinator(
             )
 
             val call = try {
-                callWithFailover(orderedBases, endpoint, secret, codespaceId)
+                withTimeoutOrNull((maxWaitMs - (nowMs() - startedAt)).coerceAtLeast(1L)) {
+                    callWithFailover(orderedBases, endpoint, secret, codespaceId)
+                } ?: return WorkerRouteOutcome.TimedOut("Worker recovery deadline exceeded.")
             } catch (error: IOException) {
                 return WorkerRouteOutcome.Failed(
                     message = error.localizedMessage ?: "All configured Worker endpoints are unreachable.",
@@ -278,6 +283,15 @@ class WorkerRouteCoordinator(
             orderedBases = listOf(call.workerBaseUrl) + orderedBases.filterNot { it == call.workerBaseUrl }
             val response = call.response
             val body = if (response.isSuccessful) response.body() else call.errorBody
+
+            if (response.isSuccessful && !expectedCodespaceName.isNullOrBlank() &&
+                body?.codespace != expectedCodespaceName
+            ) {
+                return WorkerRouteOutcome.Failed(
+                    "Worker responded for a different or unidentified Codespace. Check this account's Worker selection.",
+                    response = body
+                )
+            }
 
             if (response.isSuccessful) {
                 if (body?.route_ready == true) {
@@ -292,7 +306,7 @@ class WorkerRouteCoordinator(
                             attempt = attempts
                         )
                     )
-                    sleep(waitSeconds * 1000L)
+                    sleep(minOf(waitSeconds * 1000L, (maxWaitMs - (nowMs() - startedAt)).coerceAtLeast(0L)))
                     endpoint = WorkerRouteEndpoint.HEALTH
                     continue
                 }
@@ -304,7 +318,7 @@ class WorkerRouteCoordinator(
 
             if (response.code() == 429 && body?.reason == "wake_recently_succeeded") {
                 val waitSeconds = (body.poll_after_seconds ?: 2).coerceIn(1, 5)
-                sleep(waitSeconds * 1000L)
+                sleep(minOf(waitSeconds * 1000L, (maxWaitMs - (nowMs() - startedAt)).coerceAtLeast(0L)))
                 endpoint = WorkerRouteEndpoint.HEALTH
                 continue
             }

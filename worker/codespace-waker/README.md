@@ -62,6 +62,15 @@ The authenticated endpoint `POST /api/codespaces` returns only safe fields: sele
 
 Wrangler configuration remains available for automated deployments, but it is not part of the recommended manual setup. The KV registry in [`codespaces.registry.example.json`](codespaces.registry.example.json) remains an advanced option for custom labels, priorities, ports, or more than ten entries. Dashboard variables take effect automatically when no valid KV registry is present.
 
+If KV is bound only for optional history and Codespaces are configured with
+dashboard variables, set the optional Plaintext variable
+`CODESPACE_REGISTRY_SOURCE=dashboard` to skip registry storage reads. Leave it
+unset when using a KV registry. Registry operations have a one-second deadline;
+unavailable registry storage returns HTTP 503 instead of silently selecting a
+different Codespace. An unknown explicitly requested ID/name returns HTTP 404,
+even with one configured Codespace. Update older apps' saved selection to the
+real Codespace name rather than relying on arbitrary legacy IDs.
+
 If you choose the advanced KV registry, each entry declares its own token binding and route ports. The first port in `route_ports` is the primary XHTTP route and gates `route_ready`; later ports receive one bounded diagnostic probe, not a full settling loop. These are XHTTP OPTIONS checks, not WebSocket handshake tests: an HTTP 400 on the WS port does not establish that WebSocket traffic is broken. Keep `[443]` for normal setup. Do not list the WS port first or treat it as proof that the XHTTP route is ready.
 
 The tracked example enables Workers Logs. Successful and failed requests emit a
@@ -180,7 +189,7 @@ For automation that only needs GitHub state and wants to avoid an external route
 - `notification_status: "none"`: no Discord/Telegram alert was needed, or no alert channel is configured.
 - `notification_status: "deferred"` / `notifications_deferred: true`: Discord or Telegram delivery is running after the response through Cloudflare `waitUntil`; check Worker logs if an alert does not arrive.
 - `notification_status: "failed"`: notification delivery was attempted synchronously and `notification_errors` contains the delivery error.
-- `history_deferred: true`: KV history writes were queued through Cloudflare `waitUntil`, so the dashboard response did not wait for the history append. Quota incident state is recorded before the response when KV is available so quota-survival decisions are immediately visible.
+- `history_deferred: true`: history and quota-incident work were queued through Cloudflare `waitUntil`, so the dashboard response did not wait for optional storage. `quota_incident_recorded: false` while deferred is not a failed wake; inspect a later history response for persistence. Optional KV operations are time-bounded. KV history/cooldowns remain best-effort and non-transactional: concurrent requests may lose history or repeat a start. They are not an authoritative billing ledger or a strict distributed lock.
 - `401`: Wrong wake secret, or GitHub rejected the stored token. Check the JSON `error`, `reason`, or `token_warning` field to tell which side rejected the request.
 - `402`: GitHub quota or billing blocked the start. If the option is available, mark the Codespace as **Keep codespace**, wait for quota reset or adjust GitHub billing settings, then start the same Codespace again. Org-owned or policy-managed Codespaces may have retention rules that override or hide this option.
 - `403`: GitHub token was accepted but cannot access Codespaces, commonly because the `codespace` scope is missing. The response reason may be `github_token_scope_missing`.

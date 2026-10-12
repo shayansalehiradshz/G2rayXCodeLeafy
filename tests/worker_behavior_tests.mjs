@@ -2225,9 +2225,9 @@ async function testSimpleDashboardSetupAcceptsRealCodespaceName() {
     {}
   );
   const staleIdHealth = await responseJson(staleIdResponse);
-  assert.equal(staleIdResponse.status, 200);
-  assert.equal(staleIdHealth.codespace_id, "behavior-space");
-  assert.deepEqual(authorizations, ["Bearer github-token", "Bearer github-token"]);
+  assert.equal(staleIdResponse.status, 404);
+  assert.equal(staleIdHealth.error, "codespace_not_registered");
+  assert.deepEqual(authorizations, ["Bearer github-token"]);
   console.log("PASS: Worker simple dashboard setup accepts the real Codespace name");
 }
 
@@ -2346,7 +2346,67 @@ async function testWorkerRegistrySelectsBoundTokenAndReturnsSafeDirectory() {
   console.log("PASS: Worker registry isolates Codespaces, token bindings, and route ports");
 }
 
+async function testStalledKvRegistryCannotSelectAnotherCodespace() {
+  const originalSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (callback, ms, ...args) => originalSetTimeout(callback, ms === 1000 ? 15 : ms, ...args);
+  let githubCalls = 0;
+  globalThis.fetch = async () => { githubCalls += 1; throw new Error("Must not contact GitHub for an unknown registry"); };
+  const kv = { get: () => new Promise(() => {}), put: async () => {} };
+  try {
+    const response = await worker.fetch(makeRequest("/api/wake"), baseEnv({ WAKER_KV: kv }), {});
+    const body = await responseJson(response);
+    assert.equal(response.status, 503);
+    assert.equal(body.error, "codespace_registry_unavailable");
+    assert.equal(githubCalls, 0);
+    console.log("PASS: Worker bounds registry storage and never silently substitutes a Codespace");
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+  }
+}
+
+async function testDashboardRegistryBypassesOptionalKv() {
+  let registryReads = 0;
+  const kv = {
+    get: async (key) => { if (key === "codespace-registry:v1") { registryReads += 1; throw new Error("unused"); } return null; },
+    put: async () => {}
+  };
+  const response = await worker.fetch(makeRequest("/api/codespaces"), baseEnv({
+    WAKER_KV: kv, CODESPACE_REGISTRY_SOURCE: "dashboard"
+  }), {});
+  const body = await responseJson(response);
+  assert.equal(response.status, 200);
+  assert.equal(body.codespaces[0].codespace, "behavior-space");
+  assert.equal(registryReads, 0);
+  console.log("PASS: dashboard-only registry does not depend on optional KV history storage");
+}
+
+async function testStalledOptionalHistoryCannotHoldAHealthyResponse() {
+  const originalSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (callback, ms, ...args) => originalSetTimeout(callback, ms === 1000 ? 15 : ms, ...args);
+  const pending = [];
+  const kv = { get: () => new Promise(() => {}), put: () => new Promise(() => {}) };
+  globalThis.fetch = async () => new Response(JSON.stringify({ name: "behavior-space", state: "Available" }), {
+    status: 200, headers: { "content-type": "application/json" }
+  });
+  try {
+    const response = await worker.fetch(makeRequest("/api/health?route=false"), baseEnv({
+      WAKER_KV: kv, CODESPACE_REGISTRY_SOURCE: "dashboard"
+    }), { waitUntil(task) { pending.push(task); } });
+    const body = await responseJson(response);
+    assert.equal(response.status, 200);
+    assert.equal(body.history_deferred, true);
+    assert.equal(body.quota_incident_recorded, false);
+    await Promise.all(pending);
+    console.log("PASS: stalled optional history is bounded and deferred, not a wake dependency");
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+  }
+}
+
 try {
+  await testStalledKvRegistryCannotSelectAnotherCodespace();
+  await testDashboardRegistryBypassesOptionalKv();
+  await testStalledOptionalHistoryCannotHoldAHealthyResponse();
   await testFailedSecretIpv6PrefixSharesBudget();
   await testWakeIncidentTimestampsAreSampled();
   await testPrivatePortRedirectClassification();

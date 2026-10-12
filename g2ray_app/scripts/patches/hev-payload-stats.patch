@@ -1,0 +1,116 @@
+diff --git a/src/hev-socks5-tunnel.c b/src/hev-socks5-tunnel.c
+--- a/src/hev-socks5-tunnel.c
++++ b/src/hev-socks5-tunnel.c
+@@ -59,7 +59,8 @@
+ static size_t stat_tx_packets;
+ static size_t stat_rx_packets;
+ static size_t stat_tx_bytes;
+ static size_t stat_rx_bytes;
++static atomic_ullong stat_rx_tcp_payload_bytes;
+ 
+ static struct netif *netif;
+ static struct tcp_pcb *tcp;
+@@ -516,10 +517,18 @@
+         udp = NULL;
+     }
++    /* SYN_RCVD PCBs have no HEV session yet. Drain them before lwIP's
++     * memory pools are reinitialized on the next Android service start. */
++    while (tcp_active_pcbs)
++        tcp_abort (tcp_active_pcbs);
++    while (tcp_tw_pcbs)
++        tcp_abort (tcp_tw_pcbs);
+     if (tcp) {
+         tcp_close (tcp);
+         tcp = NULL;
+     }
++    while (tcp_bound_pcbs)
++        tcp_abort (tcp_bound_pcbs);
+     if (netif) {
+         netif_remove (netif);
+         netif = NULL;
+@@ -715,7 +716,8 @@
+     stat_tx_packets = 0;
+     stat_rx_packets = 0;
+     stat_tx_bytes = 0;
+     stat_rx_bytes = 0;
++    atomic_store_explicit (&stat_rx_tcp_payload_bytes, 0, memory_order_relaxed);
+ }
+ 
+ int
+@@ -784,5 +786,17 @@
+         *rx_packets = stat_rx_packets;
+ 
+     if (rx_bytes)
+         *rx_bytes = stat_rx_bytes;
+ }
++
++void
++hev_socks5_tunnel_add_tcp_payload (size_t bytes)
++{
++    atomic_fetch_add_explicit (&stat_rx_tcp_payload_bytes, bytes, memory_order_relaxed);
++}
++
++unsigned long long
++hev_socks5_tunnel_tcp_payload_stats (void)
++{
++    return atomic_load_explicit (&stat_rx_tcp_payload_bytes, memory_order_relaxed);
++}
+diff --git a/src/hev-socks5-tunnel.h b/src/hev-socks5-tunnel.h
+--- a/src/hev-socks5-tunnel.h
++++ b/src/hev-socks5-tunnel.h
+@@ -22,5 +22,8 @@
+                               size_t *rx_packets, size_t *rx_bytes);
+ 
+ void hev_socks5_tunnel_update_session (HevListNode *node);
+ 
++void hev_socks5_tunnel_add_tcp_payload (size_t bytes);
++unsigned long long hev_socks5_tunnel_tcp_payload_stats (void);
++
+ #endif /* __HEV_SOCKS5_TUNNEL_H__ */
+diff --git a/src/hev-socks5-session-tcp.c b/src/hev-socks5-session-tcp.c
+--- a/src/hev-socks5-session-tcp.c
++++ b/src/hev-socks5-session-tcp.c
+@@ -98,6 +98,8 @@
+             else
+                 res = -1;
+         } else {
++            /* Count SOCKS payload, never lwIP's local SYN-ACK/ACK/RST packets. */
++            hev_socks5_tunnel_add_tcp_payload (s);
+             hev_ring_buffer_write_finish (self->buffer, s);
+         }
+     } else {
+diff --git a/src/hev-jni.c b/src/hev-jni.c
+--- a/src/hev-jni.c
++++ b/src/hev-jni.c
+@@ -19,6 +19,7 @@
+ #include <string.h>
+ 
+ #include "hev-main.h"
++#include "hev-socks5-tunnel.h"
+ 
+ #include "hev-jni.h"
+ 
+@@ -191,7 +191,7 @@
+ {
+     size_t tx_packets, rx_packets, tx_bytes, rx_bytes;
+     jlongArray res;
+-    jlong array[4];
++    jlong array[5];
+ 
+     hev_socks5_tunnel_stats (&tx_packets, &tx_bytes, &rx_packets, &rx_bytes);
+     array[0] = tx_packets;
+@@ -199,8 +199,11 @@
+     array[1] = tx_bytes;
+     array[2] = rx_packets;
+     array[3] = rx_bytes;
++    array[4] = hev_socks5_tunnel_tcp_payload_stats ();
+ 
+-    res = (*env)->NewLongArray (env, 4);
+-    (*env)->SetLongArrayRegion (env, res, 0, 4, array);
++    res = (*env)->NewLongArray (env, 5);
++    if (!res)
++        return NULL;
++    (*env)->SetLongArrayRegion (env, res, 0, 5, array);
+ 
+     return res;
+ }

@@ -27,6 +27,11 @@ backed by the official XTLS `libXray` Android wrapper.
    Codespace, so an already-working route does not wait on a control plane.
 7. Approve Android's VPN permission prompt.
 
+Wake setup is optional for an imported profile whose server is already running.
+Start VPN tries that profile directly even when no Worker or GitHub token is
+configured. Automatic server wake requires a configured wake method only when
+the server actually needs recovery.
+
 ### Direct GitHub wake
 
 Direct mode uses GitHub's authenticated Codespaces REST API from the phone. A
@@ -90,9 +95,10 @@ XHTTP links can also carry an `extra` JSON object. The app validates its syntax
 and preserves it for VPN connections, delay tests, and discovered edge variants.
 Different tuning objects remain separate transport templates, so seamless
 failover does not silently mix tuned and untuned profiles. No tuning is injected
-when the imported link has no `extra`. The server's Android import bundle still
-omits this field for older-client compatibility; import the direct VLESS link
-to use its explicitly exported tuning. Core-specific settings must still be
+when the imported link has no `extra`. The server's current schema-2 Android
+bundle preserves this field exactly as direct links do. Only the separately
+named `.legacy.json` bundle omits it for older clients. Refresh exports and
+re-import the current bundle to replace older untuned imports. Core-specific settings must still be
 accepted by the bundled Xray version, and throughput improvements need phone-side
 measurement rather than an assumption.
 
@@ -111,7 +117,8 @@ Home **Quick scan** uses one bounded real route sample per saved config and is
 intentionally fast. Modern libXray builds test up to five tagged configs in one
 batch and retry only failed entries against alternate 204 endpoints; older
 cores fall back to the sequential path. A successful one-sample result is
-marked provisional. The
+marked provisional. Partial failures remain attached to the result and do not
+qualify that config as a verified live standby. The
 per-config real-delay action uses three samples and reports median, p95, and
 jitter. These measurements are from the phone and therefore reflect the
 user's actual ISP path better than Codespace-side route probes, but they are
@@ -148,8 +155,8 @@ tunnel. Worker and direct-GitHub control-plane sockets used by the foreground
 service bypass the VPN so a dead data tunnel cannot block its own recovery. If a
 direct GitHub wake only reaches `Available`, the service continues bounded route
 verification while Codespaces forwarding settles. If control-plane readiness
-times out, the app tests a bounded set of imported alternate profiles, trying
-different edge addresses before additional transport variants from one edge.
+times out, the app tests a bounded set of imported alternate profiles, reserving
+capacity for an alternate transport as well as different edge addresses.
 A successful backup becomes the selected profile for the next connection.
 Returning to the app re-verifies a healthy route and restarts or repairs a stale
 core without changing the foreground service to non-sticky mode. HEV expires a
@@ -158,11 +165,20 @@ reusing a stale local flow. The outer VLESS socket starts TCP keepalive after 25
 idle seconds and retries every 15 seconds to help retain short-lived mobile
 carrier NAT mappings. This favors idle-resume responsiveness over minimizing
 radio wakeups.
-Route re-verification and response-byte checks detect a dead shared tunnel
-independently. In HEV mode, sustained transmission without
-received-byte progress requests an early fresh quorum probe; counters alone
-never trigger a restart. Explicitly pressing Stop still clears sticky recovery
-state.
+Route re-verification and upstream TCP payload checks detect a dead shared
+tunnel. HEV's displayed TUN counters still include packet headers and local
+TCP control packets; those packets are not proof of Internet connectivity.
+Only payload read from SOCKS can extend the health-check grace period, and even
+that grace is finite: repeated failed health quorums eventually request recovery.
+Transient recovery failures retain the user's desired-connected intent and
+retry with capped backoff instead of stopping permanently. Authentication,
+configuration, and quota errors need user action. Explicitly pressing Stop
+clears sticky recovery state and cancels scheduled retries.
+
+Start VPN cancels background route optimization and waits for its native probe
+to finish safely. A process-wide runtime lease also prevents Android Always-on
+startup from overlapping a temporary scan core. A blocking native ping can still
+take its bounded timeout; cancellation does not unsafely kill the native thread.
 
 Importing the exact same VLESS URI again reuses the existing stored profile
 instead of accumulating duplicates and discarding its measured delay history.
@@ -221,8 +237,15 @@ to the project.
 The HEV build is pinned to stable tag `2.17.1`, targets Android API 24 to match
 the app's `minSdk`, and verifies the Android API note in every generated native
 library before it replaces the bundled binaries. The app also verifies HEV's
-boolean start/stop/runtime JNI contract so an API-incompatible native upgrade
-cannot silently produce an unusable APK.
+boolean start/stop/runtime JNI contract and the five-field payload-stats patch
+hash so an API-incompatible native upgrade cannot silently produce an unusable
+APK. The first four stats fields retain their original meaning. On Linux,
+`bash scripts/test-hev-payload.sh` builds the pinned engine in a temporary
+directory and tests synthetic TCP versus actual SOCKS payload without a phone
+or a privileged TUN device. It also stops and restarts the engine with half-open
+and established TCP sessions, checking the patched lwIP shutdown cleanup. CI
+runs this Linux fixture separately from Android source checks. Neither check
+is Android device acceptance.
 
 6. Build and test the app:
 

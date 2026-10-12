@@ -147,7 +147,8 @@ WS_HEARTBEAT_PERIOD_SEC=30
 # Server-side reorder window for packet-up upload POSTs. Tuned links send many
 # 60 KB POSTs instead of a few 1 MB ones; Xray tears the session down once more
 # than this many arrive out of order, so keep a margin above its default of 30
-# for jittery mobile paths. Worst case is ~6 MB per session at 60 KB per POST.
+# for jittery mobile paths. This is a count limit, not a byte cap: ~6 MB for
+# tuned 60 KB POSTs, but ~100 MB for legacy 1 MB POSTs, before authentication.
 XHTTP_SERVER_MAX_BUFFERED_POSTS=100
 CODESPACES_EDGE_PORT="${G2RAY_CODESPACES_EDGE_PORT:-443}"
 PORT_FORWARDING_DOMAIN="${G2RAY_PORT_FORWARDING_DOMAIN:-${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN:-app.github.dev}}"
@@ -691,24 +692,40 @@ tcp_fast_open_outbound_enabled() {
 }
 
 run_with_deadline() {
-    local seconds="${1:-30}" pid waited_ticks=0 max_ticks status=0 status_file command_name
+    local seconds="${1:-30}" pid waited_ticks=0 max_ticks status=0 status_file command_name monitor_was_enabled=false
     shift || return 1
     [[ "$seconds" =~ ^[0-9]+$ && "$seconds" -gt 0 ]] || seconds=30
     max_ticks=$((seconds * 10))
     command_name="${1:-unknown}"
-    status_file=$(mktemp "${TMPDIR:-/tmp}/g2ray-deadline.XXXXXX") || { "$@"; return $?; }
+    status_file=$(mktemp "${TMPDIR:-/tmp}/g2ray-deadline.XXXXXX") || {
+        log_event ERROR "deadline_init_failed command=${command_name}"
+        return 125
+    }
     rm -f "$status_file" 2>/dev/null || true
+    [[ "$-" == *m* ]] && monitor_was_enabled=true
+    # Job control gives this wrapper a dedicated process group. Descendants
+    # keep that identity after their parent exits during TERM handling.
+    set -m
     (
+        set +m
         set +e
         "$@"
         printf '%s\n' "$?" > "$status_file" 2>/dev/null || true
     ) &
     pid=$!
+    [[ "$monitor_was_enabled" == true ]] || set +m
+    if [[ ! -s "$status_file" ]] && ! kill -0 -- "-$pid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        rm -f "$status_file" 2>/dev/null || true
+        log_event ERROR "deadline_group_init_failed command=${command_name}"
+        return 125
+    fi
     while [[ ! -s "$status_file" ]]; do
         if (( waited_ticks >= max_ticks )); then
-            terminate_process_tree "$pid"
+            kill -TERM -- "-$pid" 2>/dev/null || true
             sleep 0.2
-            kill_process_tree_hard "$pid"
+            kill -KILL -- "-$pid" 2>/dev/null || true
             wait "$pid" 2>/dev/null || true
             rm -f "$status_file" 2>/dev/null || true
             log_event WARN "deadline_exceeded command=${command_name} timeout_sec=${seconds}"
@@ -3160,6 +3177,7 @@ upgrade_config_dns() {
             end
         )
       | (.inbounds[]? | select(.sniffing? and .sniffing.destOverride?) | .sniffing.destOverride) |= (map(select(. != "quic")))
+      | (.inbounds[]? | select((.tag == "vless-in" or .tag == "vless-ws") and .sniffing?) | .sniffing.routeOnly) = true
       | (.inbounds[]? | select(.tag == "vless-in" and .streamSettings.xhttpSettings?) | .streamSettings.xhttpSettings.mode) = "auto"
       | (.inbounds[]? | select(.tag == "vless-in" and .streamSettings.xhttpSettings?) | .streamSettings.xhttpSettings.scMaxBufferedPosts) |=
           (if . == null or . < $max_buffered_posts then $max_buffered_posts else . end)
@@ -4086,7 +4104,7 @@ _generate_config_impl() {
         "wsSettings": { "path": "$(json_escape "$ws_path")", "heartbeatPeriod": ${WS_HEARTBEAT_PERIOD_SEC} },
         "sockopt": { "tcpKeepAliveInterval": ${TCP_KEEPALIVE_INTERVAL_SEC}, "tcpKeepAliveIdle": ${TCP_KEEPALIVE_IDLE_SEC} }
       },
-      "sniffing": { "enabled": true, "destOverride": ${sniff_dest}, "routeOnly": false }
+      "sniffing": { "enabled": true, "destOverride": ${sniff_dest}, "routeOnly": true }
     }
 JSONEOF
 )
@@ -4128,7 +4146,7 @@ JSONEOF
         "xhttpSettings": { "mode": "${xhttp_accept_mode}", "path": "/", "scMaxBufferedPosts": ${XHTTP_SERVER_MAX_BUFFERED_POSTS} },
         "sockopt": { "tcpKeepAliveInterval": ${TCP_KEEPALIVE_INTERVAL_SEC}, "tcpKeepAliveIdle": ${TCP_KEEPALIVE_IDLE_SEC} }
       },
-      "sniffing": { "enabled": true, "destOverride": ${sniff_dest}, "routeOnly": false }
+      "sniffing": { "enabled": true, "destOverride": ${sniff_dest}, "routeOnly": true }
     }${ws_inbound_json},
     { "listen": "127.0.0.1", "port": 10085, "protocol": "dokodemo-door", "settings": { "address": "127.0.0.1" }, "tag": "api" }
   ],
@@ -4298,10 +4316,12 @@ generate_config() {
 }
 
 generate_config_with_feedback() {
+    local rc
     if generate_config; then
         return 0
+    else
+        rc=$?
     fi
-    local rc=$?
     log_event ERROR "generate_config interactive_failed rc=${rc}"
     echo -e "  ${RED}Config generation failed. Previous config was kept if one existed.${NC}"
     echo -e "  ${DIM}Use option 13) View Engine Logs or 14) Diagnostics for details.${NC}"
@@ -5579,30 +5599,38 @@ JSON
 }
 
 write_codespace_import_bundle() {
-    local links="$1" generated worker_codespace_id first=true link bundle
+    local links="$1" legacy="${2:-false}" generated worker_codespace_id first=true link bundle
+    local bundle_file="$CODESPACE_BUNDLE_FILE" schema=2
+    if [[ "$legacy" == true ]]; then
+        bundle_file="${CODESPACE_BUNDLE_FILE%.json}.legacy.json"
+        schema=1
+    fi
     generated=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')
     worker_codespace_id="$(waker_metadata_value worker_codespace_id)"
     [[ -n "$worker_codespace_id" ]] || worker_codespace_id="${G2RAY_WORKER_CODESPACE_ID:-$CODESPACE_NAME}"
     bundle=$(
         printf '{\n'
-        printf '  "schema_version": 1,\n'
+        printf '  "schema_version": %s,\n' "$schema"
+        [[ "$legacy" == true ]] && printf '  "compatibility": "legacy_without_xhttp_extra",\n'
         printf '  "generated_at": "%s",\n' "$(json_escape "$generated")"
         printf '  "codespace_name": "%s",\n' "$(json_escape "$CODESPACE_NAME")"
         printf '  "worker_codespace_id": "%s",\n' "$(json_escape "$worker_codespace_id")"
         printf '  "configs": [\n'
         while IFS= read -r link; do
             [[ -n "$link" ]] || continue
-            # The G2Ray Android app applies its own XHTTP transport tuning and
-            # releases before this change reject links that carry `extra`.
-            link=$(printf '%s' "$link" | sed -E 's/&extra=[^&#]*//')
+            # Only the explicitly named legacy bundle removes advanced tuning.
+            if [[ "$legacy" == true ]]; then
+                link=$(printf '%s' "$link" | sed -E 's/&extra=[^&#]*//')
+            fi
             if [[ "$first" != true ]]; then printf ',\n'; fi
             printf '    "%s"' "$(json_escape "$link")"
             first=false
         done <<< "$links"
         printf '\n  ]\n}\n'
     )
-    _atomic_write "$CODESPACE_BUNDLE_FILE" "$bundle" || return 1
-    chmod 600 "$CODESPACE_BUNDLE_FILE" 2>/dev/null || true
+    _atomic_write "$bundle_file" "$bundle" || return 1
+    chmod 600 "$bundle_file" 2>/dev/null || true
+    if [[ "$legacy" != true ]]; then write_codespace_import_bundle "$links" true; fi
 }
 
 write_config_exports_from_links() {
@@ -5623,7 +5651,7 @@ write_config_exports_from_links() {
 
 clear_config_exports() {
     local reason="${1:-no_exportable_links}"
-    rm -f "$MOBILE_CONFIG_FILE" "$SUBSCRIPTION_FILE" "$CONFIG_META_FILE" "$CODESPACE_BUNDLE_FILE" 2>/dev/null || true
+    rm -f "$MOBILE_CONFIG_FILE" "$SUBSCRIPTION_FILE" "$CONFIG_META_FILE" "$CODESPACE_BUNDLE_FILE" "${CODESPACE_BUNDLE_FILE%.json}.legacy.json" 2>/dev/null || true
     log_event WARN "config_exports cleared reason=${reason}"
 }
 
@@ -5659,6 +5687,7 @@ export_input_hash() {
     selected_routes=$(effective_export_route_ips | tr '\n' ',' 2>/dev/null || true)
     uuid_fingerprint=$(fingerprint_secret "$(active_vless_uuid 2>/dev/null || true)")
     input=$(
+        printf 'bundle_schema=2\n'
         printf 'codespace=%s\n' "$CODESPACE_NAME"
         printf 'port_domain=%s\n' "$PORT_DOMAIN"
         printf 'ws_port_domain=%s\n' "$WS_PORT_DOMAIN"
@@ -5697,7 +5726,7 @@ _refresh_config_exports_impl() {
         backup_dir=$(mktemp -d "$DATA_DIR/config-export-backup.XXXXXX" 2>/dev/null || true)
     fi
     if [[ -n "$backup_dir" ]]; then
-        for artifact in "$MOBILE_CONFIG_FILE" "$SUBSCRIPTION_FILE" "$CONFIG_META_FILE" "$CODESPACE_BUNDLE_FILE"; do
+        for artifact in "$MOBILE_CONFIG_FILE" "$SUBSCRIPTION_FILE" "$CONFIG_META_FILE" "$CODESPACE_BUNDLE_FILE" "${CODESPACE_BUNDLE_FILE%.json}.legacy.json"; do
             [[ -e "$artifact" ]] || continue
             name=$(basename "$artifact")
             cp -p "$artifact" "$backup_dir/$name" 2>/dev/null || true
@@ -5705,8 +5734,8 @@ _refresh_config_exports_impl() {
     fi
     if ! write_config_exports_from_links "${link_array[@]}"; then
         if [[ -n "$backup_dir" ]]; then
-            rm -f "$MOBILE_CONFIG_FILE" "$SUBSCRIPTION_FILE" "$CONFIG_META_FILE" "$CODESPACE_BUNDLE_FILE" 2>/dev/null || true
-            for artifact in "$MOBILE_CONFIG_FILE" "$SUBSCRIPTION_FILE" "$CONFIG_META_FILE" "$CODESPACE_BUNDLE_FILE"; do
+            rm -f "$MOBILE_CONFIG_FILE" "$SUBSCRIPTION_FILE" "$CONFIG_META_FILE" "$CODESPACE_BUNDLE_FILE" "${CODESPACE_BUNDLE_FILE%.json}.legacy.json" 2>/dev/null || true
+            for artifact in "$MOBILE_CONFIG_FILE" "$SUBSCRIPTION_FILE" "$CONFIG_META_FILE" "$CODESPACE_BUNDLE_FILE" "${CODESPACE_BUNDLE_FILE%.json}.legacy.json"; do
                 name=$(basename "$artifact")
                 [[ -e "$backup_dir/$name" ]] && cp -p "$backup_dir/$name" "$artifact" 2>/dev/null || true
             done

@@ -271,6 +271,38 @@ class GitHubCodespacesApiTest {
         assertTrue(WakeBackendSelector.order(CodespaceWakeMode.WORKER, false, true).isEmpty())
     }
 
+    @Test
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    fun wakeDeadlineIncludesTimeAlreadySpentOnWorkerBeforeDirectFallback() = runTest {
+        var directCancelled = false
+        val coordinator = CodespaceWakeCoordinator(
+            workerWake = { _, _ ->
+                kotlinx.coroutines.delay(400L)
+                WorkerRouteOutcome.Failed("offline", controlPlaneUnavailable = true)
+            },
+            githubWake = { _, progress ->
+                progress(GitHubCodespaceProgress(GitHubCodespacePhase.WAITING, "waiting", 1))
+                try {
+                    kotlinx.coroutines.awaitCancellation()
+                } finally {
+                    directCancelled = true
+                }
+            }
+        )
+        val result = coordinator.ensureReady(
+            CodespaceWakeRequest(
+                CodespaceWakeMode.AUTO, "demo",
+                workerBaseUrls = listOf("https://worker.example"),
+                workerSecret = "wake", githubToken = "token"
+            ),
+            maxWaitMs = 500L
+        )
+        assertTrue(result is CodespaceWakeOutcome.TimedOut)
+        assertEquals(WakeControlBackend.GITHUB_DIRECT, (result as CodespaceWakeOutcome.TimedOut).backend)
+        assertTrue(directCancelled)
+        assertEquals(500L, testScheduler.currentTime)
+    }
+
     private companion object {
         fun error(code: Int, message: String): Response<GitHubCodespaceResponse> {
             val body = "{\"message\":\"$message\"}"

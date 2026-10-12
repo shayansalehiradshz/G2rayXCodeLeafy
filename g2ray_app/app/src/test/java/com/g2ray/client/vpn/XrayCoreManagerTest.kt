@@ -627,6 +627,30 @@ class XrayCoreManagerTest {
         )
     }
 
+    @Test
+    fun measureRoutePerformance_doesNotRetryOrReportSuccessIfItsRuntimeCannotStop() = runTest {
+        val bridge = FakeXrayBridge(available = true).apply { stopLeavesCoreRunning = true }
+        var allocatedPorts = 0
+        val manager = XrayCoreManager(
+            bridge = bridge,
+            runningRouteProbe = FakeRunningRouteProbe(success = true),
+            portAllocator = { allocatedPorts++; 19090 },
+            localSocksListenerProbe = LocalSocksListenerProbe { true },
+            stopWaitTimeoutMs = 50L,
+            routePerformanceProbe = FakeRoutePerformanceProbe(
+                RoutePerformanceSummary(false, error = "address already in use")
+            )
+        )
+        val result = manager.measureRoutePerformance(sampleProfile(), "/tmp")
+        assertFalse(result.success)
+        assertTrue(result.error?.contains("has not stopped") == true)
+        assertEquals(1, allocatedPorts)
+        assertEquals(TunnelCoreState.Error, manager.state.value)
+        val another = manager.measureRoutePerformance(sampleProfile(), "/tmp")
+        assertFalse(another.success)
+        assertEquals(1, allocatedPorts)
+    }
+
     @Test(expected = CancellationException::class)
     fun measureDelayQuickBatch_propagatesCancellationFromLibXray() {
         val bridge = FakeXrayBridge(available = true).apply {

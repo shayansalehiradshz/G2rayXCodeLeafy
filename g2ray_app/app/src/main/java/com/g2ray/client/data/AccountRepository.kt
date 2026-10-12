@@ -803,6 +803,7 @@ class AccountRepository(private val store: SecureKeyValueStore) {
                 profile
             } else {
                 val delayTestedAt = update.delayTestedAt?.coerceIn(0L, now) ?: now
+                val partial = update.sampleCount > 0 && update.successfulSamples < update.sampleCount
                 val delayUpdated = if (update.success && update.delayMs != null) {
                     profile.copy(
                         lastDelayMs = update.delayMs,
@@ -811,8 +812,11 @@ class AccountRepository(private val store: SecureKeyValueStore) {
                         lastDelayJitterMs = update.jitterMs,
                         lastDelaySuccessfulSamples = update.successfulSamples.coerceAtLeast(0),
                         lastDelaySampleCount = update.sampleCount.coerceAtLeast(0),
-                        delayFailureCount = 0,
-                        lastDelayError = null,
+                        delayFailureCount = if (partial) profile.delayFailureCount else 0,
+                        lastDelayError = if (partial) {
+                            update.error?.takeIf { it.isNotBlank() }
+                                ?: "Only ${update.successfulSamples}/${update.sampleCount} delay samples succeeded"
+                        } else null,
                         updatedAt = now
                     )
                 } else {

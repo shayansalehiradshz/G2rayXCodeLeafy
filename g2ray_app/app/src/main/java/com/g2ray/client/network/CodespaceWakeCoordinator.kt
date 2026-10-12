@@ -1,6 +1,7 @@
 package com.g2ray.client.network
 
 import com.g2ray.client.model.CodespaceWakeMode
+import kotlinx.coroutines.withTimeoutOrNull
 
 enum class WakeControlBackend {
     WORKER,
@@ -84,7 +85,8 @@ internal data class WorkerWakeInvocation(
     val workerBaseUrls: List<String>,
     val secret: String,
     val codespaceId: String?,
-    val maxWaitMs: Long
+    val maxWaitMs: Long,
+    val expectedCodespaceName: String? = null
 )
 
 internal data class GitHubWakeInvocation(
@@ -112,6 +114,7 @@ class CodespaceWakeCoordinator internal constructor(
                 workerBaseUrls = request.workerBaseUrls,
                 secret = request.secret,
                 codespaceId = request.codespaceId,
+                expectedCodespaceName = request.expectedCodespaceName,
                 maxWaitMs = request.maxWaitMs,
                 onProgress = progress
             )
@@ -131,6 +134,22 @@ class CodespaceWakeCoordinator internal constructor(
         maxWaitMs: Long = 3 * 60 * 1000L,
         onProgress: (CodespaceWakeProgress) -> Unit = {}
     ): CodespaceWakeOutcome {
+        var activeBackend = WakeBackendSelector.order(
+            request.mode, request.workerConfigured, request.githubDirectConfigured
+        ).firstOrNull() ?: WakeControlBackend.WORKER
+        return withTimeoutOrNull(maxWaitMs.coerceAtLeast(1L)) {
+            ensureReadyWithinDeadline(request, maxWaitMs) { progress ->
+                activeBackend = progress.backend
+                onProgress(progress)
+            }
+        } ?: CodespaceWakeOutcome.TimedOut("Codespace wake deadline exceeded.", activeBackend)
+    }
+
+    private suspend fun ensureReadyWithinDeadline(
+        request: CodespaceWakeRequest,
+        maxWaitMs: Long,
+        onProgress: (CodespaceWakeProgress) -> Unit
+    ): CodespaceWakeOutcome {
         val order = WakeBackendSelector.order(
             mode = request.mode,
             workerConfigured = request.workerConfigured,
@@ -148,7 +167,8 @@ class CodespaceWakeCoordinator internal constructor(
                             workerBaseUrls = request.workerBaseUrls,
                             secret = request.workerSecret.orEmpty(),
                             codespaceId = request.workerCodespaceId ?: request.githubCodespaceName,
-                            maxWaitMs = maxWaitMs
+                            maxWaitMs = maxWaitMs,
+                            expectedCodespaceName = request.githubCodespaceName.takeIf { it.isNotBlank() }
                         )
                     ) { progress ->
                         onProgress(

@@ -350,18 +350,16 @@ object XrayConfigBuilder {
 
     private fun buildSniffing(fakeDnsEnabled: Boolean): JSONObject {
         return JSONObject().apply {
-            put("enabled", true)
+            put("enabled", fakeDnsEnabled)
             put("destOverride", JSONArray().apply {
                 if (fakeDnsEnabled) {
                     put("fakedns")
                 }
-                put("http")
-                put("tls")
             })
-            // The recovered hostname must replace the fake or bare destination
-            // IP so routing and the remote resolver see the original domain.
-            put("routeOnly", false)
-            put("metadataOnly", false)
+            // Fake-IP metadata is recovered without reading application content.
+            // The pinned core still replaces FakeDNS destinations in route-only mode.
+            put("routeOnly", true)
+            put("metadataOnly", true)
         }
     }
 

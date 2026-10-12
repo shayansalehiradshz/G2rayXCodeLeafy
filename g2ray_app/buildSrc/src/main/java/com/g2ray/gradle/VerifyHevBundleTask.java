@@ -54,10 +54,17 @@ public abstract class VerifyHevBundleTask extends DefaultTask {
         requireMetadata(metadata, "hev.ndk");
         requireMetadata(metadata, "hev.minSdk");
         String jniContract = requireMetadata(metadata, "hev.jni");
-        if (!"boolean-runtime-v2".equals(jniContract)) {
+        if (!"payload-stats-v3".equals(jniContract)) {
             throw new GradleException(
                 "HEV metadata does not match the app's start/stop/runtime JNI contract"
             );
+        }
+
+        Path patch = metadataPath.getParent().getParent().getParent()
+            .resolve("scripts/patches/hev-payload-stats.patch");
+        String expectedPatch = requireMetadata(metadata, "hev.payload.patch.sha256");
+        if (!Files.isRegularFile(patch) || !sha256(patch).equalsIgnoreCase(expectedPatch)) {
+            throw new GradleException("HEV payload-counter patch changed; rebuild all native ABIs");
         }
 
         for (String abi : ABIS) {

@@ -65,6 +65,12 @@ if ($LASTEXITCODE -ne 0) { throw "Could not reset pinned HEV submodules." }
 git -C $sourcePath submodule foreach --recursive git clean -ffdx
 if ($LASTEXITCODE -ne 0) { throw "Could not clean pinned HEV submodules." }
 
+$payloadPatch = Join-Path $PSScriptRoot "patches\hev-payload-stats.patch"
+git -C $sourcePath apply --recount --ignore-whitespace --check $payloadPatch
+if ($LASTEXITCODE -ne 0) { throw "HEV payload-counter patch does not match the pinned source." }
+git -C $sourcePath apply --recount --ignore-whitespace $payloadPatch
+if ($LASTEXITCODE -ne 0) { throw "Could not apply HEV payload-counter patch." }
+
 # Git for Windows may materialize POSIX symlinks from HEV submodules as tiny files
 # containing a relative target path. Convert only that exact form inside this build
 # copy so ndk-build reads the intended source without touching the app code.
@@ -130,7 +136,8 @@ $metadata = [ordered]@{
     "hev.ref" = $HevRevision
     "hev.ndk" = $ndkRevision
     "hev.minSdk" = $MinSdkVersion
-    "hev.jni" = "boolean-runtime-v2"
+    "hev.jni" = "payload-stats-v3"
+    "hev.payload.patch.sha256" = (Get-FileHash -LiteralPath $payloadPatch -Algorithm SHA256).Hash
 }
 foreach ($abi in $SupportedAbis) {
     $library = Join-Path $outputPath "$abi\libhev-socks5-tunnel.so"

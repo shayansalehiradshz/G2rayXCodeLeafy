@@ -201,7 +201,7 @@ class G2RayViewModelTest {
             G2RayViewModel.vpnStartPlanVisibleForTesting(workerConfigured = false, routeReady = true)
         )
         assertEquals(
-            G2RayViewModel.VpnStartPlan.Block,
+            G2RayViewModel.VpnStartPlan.StartDirect,
             G2RayViewModel.vpnStartPlanVisibleForTesting(workerConfigured = false, routeReady = false)
         )
     }

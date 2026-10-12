@@ -520,8 +520,7 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
         private fun vpnStartPlan(workerConfigured: Boolean, routeReady: Boolean): VpnStartPlan {
             return when {
                 workerConfigured -> VpnStartPlan.DirectProbeThenWake
-                routeReady -> VpnStartPlan.StartDirect
-                else -> VpnStartPlan.Block
+                else -> VpnStartPlan.StartDirect
             }
         }
 
@@ -913,17 +912,15 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
             _statusMessage.value = "VPN startup is already in progress."
             return
         }
-        routeOptimizationJob?.takeIf { it.isActive }?.let { job ->
-            if (routeOptimizationProbeStarted) {
-                reportVpnStartBlocked("Wait for route optimization to finish before starting VPN.")
-                return
+        val probesToDrain = listOfNotNull(routeOptimizationJob, currentDelayProbeJob).filter { it.isActive }
+        if (probesToDrain.isNotEmpty()) {
+            _statusMessage.value = "Finishing the current bounded probe, then starting VPN..."
+            currentVpnStartJob = viewModelScope.launch {
+                probesToDrain.forEach { it.cancel() }
+                probesToDrain.forEach { it.join() }
+                currentVpnStartJob = null
+                startVpn(context)
             }
-            job.cancel()
-            routeOptimizationJob = null
-            _isRouteOptimizing.value = false
-        }
-        if (currentDelayProbeJob?.isActive == true) {
-            reportVpnStartBlocked("Wait for the real-delay test to finish before starting VPN.")
             return
         }
         if (!isVpnCoreAvailable.value) {

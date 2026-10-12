@@ -528,7 +528,8 @@ test_xhttp_upload_tuning_is_reversible_and_bundle_compatible() {
     link=$(generate_link_for_address 20.0.0.1)
     [[ "$link" == *"extra=$(url_encode_query_value "$XHTTP_TUNED_EXTRA_JSON")"* ]] || fail 'tuned links lost their extra object'
     write_codespace_import_bundle "$link"
-    jq -e '.configs[0] | contains("extra=") | not' "$CODESPACE_BUNDLE_FILE" >/dev/null || fail 'legacy app bundle gained an incompatible extra parameter'
+    jq -e --arg link "$link" '.schema_version == 2 and .configs[0] == $link' "$CODESPACE_BUNDLE_FILE" >/dev/null || fail 'current bundle changed the direct transport configuration'
+    jq -e '.schema_version == 1 and .compatibility == "legacy_without_xhttp_extra" and (.configs[0] | contains("extra=") | not)' "${CODESPACE_BUNDLE_FILE%.json}.legacy.json" >/dev/null || fail 'legacy bundle lost its explicit compatibility contract'
     G2RAY_XHTTP_LINK_TUNING=off
     link=$(generate_link_for_address 20.0.0.1)
     [[ "$link" != *'&extra='* ]] || fail 'upload tuning off switch does not work'
@@ -1974,6 +1975,8 @@ JSON
         || fail "existing config migration changed the active UUID"
     [[ "$(jq -r '.inbounds[0].streamSettings.wsSettings.heartbeatPeriod' "$CONFIG_FILE")" == "30" ]] \
         || fail "existing config migration did not add the WebSocket idle heartbeat"
+    [[ "$(jq -r '.inbounds[0].sniffing.routeOnly' "$CONFIG_FILE")" == "true" ]] \
+        || fail "existing WS migration still allows sniffing to rewrite explicit destinations"
     [[ "$(jq -r '.outbounds[] | select(.tag == "block") | .settings.response.type' "$CONFIG_FILE")" == "none" ]] \
         || fail "existing config migration retained an HTTP payload on the generic blackhole outbound"
     pass "existing config upgrade preserves UUID and restores safe handshake, blackhole, and WebSocket settings"
@@ -2006,6 +2009,8 @@ JSON
         || fail "existing XHTTP inbound remained restricted to one client mode"
     [[ "$(jq -r '.inbounds[] | select(.tag == "vless-in") | .settings.clients[0].id' "$CONFIG_FILE")" == "11111111-2222-4333-8444-555555555555" ]] \
         || fail "XHTTP compatibility migration changed the active UUID"
+    [[ "$(jq -r '.inbounds[0].sniffing.routeOnly' "$CONFIG_FILE")" == "true" ]] \
+        || fail "existing XHTTP migration still allows sniffing to rewrite explicit destinations"
     pass "existing XHTTP config accepts all supported client modes without changing identity"
 }
 
@@ -3549,6 +3554,19 @@ test_headless_start_prepares_listener_without_waiting_for_edge() {
     pass "headless startup prepares listener without blocking on the edge"
 }
 
+test_generate_config_feedback_preserves_failure_status() {
+    (
+        reset_runtime_paths
+        generate_config() { return 7; }
+        local rc=0
+        generate_config_with_feedback >/dev/null 2>&1 || rc=$?
+        [[ "$rc" -eq 7 ]] || fail "config generation failure was reported as success"
+        generate_config() { return 0; }
+        generate_config_with_feedback >/dev/null 2>&1 || fail "successful config generation was rejected"
+    )
+    pass "interactive config generation preserves its real exit status"
+}
+
 test_headless_start_command_preserves_failures() {
     (
         reset_runtime_paths
@@ -4024,6 +4042,30 @@ test_port_listener_detection_does_not_require_sudo() {
     pass "listener detection works without sudo and matches the exact port"
 }
 
+test_deadline_stops_term_resistant_writers() {
+    local output="$TMP_ROOT/deadline-resistant.log" before after rc=0
+    run_with_deadline 1 bash -c '
+        bash -c '\''trap "" TERM; while :; do printf x >> "$1"; sleep 0.05; done'\'' _ "$1" &
+        wait
+    ' _ "$output" || rc=$?
+    [[ "$rc" == 124 ]] || fail "resistant writer did not time out: $rc"
+    before=$(wc -c < "$output")
+    sleep 0.3
+    after=$(wc -c < "$output")
+    [[ "$before" == "$after" ]] || fail 'reparented deadline writer survived group KILL'
+    pass 'deadline stops TERM-resistant reparented writers'
+}
+
+test_deadline_fails_closed_without_temp_storage() {
+    (
+        mktemp() { return 1; }
+        local rc=0
+        run_with_deadline 1 touch "$TMP_ROOT/deadline-must-not-run" || rc=$?
+        [[ "$rc" == 125 && ! -e "$TMP_ROOT/deadline-must-not-run" ]] || fail 'deadline ran without its status storage'
+    )
+    pass 'deadline initialization failure never runs an unbounded task'
+}
+
 test_deadline_terminates_descendant_processes() {
     reset_runtime_paths
     local child_file child rc
@@ -4036,7 +4078,9 @@ test_deadline_terminates_descendant_processes() {
     child=$(cat "$child_file" 2>/dev/null || true)
     [[ "$child" =~ ^[0-9]+$ ]] || fail "deadline child PID was not recorded"
     sleep 0.2
-    ! kill -0 "$child" 2>/dev/null || fail "deadline left a descendant process running"
+    if kill -0 "$child" 2>/dev/null; then
+        [[ "$(ps -o stat= -p "$child" 2>/dev/null)" == Z* ]] || fail "deadline left a descendant process running"
+    fi
     pass "deadline wrapper terminates descendant processes"
 }
 
@@ -4602,6 +4646,8 @@ test_self_heal_reasserts_optional_ws_visibility
 test_self_heal_keeps_failure_count_when_route_repair_fails
 test_port_listener_detection_does_not_require_sudo
 test_deadline_terminates_descendant_processes
+test_deadline_stops_term_resistant_writers
+test_deadline_fails_closed_without_temp_storage
 test_post_start_propagates_silent_start_failure
 test_generate_config_respects_runtime_lock_for_entire_transaction
 test_generate_config_failed_start_restores_previous_running_engine
@@ -4695,6 +4741,7 @@ test_recover_now_json_reports_settling_contract
 test_recover_now_json_treats_followup_ready_probe_as_success
 test_headless_start_prepares_listener_without_waiting_for_edge
 test_headless_start_command_preserves_failures
+test_generate_config_feedback_preserves_failure_status
 test_headless_route_settle_records_background_ready_state
 test_diagnostic_snapshot_writes_readable_history
 test_diagnostic_log_rotation_keeps_readable_history

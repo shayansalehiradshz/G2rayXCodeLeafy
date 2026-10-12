@@ -16,6 +16,7 @@ const QUOTA_CRON_CURSOR_KEY = "quota-cron-cursor:v1";
 const MAX_REGISTERED_CODESPACES = 20;
 const MAX_DASHBOARD_CODESPACES = 10;
 const HISTORY_LIMIT = 50;
+const KV_OPERATION_TIMEOUT_MS = 1000;
 const FAILED_AUTH_KEY_PREFIX = "failed-auth:";
 const SUCCESSFUL_WAKE_KEY_PREFIX = "successful-wake:";
 const FAILED_AUTH_WINDOW_SECONDS = 600;
@@ -312,6 +313,7 @@ async function handleCodespaces(request, env) {
   if (!auth.ok) return json(auth.body, auth.status, retryHeaders(auth.body));
 
   const registry = await readCodespaceRegistry(env);
+  if (registry.unavailable) return json({ ok: false, error: "codespace_registry_unavailable", retry_after_seconds: 5 }, 503);
   const entries = registry.entries
     .filter((entry) => entry.enabled)
     .map((entry) => ({
@@ -337,6 +339,12 @@ async function requireAuthorizedContext(request, env, options = {}) {
 
   const requestedId = await readRequestedCodespaceId(request);
   const registry = await readCodespaceRegistry(env);
+  if (registry.unavailable) {
+    return { ok: false, status: 503, body: {
+      ok: false, error: "codespace_registry_unavailable", retry_after_seconds: 5,
+      next_action: "Registry storage is unavailable. Retry shortly; dashboard-only deployments may set CODESPACE_REGISTRY_SOURCE=dashboard."
+    } };
+  }
   if (!registry.entries.length) {
     return {
       ok: false,
@@ -433,9 +441,9 @@ async function readRequestedCodespaceId(request) {
 }
 
 async function readCodespaceRegistry(env) {
-  if (env.WAKER_KV) {
+  if (env.WAKER_KV && String(env.CODESPACE_REGISTRY_SOURCE || "").trim().toLowerCase() !== "dashboard") {
     try {
-      const text = await env.WAKER_KV.get(CODESPACE_REGISTRY_KEY);
+      const text = await withKvDeadline(() => env.WAKER_KV.get(CODESPACE_REGISTRY_KEY));
       if (text) {
         const parsed = JSON.parse(text);
         const entries = normalizeRegistryEntries(parsed && parsed.codespaces);
@@ -452,6 +460,8 @@ async function readCodespaceRegistry(env) {
       }
     } catch (error) {
       console.warn("codespace_registry_read_failed", shortError(error));
+      // Do not silently replace an unavailable registry with another identity.
+      return { multi: true, defaultCodespaceId: null, entries: [], unavailable: true };
     }
   }
 
@@ -462,6 +472,20 @@ async function readCodespaceRegistry(env) {
     defaultCodespaceId: dashboardEntries[0].id,
     entries: dashboardEntries
   };
+}
+
+async function withKvDeadline(operation) {
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(operation),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("KV operation timed out")), KV_OPERATION_TIMEOUT_MS);
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function readDashboardCodespaceEntries(env) {
@@ -541,11 +565,8 @@ function normalizePriority(value) {
 }
 
 function selectCodespaceEntry(registry, requestedId) {
-  if (registry.multi === false && registry.entries.length === 1) {
-    return registry.entries[0].enabled ? registry.entries[0] : null;
-  }
   const id = String(requestedId || registry.defaultCodespaceId || "").trim();
-  return registry.entries.find((entry) => entry.id === id && entry.enabled) || null;
+  return registry.entries.find((entry) => (entry.id === id || entry.name === id) && entry.enabled) || null;
 }
 
 function addCodespaceIdentity(data, context) {
@@ -569,12 +590,12 @@ async function rateLimitFailedAuth(request, env) {
     }
   };
   try {
-    const raw = await env.WAKER_KV.get(key);
+    const raw = await withKvDeadline(() => env.WAKER_KV.get(key));
     const count = Number.parseInt(raw || "0", 10) || 0;
     // Already at/over the limit: block WITHOUT another KV write, so a single
     // attacker hammering one IP cannot drain the daily free-tier KV write quota.
     if (count >= FAILED_AUTH_MAX_ATTEMPTS) return blocked;
-    await env.WAKER_KV.put(key, String(count + 1), { expirationTtl: FAILED_AUTH_WINDOW_SECONDS });
+    await withKvDeadline(() => env.WAKER_KV.put(key, String(count + 1), { expirationTtl: FAILED_AUTH_WINDOW_SECONDS }));
     if (count + 1 > FAILED_AUTH_MAX_ATTEMPTS) return blocked;
   } catch {
     return null;
@@ -588,7 +609,7 @@ async function rateLimitSuccessfulWake(codespaceName, env) {
   if (!seconds) return null;
   const key = SUCCESSFUL_WAKE_KEY_PREFIX + encodeURIComponent(codespaceName);
   try {
-    const raw = await env.WAKER_KV.get(key);
+    const raw = await withKvDeadline(() => env.WAKER_KV.get(key));
     if (!raw) return null;
     return {
       ok: false,
@@ -614,7 +635,7 @@ async function rememberSuccessfulWake(codespaceName, env, data) {
   if (data.route_ready !== true && data.start_accepted !== true) return false;
   const key = SUCCESSFUL_WAKE_KEY_PREFIX + encodeURIComponent(codespaceName);
   try {
-    await env.WAKER_KV.put(key, new Date().toISOString(), { expirationTtl: seconds });
+    await withKvDeadline(() => env.WAKER_KV.put(key, new Date().toISOString(), { expirationTtl: seconds }));
     return true;
   } catch {
     return false;
@@ -1237,25 +1258,23 @@ async function queueHistorySideEffects(env, event, data, ctx) {
     };
   }
 
-  const quotaIncident = await recordQuotaIncident(env, event, data);
-  const historyTask = recordHistory(env, {
-    ...event,
-    history_recorded_at: new Date().toISOString()
-  });
-
   if (ctx && typeof ctx.waitUntil === "function") {
-    ctx.waitUntil(historyTask.catch((error) => {
+    ctx.waitUntil(Promise.all([
+      recordQuotaIncident(env, event, data),
+      recordHistory(env, { ...event, history_recorded_at: new Date().toISOString() })
+    ]).catch((error) => {
       console.warn("history_side_effect_failed", shortError(error));
     }));
     return {
       history_recorded: false,
-      quota_incident_recorded: quotaIncident.recorded,
-      quota_incident: quotaIncident.incident,
+      quota_incident_recorded: false,
+      quota_incident: null,
       deferred: true
     };
   }
 
-  const historyRecorded = await historyTask;
+  const quotaIncident = await recordQuotaIncident(env, event, data);
+  const historyRecorded = await recordHistory(env, { ...event, history_recorded_at: new Date().toISOString() });
   return {
     history_recorded: historyRecorded,
     quota_incident_recorded: quotaIncident.recorded,
@@ -1271,7 +1290,7 @@ async function recordHistory(env, event) {
     const existing = await readHistory(env, event.codespace);
     if (!shouldStoreHistoryEvent(env, event, existing)) return true;
     const next = [event, ...existing].slice(0, HISTORY_LIMIT);
-    await env.WAKER_KV.put(historyKey(event.codespace), JSON.stringify(next));
+    await withKvDeadline(() => env.WAKER_KV.put(historyKey(event.codespace), JSON.stringify(next)));
     return true;
   } catch {
     return false;
@@ -1355,7 +1374,7 @@ async function recordQuotaIncident(env, event, data, cronFields = null) {
       return { recorded: false, incident: Object.keys(existing).length ? existing : incident };
     }
 
-    await env.WAKER_KV.put(quotaIncidentKey(event.codespace), JSON.stringify(incident));
+    await withKvDeadline(() => env.WAKER_KV.put(quotaIncidentKey(event.codespace), JSON.stringify(incident)));
     return { recorded: true, incident };
   } catch {
     return { recorded: false, incident: null };
@@ -1399,7 +1418,7 @@ async function readHistory(env, codespace) {
   if (!env.WAKER_KV) return [];
 
   try {
-    const text = await env.WAKER_KV.get(historyKey(codespace));
+    const text = await withKvDeadline(() => env.WAKER_KV.get(historyKey(codespace)));
     const parsed = text ? JSON.parse(text) : [];
     return Array.isArray(parsed) ? parsed.slice(0, HISTORY_LIMIT) : [];
   } catch {
@@ -1411,7 +1430,7 @@ async function readQuotaIncident(env, codespace) {
   if (!env.WAKER_KV) return null;
 
   try {
-    const text = await env.WAKER_KV.get(quotaIncidentKey(codespace));
+    const text = await withKvDeadline(() => env.WAKER_KV.get(quotaIncidentKey(codespace)));
     const parsed = text ? JSON.parse(text) : null;
     return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
   } catch {
@@ -1448,7 +1467,7 @@ async function handleQuotaSurvivalCron(controller, env) {
   if (nearReset && !quotaCronWakeAllowed(incident, now)) {
     if (resultNeedsCronStamp(incident, now)) {
       incident.last_cron_check_at = now.toISOString();
-      await env.WAKER_KV.put(quotaIncidentKey(codespaceName), JSON.stringify(incident));
+      await withKvDeadline(() => env.WAKER_KV.put(quotaIncidentKey(codespaceName), JSON.stringify(incident)));
     }
     return { ok: true, skipped: "quota_cron_near_reset_wake_already_attempted" };
   }
@@ -1485,7 +1504,7 @@ async function selectDueQuotaCronCodespace(env, registry, now) {
   if (!entries.length) return null;
   let cursor = 0;
   try {
-    cursor = Number.parseInt(await env.WAKER_KV.get(QUOTA_CRON_CURSOR_KEY) || "0", 10) || 0;
+    cursor = Number.parseInt(await withKvDeadline(() => env.WAKER_KV.get(QUOTA_CRON_CURSOR_KEY)) || "0", 10) || 0;
   } catch {}
 
   for (let offset = 0; offset < entries.length; offset += 1) {
@@ -1494,7 +1513,7 @@ async function selectDueQuotaCronCodespace(env, registry, now) {
     const incident = await readQuotaIncident(env, entry.name);
     if (!incident || incident.quota_drought_active !== true || !quotaCronCheckAllowed(incident, now)) continue;
     try {
-      await env.WAKER_KV.put(QUOTA_CRON_CURSOR_KEY, String((index + 1) % entries.length));
+      await withKvDeadline(() => env.WAKER_KV.put(QUOTA_CRON_CURSOR_KEY, String((index + 1) % entries.length)));
     } catch {}
     return { entry, incident };
   }

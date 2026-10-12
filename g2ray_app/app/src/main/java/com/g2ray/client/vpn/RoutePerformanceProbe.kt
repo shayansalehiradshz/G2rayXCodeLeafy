@@ -4,7 +4,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.Call
+import okhttp3.Response
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -46,7 +52,8 @@ class SocksRoutePerformanceProbe(
                 .header("Cache-Control", "no-store")
                 .build()
             val downloadStarted = System.nanoTime()
-            val downloaded = client.newCall(downloadRequest).execute().use { response ->
+            val context = currentCoroutineContext()
+            val downloaded = executeCancellable(client.newCall(downloadRequest)) { response ->
                 if (!response.isSuccessful) {
                     throw IllegalStateException("Download probe returned HTTP ${response.code}")
                 }
@@ -55,7 +62,7 @@ class SocksRoutePerformanceProbe(
                 val buffer = ByteArray(32 * 1024)
                 var total = 0L
                 while (total < downloadBytes) {
-                    currentCoroutineContext().ensureActive()
+                    context.ensureActive()
                     val read = input.read(buffer, 0, minOf(buffer.size, downloadBytes - total.toInt()))
                     if (read < 0) break
                     total += read
@@ -79,7 +86,7 @@ class SocksRoutePerformanceProbe(
                     .post(uploadPayload.toRequestBody("application/octet-stream".toMediaType()))
                     .build()
                 val uploadStarted = System.nanoTime()
-                client.newCall(uploadRequest).execute().use { response ->
+                executeCancellable(client.newCall(uploadRequest)) { response ->
                     if (!response.isSuccessful) {
                         throw IllegalStateException("Upload probe returned HTTP ${response.code}")
                     }
@@ -112,6 +119,21 @@ class SocksRoutePerformanceProbe(
     }
 
     internal companion object {
+        internal suspend fun <T> executeCancellable(call: Call, read: (Response) -> T): T = coroutineScope {
+            val cancellation = launch(start = CoroutineStart.UNDISPATCHED) {
+                try {
+                    awaitCancellation()
+                } finally {
+                    call.cancel()
+                }
+            }
+            try {
+                call.execute().use(read)
+            } finally {
+                cancellation.cancel()
+            }
+        }
+
         fun bytesPerSecond(bytes: Long, elapsedNanos: Long): Long {
             if (bytes <= 0L || elapsedNanos <= 0L) return 0L
             return ((bytes.toDouble() * 1_000_000_000.0) / elapsedNanos.toDouble())

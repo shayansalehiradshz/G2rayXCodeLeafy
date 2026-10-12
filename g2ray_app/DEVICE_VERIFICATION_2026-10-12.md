@@ -189,3 +189,21 @@ rerun after the install completed. No crash/ANR log signature was found.
 
 Raw logs, screenshots, account data, and device identifiers stayed local in
 temporary storage, outside the public repository.
+
+## Follow-up: 13 October 2026
+
+The user requested continuing without further device tests. The subsequent
+health/recovery changes and rebuilt HEV libraries have automated coverage only;
+none of the earlier phone results above validates those new binaries.
+
+A pinned-engine Linux fixture reproduced two defects and checks their fixes:
+locally generated SYN-ACK packets are not evidence of upstream application
+payload, and stopping HEV with a half-open TCP connection left stale lwIP state
+that could abort the next start. The fixture now passes negative-payload,
+positive-payload, and repeated-start cases. All four Android ABI libraries were
+rebuilt from the patch, with hashes checked by the Gradle verification task.
+
+These fixes do not establish the cause of the retained-connection idle stalls
+above. Issue #1 remains open, pending targeted device/network retesting.
+See [the audit follow-up](../AUDIT_FOLLOWUP_2026-10-13.md) for the distinction
+between corrected code, automated checks, and unresolved acceptance work.

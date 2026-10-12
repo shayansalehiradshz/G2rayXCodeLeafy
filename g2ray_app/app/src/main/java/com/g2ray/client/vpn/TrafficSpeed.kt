@@ -34,7 +34,8 @@ data class TrafficBytes(
     val rxBytes: Long,
     val txBytes: Long,
     val rxPackets: Long = 0,
-    val txPackets: Long = 0
+    val txPackets: Long = 0,
+    val rxTcpPayloadBytes: Long? = null
 )
 
 interface TrafficByteSnapshotSource : TrafficByteSource {

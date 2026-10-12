@@ -9,6 +9,7 @@
 /configs-meta.json.*
 /g2ray-codespace-bundle.json
 /g2ray-codespace-bundle.json.*
+/g2ray-codespace-bundle.legacy.json*
 /g2ray-support-*.tar.gz
 /*.rar
 /*.zip

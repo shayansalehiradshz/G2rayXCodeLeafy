@@ -85,8 +85,9 @@ versions and OEM devices.
 4. Run **Optimize** manually with two working routes whose delays differ by less
    than 10 percent/25 ms. The current route must remain selected. A materially
    faster verified route may become active.
-5. Start a Quick scan and immediately press Start VPN. Startup must wait rather
-   than racing the process-global libXray ping instance.
+5. Start a Quick scan or Optimize and immediately press Start VPN. Startup must
+   cancel the scan, drain its bounded native call, and then connect without
+   racing the process-global libXray instance. Repeat with Android Always-on.
 6. Confirm **Ping all** returns one visible result per config. Block the first
    204 endpoint for one route and verify only that failed entry is retried and
    the button completes instead of remaining stuck.

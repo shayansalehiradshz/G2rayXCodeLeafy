@@ -6,7 +6,8 @@ data class HevTunnelStats(
     val uploadPackets: Long,
     val uploadBytes: Long,
     val downloadPackets: Long,
-    val downloadBytes: Long
+    val downloadBytes: Long,
+    val downloadTcpPayloadBytes: Long? = null
 )
 
 /**
@@ -101,7 +102,8 @@ class HevTunController private constructor() {
                     uploadPackets = stats[0].coerceAtLeast(0),
                     uploadBytes = stats[1].coerceAtLeast(0),
                     downloadPackets = stats[2].coerceAtLeast(0),
-                    downloadBytes = stats[3].coerceAtLeast(0)
+                    downloadBytes = stats[3].coerceAtLeast(0),
+                    downloadTcpPayloadBytes = stats.getOrNull(4)?.coerceAtLeast(0)
                 )
             }.getOrNull()
         }
@@ -152,7 +154,8 @@ class HevTunnelByteSource : TrafficByteSnapshotSource {
             rxBytes = stats.downloadBytes,
             txBytes = stats.uploadBytes,
             rxPackets = stats.downloadPackets,
-            txPackets = stats.uploadPackets
+            txPackets = stats.uploadPackets,
+            rxTcpPayloadBytes = stats.downloadTcpPayloadBytes
         )
     }
 }

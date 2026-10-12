@@ -236,9 +236,8 @@ class XrayConfigBuilderTest {
         assertEquals("proxy", rules.getJSONObject(4).getString("outboundTag"))
 
         val sniffingOverrides = tunInbound.getJSONObject("sniffing").getJSONArray("destOverride")
-        assertEquals("http", sniffingOverrides.getString(0))
-        assertEquals("tls", sniffingOverrides.getString(1))
-        assertEquals(2, sniffingOverrides.length())
+        assertEquals(0, sniffingOverrides.length())
+        assertFalse(tunInbound.getJSONObject("sniffing").getBoolean("enabled"))
 
         val healthInbound = inbounds.getJSONObject(1)
         assertEquals("health-socks", healthInbound.getString("tag"))
@@ -300,9 +299,8 @@ class XrayConfigBuilderTest {
         assertEquals(19090, socks.getInt("port"))
         assertTrue(socks.getJSONObject("settings").getBoolean("udp"))
         val sniffingOverrides = socks.getJSONObject("sniffing").getJSONArray("destOverride")
-        assertEquals("http", sniffingOverrides.getString(0))
-        assertEquals("tls", sniffingOverrides.getString(1))
-        assertEquals(2, sniffingOverrides.length())
+        assertEquals(0, sniffingOverrides.length())
+        assertFalse(socks.getJSONObject("sniffing").getBoolean("enabled"))
 
         val rules = root.getJSONObject("routing").getJSONArray("rules")
         assertEquals("tun-socks", rules.getJSONObject(0).getJSONArray("inboundTag").getString(0))
@@ -333,10 +331,9 @@ class XrayConfigBuilderTest {
             val dataInbound = root.getJSONArray("inbounds").getJSONObject(0)
             val overrides = dataInbound.getJSONObject("sniffing").getJSONArray("destOverride")
             assertEquals("fakedns", overrides.getString(0))
-            assertEquals("http", overrides.getString(1))
-            assertEquals("tls", overrides.getString(2))
-            assertFalse(dataInbound.getJSONObject("sniffing").getBoolean("routeOnly"))
-            assertFalse(dataInbound.getJSONObject("sniffing").getBoolean("metadataOnly"))
+            assertEquals(1, overrides.length())
+            assertTrue(dataInbound.getJSONObject("sniffing").getBoolean("routeOnly"))
+            assertTrue(dataInbound.getJSONObject("sniffing").getBoolean("metadataOnly"))
         }
     }
 
@@ -360,9 +357,7 @@ class XrayConfigBuilderTest {
             .getJSONObject(0)
             .getJSONObject("sniffing")
             .getJSONArray("destOverride")
-        assertEquals("http", overrides.getString(0))
-        assertEquals("tls", overrides.getString(1))
-        assertEquals(2, overrides.length())
+        assertEquals(0, overrides.length())
     }
 
     @Test
