@@ -54,8 +54,11 @@ portable rather than simpler.
   HEV and Xray and exposes true VPN TUN upload/download counters.
 - **Native** uses Xray's Android TUN inbound directly. It is the compatibility
   fallback; the app does not invent device-wide throughput figures for it.
-  Retained HTTP connections stalled after idle during physical-device testing;
-  use Auto/HEV for normal use. See the [verification record](DEVICE_VERIFICATION_2026-10-12.md).
+
+Physical-device tests found retained-connection idle stalls in Native and a
+HEV screen-off case. Fresh connections still worked. Auto/HEV remains the normal
+path, not a guarantee of stall-free idle resume. See the
+[verification record](DEVICE_VERIFICATION_2026-10-12.md).
 
 Both engines use a 1500-byte Android VPN MTU. The physical network and the
 Codespaces edge still determine the final latency and throughput, so compare
@@ -269,6 +272,11 @@ Repeat with `engine=xray_native` to check Native independently. Without
 `liveVpn=true`, the test is skipped. The repository's root Android CI compiles
 these tests and runs unit tests and lint; it does not claim phone, long-video,
 network-handoff, or long-session coverage.
+The optional `transport=ws` or `transport=xhttp` runner argument selects an
+already-saved profile on the same edge and account, without changing the saved
+selection. It fails if no matching profile exists. Sanitized connection IDs and
+HTTP protocol names distinguish retained connections from new ones. Wake the
+phone before an awake baseline; the test reports whether the device is interactive.
 
 ## Notes
 

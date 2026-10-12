@@ -6,6 +6,7 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.Bundle
+import android.os.PowerManager
 import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
@@ -18,15 +19,24 @@ import com.g2ray.client.MainActivity
 import com.g2ray.client.model.ActiveVpnEngine
 import com.g2ray.client.model.TunnelState
 import com.g2ray.client.model.TunnelTrafficSource
+import com.g2ray.client.model.Transport
 import com.g2ray.client.model.VpnEngineMode
 import com.g2ray.client.model.VpnStateRepository
 import java.net.Proxy
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import okhttp3.ConnectionPool
+import okhttp3.Call
+import okhttp3.Connection
+import okhttp3.EventListener
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -49,8 +59,18 @@ class LiveVpnDeviceTest {
         val repository = context.accountRepository
         assertTrue("Saved data failed to load", repository.loadError.value == null)
         val selection = repository.activeSelection.value
-        val profile = repository.profiles.value.firstOrNull { it.id == selection.profileId }
-        assertNotNull("Select a working profile in the app before this test", profile)
+        val selected = repository.profiles.value.firstOrNull { it.id == selection.profileId }
+        assertNotNull("Select a working profile in the app before this test", selected)
+        val transport = args.getString("transport")?.let { value ->
+            Transport.entries.firstOrNull { it.name.equals(value, ignoreCase = true) }
+                ?: error("Test transport must be xhttp or ws")
+        }
+        val profile = if (transport == null || transport == selected!!.transport) selected else {
+            repository.profiles.value.firstOrNull {
+                it.accountId == selected!!.accountId && it.address == selected.address && it.transport == transport
+            }
+        }
+        assertNotNull("No matching saved transport profile exists on the selected edge", profile)
         val mode = VpnEngineMode.fromStorage(args.getString("engine") ?: "hev")
         val idleSeconds = (args.getString("idleSeconds")?.toLongOrNull() ?: 60L).coerceIn(60L, 600L)
         val client = OkHttpClient.Builder()
@@ -62,10 +82,25 @@ class LiveVpnDeviceTest {
             .readTimeout(20, TimeUnit.SECONDS)
             .writeTimeout(20, TimeUnit.SECONDS)
             .callTimeout(30, TimeUnit.SECONDS)
+            .eventListener(object : EventListener() {
+                override fun connectionAcquired(call: Call, connection: Connection) {
+                    report("event=connection_acquired endpoint=${call.request().url.host} " +
+                        "protocol=${connection.protocol()} connection=${System.identityHashCode(connection)}")
+                }
+            })
             .build()
 
-        val scenario = ActivityScenario.launch(MainActivity::class.java)
+        var scenario = ActivityScenario.launch(MainActivity::class.java)
         var startRequested = false
+        val lifecycleTrace = launch(Dispatchers.Default) {
+            VpnStateRepository.state
+                .map { Triple(it.tunnelState, it.tunnelVerified, it.activeVpnEngine) }
+                .distinctUntilChanged()
+                .collect { (state, verified, engine) ->
+                    report("event=tunnel_state state=$state verified=$verified engine=$engine " +
+                        "elapsed_ms=${SystemClock.elapsedRealtime()}")
+                }
+        }
         try {
             val startedAt = SystemClock.elapsedRealtime()
             scenario.onActivity { activity ->
@@ -85,7 +120,8 @@ class LiveVpnDeviceTest {
             assertEquals("Tunnel failed to verify", TunnelState.Connected, connected.tunnelState)
             val expectedEngine = if (mode == VpnEngineMode.XrayNative) ActiveVpnEngine.XrayNative else ActiveVpnEngine.Hev
             assertEquals("The requested engine was not exercised", expectedEngine, connected.activeVpnEngine)
-            report("engine=${mode.storageValue} verified_start_ms=${SystemClock.elapsedRealtime() - startedAt}")
+            report("engine=${mode.storageValue} transport=${profile!!.transport} " +
+                "verified_start_ms=${SystemClock.elapsedRealtime() - startedAt}")
 
             val connectivity = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
             assertTrue(
@@ -107,12 +143,25 @@ class LiveVpnDeviceTest {
                 assertEquals(TunnelTrafficSource.Unavailable, VpnStateRepository.state.value.tunnelTrafficSource)
             }
 
+            val idleStartedAt = SystemClock.elapsedRealtime()
             scenario.moveToState(Lifecycle.State.CREATED)
-            report("background_idle_seconds=$idleSeconds")
-            delay(idleSeconds * 1_000L)
+            val power = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+            report("background_idle_seconds=$idleSeconds device_interactive=${power.isInteractive}")
+            waitForBackgroundIdle(idleSeconds * 1_000L)
             val afterIdle = VpnStateRepository.state.value
             assertEquals("Service lost the VPN during background idle", TunnelState.Connected, afterIdle.tunnelState)
-            scenario.moveToState(Lifecycle.State.RESUMED)
+            // Reopen through Android's normal activity launch path. Trying to
+            // force a stopped test activity to RESUMED after screen-off can
+            // fail in the harness without demonstrating any VPN failure.
+            scenario.close()
+            scenario = ActivityScenario.launch(MainActivity::class.java)
+            assertTrue(
+                "Default network left the VPN after idle or activity recreation",
+                connectivity.getNetworkCapabilities(connectivity.activeNetwork)
+                    ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
+            )
+            report("idle_finished_device_interactive=${power.isInteractive} " +
+                "actual_idle_gap_ms=${SystemClock.elapsedRealtime() - idleStartedAt}")
             val retainedResponsive = probeHttpsQuorum(client, "idle_resume_retained_pool")
             client.connectionPool.evictAll()
             val freshResponsive = probeHttpsQuorum(client, "idle_resume_fresh_socket")
@@ -122,12 +171,10 @@ class LiveVpnDeviceTest {
         } finally {
             try {
                 if (startRequested) {
-                    scenario.moveToState(Lifecycle.State.RESUMED)
-                    scenario.onActivity { activity ->
-                        activity.startService(Intent(activity, G2RayVpnService::class.java).apply {
-                            action = G2RayVpnService.ACTION_STOP
-                        })
-                    }
+                    // Cleanup must not depend on restoring a foreground UI.
+                    context.startService(Intent(context, G2RayVpnService::class.java).apply {
+                        action = G2RayVpnService.ACTION_STOP
+                    })
                     withTimeout(15_000L) {
                         VpnStateRepository.state.first { it.tunnelState == TunnelState.Disconnected }
                     }
@@ -136,11 +183,23 @@ class LiveVpnDeviceTest {
                 try {
                     scenario.close()
                 } finally {
+                    lifecycleTrace.cancelAndJoin()
                     client.dispatcher.cancelAll()
                     client.connectionPool.evictAll()
                     client.dispatcher.executorService.shutdown()
                 }
             }
+        }
+    }
+
+    private suspend fun waitForBackgroundIdle(durationMs: Long) {
+        // Coroutine timer delays exclude deep sleep on Android. Measure idle
+        // with elapsedRealtime so screen-off time counts without a wake lock.
+        val deadline = SystemClock.elapsedRealtime() + durationMs
+        while (true) {
+            val remainingMs = deadline - SystemClock.elapsedRealtime()
+            if (remainingMs <= 0L) return
+            delay(minOf(remainingMs, 1_000L))
         }
     }
 

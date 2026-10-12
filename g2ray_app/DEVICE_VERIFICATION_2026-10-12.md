@@ -26,8 +26,15 @@ No production tunnel setting was changed as part of the source import.
   Lint: zero errors, 26 warnings. Warnings were not represented as a clean lint.
 - Installed the debug APK over the existing app without uninstalling it or
   clearing data. Saved accounts, keys, profiles, and preferences were preserved.
-- Installed APK SHA-256 matched the locally built APK:
+- Initial installed APK SHA-256 matched the locally built APK:
   `a31a6f50747471b4ef6ab8aab07cea96e4d9c50cd10d672f9f6c51d68159ba02`.
+- The experimental WS-heartbeat candidate was also installed without clearing data; its
+  installed SHA-256 matched the built APK:
+  `d63e7691bc7acd5dedc4142c1c402a5153aab7d65724ea0c16b907ec44d6c337`.
+  It was not retained after its repeat test failed.
+- The restored baseline was rebuilt and installed after the experiment. Its
+  installed SHA-256 matched the final locally built APK:
+  `879275b41692a2d01df0fa224497d4bf35459774e8c8ed9cf3a22425c46d4967`.
 - Native core pin: libXray `80263da83e96b2972455b0a94b13ee1a10e51391`,
   with the repository's Android controller patch and Go 1.26.5. HEV pin:
   `9a06bc6e7989da54e3d32ff701ef7a7ce4995d3a`.
@@ -65,17 +72,34 @@ The retained pool lives for ten minutes; fresh sockets are checked separately.
 
 The following are small transfer samples, not sustained bandwidth benchmarks:
 
-| Run | Idle | 2 MiB download | 64 KiB upload | Retained HTTPS after idle | Fresh HTTPS after idle |
+| Run | Requested idle | 2 MiB download | 64 KiB upload | Retained HTTPS after idle | Fresh HTTPS after idle |
 | --- | --- | --- | --- | --- | --- |
 | HEV, retained pool | 300 s | 3,486 ms | 830 ms | 1,286-1,872 ms, 3/3 successful | 1,192-1,267 ms, 3/3 successful |
 | Native, retained pool | 60 s | 3,602 ms | 832 ms | One 20,010 ms timeout; another response took 18,803 ms | 1,073-1,422 ms, 3/3 successful |
 | Native, repeated | 60 s | 2,809 ms | 1,132 ms | One 20,012 ms timeout; another response took 19,038 ms | 1,217-1,569 ms, 3/3 successful |
+| HEV, screen-off and activity reopen | 60 s | 2,733 ms | 769 ms | One 20,021 ms timeout; another response took 9,408 ms | 1,225-1,617 ms, 3/3 successful |
+| HEV/WS, confirmed awake | 60 s | 3,221 ms | 644 ms | Three reused HTTP/2 connections timed out at about 20 s | 2,070-4,115 ms, 3/3 successful |
+| HEV/XHTTP, confirmed awake | 60 s | 3,117 ms | 639 ms | Stale connections were replaced; 1,263-2,513 ms, 3/3 successful | 1,211-1,461 ms, 3/3 successful |
+| HEV/WS, 20 s heartbeat, confirmed awake | 60 s | 3,615 ms | 875 ms | Cloudflare/Example reused connections: 324/342 ms; Google timed out at 20,007 ms | 2,074-2,563 ms, 3/3 successful |
+| HEV/WS, heartbeat repeated | 60 s | 4,287 ms | 840 ms | Google: 265 ms; Cloudflare/Example timed out at 20,004/20,017 ms | 2,042-4,112 ms, 3/3 successful |
+
+The idle column is the requested background delay. Activity state changes and
+test-driven close/relaunch can add time before the first post-idle request;
+these samples are not exact 60-second socket-lifetime benchmarks. The harness
+now reports the actual elapsed gap separately for future runs.
 
 HEV counters advanced from real TUN activity, including more than 2 MiB received.
 Native correctly reported its exact traffic counter source as unavailable;
 device-wide counters were not substituted as tunnel throughput.
+The controlled awake tests temporarily kept the charging display on. HTTP/2
+connection identity telemetry confirmed actual reuse in the failed WS test and
+automatic replacement in the successful XHTTP test. A retained pool does not
+by itself prove that its original sockets survived or were used successfully.
+An additional HEV/XHTTP run passed with service-state tracing: the service stayed
+Connected through idle and reuse checks until the explicit test cleanup. The
+WS-heartbeat run likewise showed no hidden service restart during idle.
 
-### Verified Gap: Native Retained-Connection Idle Stalls
+### Verified Gap: Retained-Connection Idle Stalls
 
 The original live-test gate accepted two eventual successful HTTP responses.
 That allowed a roughly 19-second response to count as a pass. The gate now
@@ -87,20 +111,64 @@ endpoints completed within six seconds, while all three fresh-socket requests
 were responsive. An instrumentation assertion failure is not an app crash.
 
 The Native failure was reproduced twice before tightening the gate. HEV did not
-show this behavior in its five-minute retained-pool test. The app's probe reset
+show this behavior in its five-minute retained-pool test, but did reproduce an
+idle stall in a later shorter screen-off test with activity recreation. This
+is not a Native-only issue. The app's probe reset
 only closes its own health-check clients, not third-party app connections.
 Fresh-socket success does not prove an app's retained connection is healthy.
 
-Root cause is not confirmed: this is evidence of a Native-path connection-reuse
+Root cause is not confirmed: this is evidence of a VPN-path connection-reuse
 problem on this device/network, not proof of a particular upstream gVisor bug.
 No speculative MTU change, global resume-time tunnel restart, or unverified
-native-core patch was shipped to hide it. Auto/HEV remains the normal path.
-Native remains a compatibility fallback and is not certified for idle resume.
+native-core patch was shipped to hide it. Auto/HEV remains the normal path;
+Native remains a compatibility fallback. Neither engine is certified for
+stall-free idle resume from this evidence.
+Changing from XHTTP to WS is not a verified fix: the awake WS run failed while
+the same-edge awake XHTTP run passed. XHTTP remains the normal transport.
+This finding is tracked in [issue #1](https://github.com/z2roozsh/G2rayXCodeLeafy/issues/1).
 
-To investigate further, reproduce with the opt-in Native test, capture sanitized
+To investigate further, reproduce with both opt-in engine tests, capture sanitized
 connection reuse/close events and Native TCP lifecycle data, make one targeted
 change, and rerun both engines. Keep the retained-pool failure in the evidence
 even when new sockets or basic health probes succeed.
+
+### Screen-off Test Harness
+
+The initial externally screen-off run failed while the Android test harness
+tried to force its stopped activity to `RESUMED`. It did not reach the post-idle
+network assertions and is not counted as a VPN pass or a tunnel failure.
+The harness now closes/reopens the activity normally, stops the service from
+application context even if UI restoration fails, and counts real elapsed idle
+time with `elapsedRealtime` so deep sleep does not extend the requested delay.
+The revised short screen-off test reached the network assertions and failed the
+retained-pool responsiveness gate while all three fresh-socket checks passed.
+The test now also reports device interactivity and asserts that Android's default
+network remains the VPN after activity recreation.
+It can compare existing transports on the same edge/account without changing
+saved selection, records HTTP protocol/connection identity, and traces service
+state transitions without printing account IDs, links, or error strings.
+
+### WS Heartbeat Experiment
+
+The pinned core and [official WS documentation](https://xtls.github.io/en/config/transports/websocket.html)
+support `heartbeatPeriod`, which sends WebSocket Ping frames. This was previously
+omitted, so no application-level WS heartbeat was sent. TCP keepalive alone does
+not guarantee that an HTTP proxy preserves an idle WebSocket stream.
+
+A candidate set a 20-second period on WS outbounds only. The same-edge awake
+comparison improved two retained HTTP/2 endpoints from timeouts to roughly
+0.3-second responses, without a service restart. The third endpoint still timed
+out. The repeat then failed on the other two endpoints. There was no repeatable
+improvement, so the heartbeat candidate was reverted, including its installed
+production configuration. It is not shipped as a fix. XHTTP is unchanged.
+Neither one passing quorum nor a partial improvement proves all retained
+sockets are healthy. The connection-reuse issue remains open.
+The interval adds small control traffic and can cost mobile radio/battery time;
+it is not a raw bandwidth or universal latency improvement.
+
+One candidate instrumentation invocation overlapped APK replacement. Android's
+exit reason was `PACKAGE UPDATED`, not a native/JVM crash. It was excluded and
+rerun after the install completed. No crash/ANR log signature was found.
 
 ## Limits
 

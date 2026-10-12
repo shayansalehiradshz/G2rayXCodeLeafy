@@ -56,6 +56,8 @@ class XrayConfigBuilderTest {
         assertEquals("h2", tlsSettings.getJSONArray("alpn").getString(0))
 
         val xhttpSettings = streamSettings.getJSONObject("xhttpSettings")
+        assertFalse(streamSettings.has("wsSettings"))
+        assertFalse(xhttpSettings.has("heartbeatPeriod"))
         assertEquals("packet-up", xhttpSettings.getString("mode"))
         assertEquals("example.com", xhttpSettings.getString("host"))
         assertEquals("/", xhttpSettings.getString("path"))
@@ -127,6 +129,7 @@ class XrayConfigBuilderTest {
         assertEquals("ws", streamSettings.getString("network"))
 
         val wsSettings = streamSettings.getJSONObject("wsSettings")
+        assertFalse(wsSettings.has("heartbeatPeriod"))
         assertEquals("/", wsSettings.getString("path"))
         assertEquals("example.com", wsSettings.getJSONObject("headers").getString("Host"))
 
