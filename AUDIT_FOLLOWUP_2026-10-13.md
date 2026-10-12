@@ -66,6 +66,16 @@ It does not mean every device, ISP, third-party app, or long session was tested.
 | ShellCheck | Error-level checks passed | Does not imply all warning-level findings are absent. |
 | Mock control-plane benchmarks | All six budgets passed | Not Internet latency, throughput, packet loss, or video playback. |
 | Worker | 63 behavior checks, syntax checks, packaging dry-run passed | Mocked APIs/KV; no dashboard deployment or phone-to-Worker cold-wake test. |
+| Live server rollout | Fast-forward pull, UUID-preserving generation, both server inbounds routing-only, schema-2 bundle confirmed | Existing Xray 26.5.9 retained; one engine restart, no phone interaction. |
+| Authenticated live traffic | XHTTP 3/3 and WS 3/3 HTTPS destinations succeeded through temporary SOCKS clients using current bundle credentials/tuning | Codespace-to-edge-to-Codespace path only, not phone RTT, sustained throughput, or retained-connection acceptance. |
+
+GitHub [Android CI](https://github.com/z2roozsh/G2rayXCodeLeafy/actions/runs/38309615136)
+passed for the implementation commit `4fdf81a`, including the new native fixture.
+The first static run caught an obsolete documentation assertion that still
+required quota bookkeeping before the response; `5292f8f` updated that assertion
+to verify the new deferred-response contract. The subsequent
+[server/Worker CI](https://github.com/z2roozsh/G2rayXCodeLeafy/actions/runs/38309853804)
+passed all fast and extended checks. The earlier failure is not counted as a pass.
 
 ## Rollout and Remaining Acceptance
 
