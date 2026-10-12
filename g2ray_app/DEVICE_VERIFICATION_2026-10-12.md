@@ -207,3 +207,22 @@ These fixes do not establish the cause of the retained-connection idle stalls
 above. Issue #1 remains open, pending targeted device/network retesting.
 See [the audit follow-up](../AUDIT_FOLLOWUP_2026-10-13.md) for the distinction
 between corrected code, automated checks, and unresolved acceptance work.
+
+## Later Retest: 13 October 2026
+
+The phone was subsequently reconnected and the rebuilt functional APK was
+installed in place, preserving saved accounts and profiles. New full-device
+VPN checks exercised both packet engines, retained and fresh HTTPS sockets,
+screen-off idle, real transfers, and two consecutive core failures per engine.
+Both engines recovered automatically twice and passed all three HTTPS probes
+after each recovery. No new crash/ANR exit reason was observed.
+
+Idle results were mixed: longer HEV screen-off and Native interactive runs
+passed, but a shorter HEV/XHTTP repeat and the HEV/WS retained-pool comparison
+failed the unchanged six-second responsiveness gate. The retained-connection
+gap is still open, not cured by the payload-counter/restart fixes.
+
+See [the dated verification report](../AUDIT_VERIFICATION_2026-10-13.md) for
+exact measurements, failed as well as successful runs, audit claim
+dispositions, and the limits of this retest. The earlier no-device-testing
+section describes the earlier pass; it is not the status of this later retest.

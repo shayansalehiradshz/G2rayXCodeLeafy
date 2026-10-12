@@ -3398,7 +3398,8 @@ observe_route_latency() {
         degraded=true
         count=$((count + 1))
         (( count > ROUTE_DEGRADED_TRIGGER_COUNT )) && count="$ROUTE_DEGRADED_TRIGGER_COUNT"
-        baseline=$((baseline + (ms - baseline) / 10))
+        # Degraded samples must not raise the threshold for the next sample.
+        # Adapt the baseline only after a healthy observation below.
     else
         count=0
         (( samples == 0 )) && baseline="$ms" || baseline=$(((baseline * 7 + ms * 3) / 10))
@@ -5599,8 +5600,12 @@ JSON
 }
 
 write_codespace_import_bundle() {
-    local links="$1" legacy="${2:-false}" generated worker_codespace_id first=true link bundle
+    local links="${1:-}" legacy="${2:-false}" generated worker_codespace_id first=true link bundle
     local bundle_file="$CODESPACE_BUNDLE_FILE" schema=2
+    if [[ -z "${links//[[:space:]]/}" ]]; then
+        log_event ERROR "codespace_bundle invalid_links" || true
+        return 2
+    fi
     if [[ "$legacy" == true ]]; then
         bundle_file="${CODESPACE_BUNDLE_FILE%.json}.legacy.json"
         schema=1
@@ -5630,7 +5635,13 @@ write_codespace_import_bundle() {
     )
     _atomic_write "$bundle_file" "$bundle" || return 1
     chmod 600 "$bundle_file" 2>/dev/null || true
-    if [[ "$legacy" != true ]]; then write_codespace_import_bundle "$links" true; fi
+    if [[ "$legacy" != true ]] && ! write_codespace_import_bundle "$links" true; then
+        # The compatibility artifact must not roll back a valid current export
+        # or leave an older UUID available for accidental import.
+        rm -f "${CODESPACE_BUNDLE_FILE%.json}.legacy.json" 2>/dev/null || true
+        log_event WARN "codespace_bundle legacy_bundle_write_failed action=use_current_bundle" || true
+    fi
+    return 0
 }
 
 write_config_exports_from_links() {

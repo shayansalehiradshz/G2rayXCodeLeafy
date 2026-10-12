@@ -20,6 +20,38 @@ The packaged-core device smoke test must also start and stop a three-outbound
 least-ping config; compiling its JSON alone is not enough to validate the JNI
 and pinned Xray runtime boundary.
 
+## Opt-in live device regressions
+
+Save a working profile, grant VPN permission, and install both debug APKs
+before starting. Do not replace APKs during instrumentation. These tests start
+and stop the VPN and transfer real traffic; ordinary source CI skips them.
+
+From an Android SDK terminal, run the idle test separately for each engine:
+
+```powershell
+adb shell am instrument -w -r -e class 'com.g2ray.client.vpn.LiveVpnDeviceTest#selectedProfileCarriesTrafficAndRecoversAfterBackgroundIdle' -e liveVpn true -e engine hev -e idleSeconds 310 com.g2ray.client.test/androidx.test.runner.AndroidJUnitRunner
+```
+
+Repeat with `-e engine xray_native`. An optional `-e transport ws` uses a
+matching saved profile on the same account/edge without changing selection.
+Record screen interactivity and the actual elapsed gap; requested idle alone
+does not prove a screen-off test. Retained and fresh HTTPS each need two of
+three endpoints within six seconds. Failed retained checks must remain visible
+even when fresh sockets work.
+
+Run core-failure recovery independently, again with both engines:
+
+```powershell
+adb shell am instrument -w -r -e class 'com.g2ray.client.vpn.LiveVpnDeviceTest#selectedProfileRecoversAfterRepeatedCoreFailures' -e liveVpn true -e liveCoreRecovery true -e engine hev com.g2ray.client.test/androidx.test.runner.AndroidJUnitRunner
+```
+
+This stops the actual native core twice and requires automatic verified
+recovery plus an HTTPS quorum after each stop. It does not simulate every
+persistent-backoff branch, a stopped Codespace, or a failed Worker. Normal
+automatic standby routes remain enabled unless explicitly disabled for a
+separate controlled experiment. Never label a selected-transport result as
+forced single-outbound proof.
+
 ## Six-hour soak
 
 1. Start with the Codespace stopped and press Start VPN once with **Worker** mode and once with **GitHub** mode. Record time until route verification succeeds and confirm both paths use the same selected profile.

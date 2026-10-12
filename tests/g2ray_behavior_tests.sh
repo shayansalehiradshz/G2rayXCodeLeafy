@@ -90,7 +90,7 @@ reset_runtime_paths() {
     ROUTE_SETTLE_LOG_FILE="$LOG_DIR/route-settle.log"
     rm -rf "$DATA_DIR" "$LOG_DIR"
     mkdir -p "$DATA_DIR" "$LOG_DIR" "$QR_DIR"
-    rm -f "$MOBILE_CONFIG_FILE" "$SUBSCRIPTION_FILE" "$CONFIG_META_FILE" "$CODESPACE_BUNDLE_FILE" 2>/dev/null || true
+    rm -f "$MOBILE_CONFIG_FILE" "$SUBSCRIPTION_FILE" "$CONFIG_META_FILE" "$CODESPACE_BUNDLE_FILE" "${CODESPACE_BUNDLE_FILE%.json}.legacy.json" 2>/dev/null || true
     : > "$LOG_FILE"
     : > "$STRUCTURED_LOG_FILE"
     : > "$DIAGNOSTIC_LOG_FILE"
@@ -230,6 +230,78 @@ test_degraded_probe_resets_chain_on_outage_or_healthy_sample() {
     printf '%s 008 008 008 008\n' "$PORT_DOMAIN" > "$ROUTE_LATENCY_BASELINE_FILE"
     observe_route_latency 200 900 || fail 'corrupt leading-zero state raised an arithmetic error'
     pass 'degradation resets across outages, healthy probes, suspension, identity changes, and corrupt state'
+}
+
+test_degraded_probe_keeps_healthy_baseline_at_threshold() {
+    reset_runtime_paths
+    for i in 1 2 3; do observe_route_latency 200 100; done
+    observe_route_latency 200 600
+    [[ "$(awk '{print $3 ":" $5}' "$ROUTE_LATENCY_BASELINE_FILE")" == '100:1' ]] \
+        || fail 'a degraded sample contaminated the healthy baseline'
+    [[ ! -e "$ROUTE_DEGRADED_REQUEST_FILE" ]] || fail 'one threshold sample queued a scan'
+    observe_route_latency 200 600
+    [[ -s "$ROUTE_DEGRADED_REQUEST_FILE" ]] || fail 'sustained threshold degradation was normalized away'
+    observe_route_latency 200 110
+    [[ "$(awk '{print $3 ":" $5}' "$ROUTE_LATENCY_BASELINE_FILE")" == '103:0' ]] \
+        || fail 'healthy samples stopped updating the baseline or clearing the chain'
+    pass 'threshold degradation cannot move its own baseline and healthy samples still adapt'
+}
+
+test_optional_legacy_bundle_failure_preserves_current_exports() {
+    (
+        reset_runtime_paths
+        local legacy_file="${CODESPACE_BUNDLE_FILE%.json}.legacy.json"
+        local link='vless://test@20.0.0.1:443?type=xhttp&extra=%7B%22xmux%22%3A%7B%7D%7D'
+        printf 'stale legacy artifact\n' > "$legacy_file"
+        _atomic_write() {
+            [[ "$1" != "$legacy_file" ]] || return 1
+            printf '%s\n' "$2" > "$1"
+        }
+        write_config_exports_from_links "$link" || fail 'optional legacy failure invalidated current exports'
+        jq -e --arg link "$link" '.schema_version == 2 and .configs == [$link]' "$CODESPACE_BUNDLE_FILE" >/dev/null \
+            || fail 'current bundle lost its exact link or schema'
+        [[ "$(cat "$MOBILE_CONFIG_FILE")" == "$link" && -s "$CONFIG_META_FILE" && -s "$SUBSCRIPTION_FILE" ]] \
+            || fail 'legacy failure left current exports incomplete'
+        [[ ! -e "$legacy_file" ]] || fail 'failed legacy refresh kept a stale import artifact'
+        grep -Fq 'legacy_bundle_write_failed' "$LOG_FILE" || fail 'legacy failure was not reported'
+    )
+    pass 'optional legacy failures do not invalidate current exports or leave a stale legacy artifact'
+}
+
+test_codespace_bundle_rejects_missing_or_empty_links() {
+    (
+        reset_runtime_paths
+        local input rc
+        printf 'preserve previous bundle\n' > "$CODESPACE_BUNDLE_FILE"
+        rc=0
+        (write_codespace_import_bundle) 2>/dev/null || rc=$?
+        [[ "$rc" == 2 ]] || fail "missing bundle links returned $rc instead of a validation error"
+        for input in '' $' \t\n'; do
+            rc=0
+            write_codespace_import_bundle "$input" || rc=$?
+            [[ "$rc" == 2 ]] || fail "empty bundle links returned $rc instead of a validation error"
+        done
+        [[ "$(cat "$CODESPACE_BUNDLE_FILE")" == 'preserve previous bundle' ]] \
+            || fail 'invalid input overwrote an existing bundle'
+        [[ ! -e "${CODESPACE_BUNDLE_FILE%.json}.legacy.json" ]] || fail 'invalid input wrote a legacy bundle'
+    )
+    pass 'missing and whitespace-only bundle links fail without modifying existing artifacts'
+}
+
+test_codespace_bundle_primary_write_failure_still_fails() {
+    (
+        reset_runtime_paths
+        printf 'previous primary\n' > "$CODESPACE_BUNDLE_FILE"
+        _atomic_write() {
+            [[ "$1" != "$CODESPACE_BUNDLE_FILE" ]] || return 1
+            fail 'primary bundle failure continued writing artifacts'
+        }
+        if write_codespace_import_bundle 'vless://test@20.0.0.1:443?type=xhttp'; then
+            fail 'primary bundle write failure was hidden'
+        fi
+        [[ "$(cat "$CODESPACE_BUNDLE_FILE")" == 'previous primary' ]] || fail 'primary failure damaged the previous bundle'
+    )
+    pass 'primary bundle write failures remain fatal and preserve the previous artifact'
 }
 
 test_degraded_refresh_forces_fresh_scan_outside_health_deadline() {
@@ -4066,6 +4138,25 @@ test_deadline_fails_closed_without_temp_storage() {
     pass 'deadline initialization failure never runs an unbounded task'
 }
 
+test_deadline_rejects_unverified_process_group() {
+    (
+        reset_runtime_paths
+        kill() {
+            if [[ "${1:-}" == -0 && "${2:-}" == -- && "${3:-}" == -[0-9]* ]]; then
+                return 1
+            fi
+            builtin kill "$@"
+        }
+        deadline_test_work() { while :; do :; done; }
+        local rc=0 started="$SECONDS"
+        run_with_deadline 10 deadline_test_work || rc=$?
+        [[ "$rc" == 125 ]] || fail "unverified deadline group returned $rc instead of initialization failure"
+        (( SECONDS - started < 5 )) || fail 'unverified process group waited for the command deadline'
+        grep -Fq 'deadline_group_init_failed' "$LOG_FILE" || fail 'group initialization failure was not reported'
+    )
+    pass 'deadline rejects an unverified process group instead of reaching an unbounded wait'
+}
+
 test_deadline_terminates_descendant_processes() {
     reset_runtime_paths
     local child_file child rc
@@ -4585,6 +4676,10 @@ test_runtime_diagnostics_report_deployed_versions_and_policy() {
     pass "runtime diagnostics distinguish installed core, image pin, configured policy, and kernel state"
 }
 
+test_degraded_probe_keeps_healthy_baseline_at_threshold
+test_optional_legacy_bundle_failure_preserves_current_exports
+test_codespace_bundle_rejects_missing_or_empty_links
+test_codespace_bundle_primary_write_failure_still_fails
 test_runtime_diagnostics_report_deployed_versions_and_policy
 test_supervisor_reconnect_defers_long_route_verification
 test_route_repair_preserves_active_sessions_for_all_callers
@@ -4648,6 +4743,7 @@ test_port_listener_detection_does_not_require_sudo
 test_deadline_terminates_descendant_processes
 test_deadline_stops_term_resistant_writers
 test_deadline_fails_closed_without_temp_storage
+test_deadline_rejects_unverified_process_group
 test_post_start_propagates_silent_start_failure
 test_generate_config_respects_runtime_lock_for_entire_transaction
 test_generate_config_failed_start_restores_previous_running_engine

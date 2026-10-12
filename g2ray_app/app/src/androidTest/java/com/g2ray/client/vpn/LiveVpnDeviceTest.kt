@@ -24,7 +24,9 @@ import com.g2ray.client.model.VpnEngineMode
 import com.g2ray.client.model.VpnStateRepository
 import java.net.Proxy
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -51,7 +53,18 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 class LiveVpnDeviceTest {
     @Test
-    fun selectedProfileCarriesTrafficAndRecoversAfterBackgroundIdle() = runBlocking {
+    fun selectedProfileCarriesTrafficAndRecoversAfterBackgroundIdle() = runLiveTest()
+
+    @Test
+    fun selectedProfileRecoversAfterRepeatedCoreFailures() {
+        assumeTrue(
+            "Core failure injection requires -e liveCoreRecovery true",
+            InstrumentationRegistry.getArguments().getString("liveCoreRecovery") == "true"
+        )
+        runLiveTest(coreFailureCycles = 2)
+    }
+
+    private fun runLiveTest(coreFailureCycles: Int = 0) = runBlocking {
         val args = InstrumentationRegistry.getArguments()
         assumeTrue("Live network tests require -e liveVpn true", args.getString("liveVpn") == "true")
         val context = ApplicationProvider.getApplicationContext<G2RayApplication>()
@@ -143,6 +156,11 @@ class LiveVpnDeviceTest {
                 assertEquals(TunnelTrafficSource.Unavailable, VpnStateRepository.state.value.tunnelTrafficSource)
             }
 
+            if (coreFailureCycles > 0) {
+                repeatCoreFailureRecovery(client, coreFailureCycles)
+                return@runBlocking
+            }
+
             val idleStartedAt = SystemClock.elapsedRealtime()
             scenario.moveToState(Lifecycle.State.CREATED)
             val power = context.getSystemService(Context.POWER_SERVICE) as PowerManager
@@ -191,6 +209,40 @@ class LiveVpnDeviceTest {
             }
         }
     }
+
+    private suspend fun repeatCoreFailureRecovery(client: OkHttpClient, cycles: Int) =
+        kotlinx.coroutines.coroutineScope {
+            repeat(cycles) { index ->
+                val cycle = index + 1
+                val startedAt = SystemClock.elapsedRealtime()
+                // Stop the actual native core, not the service or user intent.
+                // A second recovery demonstrates that health monitoring survives
+                // the first, while the HTTPS checks prove a working data path.
+                val disconnected = async(start = CoroutineStart.UNDISPATCHED) {
+                    withTimeout(60_000L) {
+                        VpnStateRepository.state.first {
+                            it.tunnelState != TunnelState.Connected || !it.tunnelVerified
+                        }
+                    }
+                }
+                val bridge = ReflectionXrayBridge()
+                assertTrue("Could not inject core failure $cycle", bridge.stop().success)
+                assertTrue("Native core did not stop for failure $cycle", !bridge.getState())
+                report("event=core_failure_injected cycle=$cycle")
+                disconnected.await()
+                val reconnected = withTimeout(180_000L) {
+                    VpnStateRepository.state.first {
+                        (it.tunnelState == TunnelState.Connected && it.tunnelVerified) ||
+                            it.tunnelState == TunnelState.Error
+                    }
+                }
+                assertEquals("Core failure $cycle did not recover", TunnelState.Connected, reconnected.tunnelState)
+                client.connectionPool.evictAll()
+                assertResponsiveQuorum(probeHttpsQuorum(client, "core_recovery_$cycle"), "core_recovery_$cycle")
+                report("event=core_recovery_verified cycle=$cycle " +
+                    "elapsed_ms=${SystemClock.elapsedRealtime() - startedAt}")
+            }
+        }
 
     private suspend fun waitForBackgroundIdle(durationMs: Long) {
         // Coroutine timer delays exclude deep sleep on Android. Measure idle
