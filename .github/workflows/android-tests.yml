@@ -28,6 +28,10 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
+      - name: Check Unix Gradle wrapper
+        run: |
+          test -x ./gradlew
+          unzip -t -q gradle/wrapper/gradle-wrapper.jar
       - name: Set up Java
         uses: actions/setup-java@v5
         with:
