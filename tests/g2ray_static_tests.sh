@@ -1643,8 +1643,10 @@ test_docs_cover_panel_waker_setup() {
         || fail 'Worker README does not document stable next-action codes'
     grep_fixed 'history_deferred: true' "$WORKER_README" \
         || fail 'Worker README does not document deferred KV history writes'
-    grep_fixed 'Quota incident state is recorded before the response' "$WORKER_README" \
-        || fail 'Worker README overstates quota incident writes as deferred'
+    grep_fixed 'history and quota-incident work were queued through Cloudflare' "$WORKER_README" \
+        || fail 'Worker README does not document deferred quota-incident work'
+    grep_fixed '`quota_incident_recorded: false` while deferred' "$WORKER_README" \
+        || fail 'Worker README claims deferred quota-incident writes completed'
     grep_fixed 'Do not paste the GitHub token into G2ray' "$WORKER_README" \
         || fail 'Worker README does not mirror the token handling warning'
     grep_fixed 'read -rsp "Wake secret: " WAKE_SECRET' "$README" \
