@@ -177,8 +177,8 @@ stream or long-session stability.
   added to the app or server runtime.
 - `tests/xray_retained_http_check_test.go`: local HTTP/2 fixtures, no Internet.
   Eight Windows non-race tests passed. Windows race compilation failed because its
-  configured C compiler failed. The previous six-fixture hosted Linux race
-  gate passed; the updated eight-fixture gate needs its own source-commit result.
+  configured C compiler failed. The updated eight-fixture hosted Linux race
+  gate passed for source commit `1140505`.
 - `tests/xray_authenticated_transport_check.py`: starts/stops only its own
   temporary client and keeps the existing default fresh-request check. The
   retained helper and single-transport choice are explicitly opt-in. Origin,
@@ -233,7 +233,24 @@ The unchanged final local static suite passed after that correction. The
 passed, including the Linux Go race gate, pinned-core rejection/upload-expiry
 fixtures, shell/Worker regressions, ShellCheck, and Worker packaging. Its old
 profile matrix is superseded by the coverage correction above; the new
-harness and pair-contract tests require their own source-commit CI result.
+harness has its own verified result:
+
+- [Static CI for source commit 1140505](https://github.com/z2roozsh/G2rayXCodeLeafy/actions/runs/38451621014)
+  passed 66 static, 196 behavior, and 65 Worker checks, mock benchmark budgets,
+  all eight Go race fixtures, 13 authenticated-diagnostic and seven pair-contract
+  Python tests, real pinned-core rejection/upload-expiry checks, all 12 corrected
+  configuration cases, and both generated owned-origin transports. ShellCheck
+  and Worker packaging also passed.
+- [Android CI for source commit 1140505](https://github.com/z2roozsh/G2rayXCodeLeafy/actions/runs/38451621092)
+  passed unit/lint checks, instrumentation compilation, native build contracts,
+  and Linux HEV payload, EOF, and restart fixtures. It did not install an APK,
+  run device instrumentation, or certify video playback.
+
+The live checkout was rechecked at `d217843`, with Xray 26.7.28 running and
+origin `tcpFastOpen: true` still in its active config. The isolated TFO-off
+acceptance must not be described as a deployed live fix. No owned diagnostic
+core remained after the completed runs; the original server and supervisor
+continued running.
 
 No new phone installation or acceptance test was performed: the user chose to
 continue without device tests. The earlier installed-device record remains
