@@ -4373,21 +4373,30 @@ url_encode_query_value() {
 }
 
 xhttp_extra_json_valid() {
-    local value="${1:-}"
+    local value="${1:-}" parser=""
     [[ -n "$value" ]] || return 1
     if command -v jq >/dev/null 2>&1; then
-        printf '%s' "$value" | jq -e 'type == "object"' >/dev/null 2>&1
+        printf '%s' "$value" | jq -se 'length == 1 and (.[0] | type == "object")
+          and all(.. | numbers; (isnan or isinfinite) | not)' >/dev/null 2>&1
         return $?
     fi
     if command -v python3 >/dev/null 2>&1; then
-        printf '%s' "$value" | python3 -c 'import json,sys; data=json.load(sys.stdin); sys.exit(0 if isinstance(data, dict) else 1)' >/dev/null 2>&1
-        return $?
+        parser=python3
+    elif command -v python >/dev/null 2>&1; then
+        parser=python
     fi
-    if command -v python >/dev/null 2>&1; then
-        printf '%s' "$value" | python -c 'import json,sys; data=json.load(sys.stdin); sys.exit(0 if isinstance(data, dict) else 1)' >/dev/null 2>&1
-        return $?
-    fi
-    return 1
+    [[ -n "$parser" ]] || return 1
+    printf '%s' "$value" | "$parser" -c 'import json,math,sys
+def finite(value):
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, dict):
+        return all(finite(item) for item in value.values())
+    if isinstance(value, list):
+        return all(finite(item) for item in value)
+    return True
+data=json.load(sys.stdin)
+sys.exit(0 if isinstance(data, dict) and finite(data) else 1)' >/dev/null 2>&1
 }
 
 generate_link_for_address() {

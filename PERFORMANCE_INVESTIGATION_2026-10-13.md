@@ -258,6 +258,81 @@ continue without device tests. The earlier installed-device record remains
 APK has SHA-256 `7f615992089948b08417c061ee0f7491a027844fcbfccda18a2db307a8dcdf72`;
 it is not the previously installed artifact.
 
+## Claim Review: Readiness Audit of d217843
+
+The submitted 68/100 assessment reviews `d217843`, not the source at
+`5ae7612` used as the baseline of this follow-up. Its score and the earlier
+79/100 score use different subjective rubrics; neither is a network measurement
+or proof of superiority over another client. The external evidence ZIP was
+not supplied here, so its private test logs are not independently certified.
+
+| Claim | Assessment and action |
+| --- | --- |
+| Invalid ports, blank dial hosts, and malformed FinalMask are accepted | Confirmed against the current parser. Six new regression/positive-boundary tests produced four failures before the fix. Port validation now requires 1-65535, blank hosts fail before resolution, and both FinalMask and XHTTP extra use the existing strict Moshi reader to require one complete JSON object. |
+| Idle failures and incomplete media/device acceptance remain blockers | Valid. The historical phone failures remain recorded, and Issue #1 stays open. Source fixes, fresh quorum success, and connection replacement are not proof that retained application flows work. |
+| The idle root cause has not been isolated | Outdated at the configuration/path level: the origin-only on/off/on comparison and independent curl reproduction above isolated a TFO-sensitive failure without Android or the public edge. The exact kernel/middlebox mechanism and physical-phone cure are still unproven. |
+| 325/331 Android and 193 behavior checks describe the current source | Snapshot-specific, not current. This follow-up ran 341 Android tests in 30 suites and 197 server behavior checks. The earlier profile/WS harness also did not establish its ten labeled cases; the corrected 12-case result above supersedes it. |
+| Short transfers cannot prove instant video, loaded latency, or commercial parity | Valid. No new sustained media, competing-client, handoff, unplugged Doze, or battery dataset was produced in this follow-up. |
+| UDP/443 and IPv4-preferring DNS restrict coverage | Valid source-visible policies, not proof that all UDP or IPv6 traffic is unsupported. They remain explicit acceptance boundaries; no blanket IPv6 block or speculative DNS default change was made. |
+| Packet-up 60,000-byte/10-ms tuning implies about 48 Mbit/s | Correct only as a nominal per-upload-session scheduling budget before overhead. It is not measured capacity, an aggregate limit, or a download cap. No posting-rate change was made without loaded-latency and sustained-upload evidence. |
+| Network-scoped metrics, bootstrap fallback, aggregate admission, and KV consistency need follow-up | Valid design boundaries, not newly reproduced failures. Their individual scope and safe next tests are listed below; they were not converted into untested defaults. |
+
+The changed Android source is
+`g2ray_app/app/src/main/java/com/g2ray/client/parser/VlessUriParser.kt:25`
+(strict object helper) and `:138` (dial-host/port validation). Tests are in
+`g2ray_app/app/src/test/java/com/g2ray/client/parser/VlessUriParserTest.kt`.
+Valid boundary ports, encoded strings, and existing XHTTP normalization remain
+covered. FinalMask syntax validity is not native-core schema compatibility.
+No native payload, dependency, endpoint, account, or transport default changed.
+
+A related server/client contract defect was also reproduced: the server's
+old `jq -e 'type == "object"'` accepted multiple JSON documents when the final
+document was an object, while the Android parser rejected them. The Python
+fallback rejected multiple documents but accepted nonfinite numeric constants.
+`g2ray.sh:4375` now requires exactly one object with finite numeric values in
+both parser paths. The added behavior regression failed before the fix and
+now checks both real parsers, malformed/trailing input, numeric overflow,
+valid nested values, and preservation of the built-in tuning fallback.
+The jq predicates used are supported by the
+[jq 1.6 manual](https://jqlang.org/manual/v1.6/); a newer jq is not required.
+
+Focused follow-up boundaries:
+
+- `StoredG2RayProfile.kt:3` persists delay/throughput samples without a physical
+  network-generation key. Network transitions refresh session state but do not
+  add provenance to old stored measurements. A future change should retain
+  historical values separately from eligible current-network scores, with
+  handoff/migration regressions before it affects selection.
+- `SocketProtector.kt:115` chooses the first preferred IPv4 bootstrap answer.
+  Test a blackholed first answer and bounded alternate resolution/dialing before
+  changing startup ownership, cancellation, or standby behavior.
+- The pinned XHTTP handler has per-session queues but not a global pre-auth
+  pending-session/request/byte budget. Define compatible rejection and cleanup
+  semantics, then run controlled overload fixtures. It is not a client JSON
+  tuning setting, and changing the native core requires renewed build contracts.
+- Optional Worker KV history/counters are best effort, as already documented.
+  [Cloudflare documents eventual consistency and no atomic read-modify-write
+  transactions](https://developers.cloudflare.com/kv/concepts/how-kv-works/).
+  Strict locking/accounting would need a deliberate coordination design;
+  no claim of strict consistency was added.
+- GitHub's documented [12-hour maximum active Codespace lifetime](https://docs.github.com/en/codespaces/about-codespaces/understanding-the-codespace-lifecycle)
+  remains a hosting limit even during active use. Wake/restart cannot preserve
+  existing remote TCP sessions. It is not a defect that a new keepalive fixes.
+
+Local follow-up verification completed:
+
+- Android: 341 tests, 30 suites, zero failures/errors/skips; lint zero errors
+  and 26 warnings; instrumentation compiled; HEV/libXray build contracts passed.
+- Server: 197 behavior checks and 66 static checks; all four relevant Bash
+  files checked individually with `bash -n`; `git diff --check` passed.
+- All six deterministic mock benchmark budgets passed. These are script
+  execution checks, not network throughput measurements.
+
+Hosted workflow results must be checked for the exact pushed revision. This
+follow-up did not package/install a new APK, run phone instrumentation, restart
+the live Codespace, or deploy a Worker. The earlier TFO-off rollout remains
+pending approval; local parser success does not clear the idle-flow gate.
+
 ## Still Required
 
 1. Roll out the verified origin setting with an approved controlled restart,

@@ -22,6 +22,20 @@ object VlessUriParser {
         return value?.trim()?.lowercase() in setOf("1", "true", "yes", "on", "enabled")
     }
 
+    private fun parseJsonObject(input: String, errorMessage: String): JSONObject {
+        try {
+            // JSONObject alone accepts lenient syntax and trailing data.
+            JsonReader.of(Buffer().writeUtf8(input)).use { reader ->
+                require(reader.peek() == JsonReader.Token.BEGIN_OBJECT)
+                reader.skipValue()
+                require(reader.peek() == JsonReader.Token.END_DOCUMENT)
+            }
+            return JSONObject(input)
+        } catch (_: Exception) {
+            throw IllegalArgumentException(errorMessage)
+        }
+    }
+
     private fun padBase64(value: String): String {
         val remainder = value.length % 4
         return if (remainder == 0) value else value + "=".repeat(4 - remainder)
@@ -121,8 +135,10 @@ object VlessUriParser {
             val uuid = parsed.userInfo ?: return Result.failure(IllegalArgumentException("Missing UUID"))
             require(uuidRegex.matches(uuid)) { "Invalid UUID" }
 
-            val host = parsed.host ?: return Result.failure(IllegalArgumentException("Missing host"))
-            val port = parsed.port.takeIf { it > 0 } ?: return Result.failure(IllegalArgumentException("Missing or invalid port"))
+            val host = parsed.host?.takeIf { it.isNotBlank() }
+                ?: return Result.failure(IllegalArgumentException("Missing host"))
+            val port = parsed.port.takeIf { it in 1..65535 }
+                ?: return Result.failure(IllegalArgumentException("Missing or invalid port"))
 
             val security = parsed.getQueryParameter("security")?.lowercase() ?: ""
             val type = parsed.getQueryParameter("type")?.lowercase() ?: ""
@@ -167,24 +183,12 @@ object VlessUriParser {
             val xhttpExtraJson = extra?.trim()?.takeIf { it.isNotEmpty() }?.let {
                 require(transport == Transport.XHTTP) { "XHTTP extra requires type=xhttp" }
                 require(it.length <= MAX_XHTTP_EXTRA_CHARS) { "XHTTP extra JSON is too large" }
-                try {
-                    // JSONObject alone accepts non-JSON syntax and trailing data.
-                    JsonReader.of(Buffer().writeUtf8(it)).use { reader ->
-                        require(reader.peek() == JsonReader.Token.BEGIN_OBJECT)
-                        reader.skipValue()
-                        require(reader.peek() == JsonReader.Token.END_DOCUMENT)
-                    }
-                    JSONObject(it).toString()
-                } catch (_: Exception) {
-                    throw IllegalArgumentException("Invalid XHTTP extra JSON object")
-                }
+                parseJsonObject(it, "Invalid XHTTP extra JSON object").toString()
             }
 
             finalMaskJson?.let {
                 require(it.length <= MAX_FINAL_MASK_CHARS) { "FinalMask JSON is too large" }
-                runCatching { JSONObject(it) }.getOrElse {
-                    throw IllegalArgumentException("Invalid FinalMask JSON")
-                }
+                parseJsonObject(it, "Invalid FinalMask JSON")
             }
             cipherSuites?.let {
                 require(it.length <= MAX_CIPHER_SUITES_CHARS) { "Cipher suites value is too large" }

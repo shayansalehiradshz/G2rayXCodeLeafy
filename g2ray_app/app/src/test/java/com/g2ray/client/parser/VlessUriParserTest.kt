@@ -15,6 +15,59 @@ import org.robolectric.RobolectricTestRunner
 class VlessUriParserTest {
 
     @Test
+    fun parse_rejectsPortsOutsideTcpRange() {
+        listOf("0", "-1", "65536", "2147483647", "", "not-a-port").forEach { port ->
+            val uri = "vless://00000000-0000-0000-0000-000000000000@example.com:$port?encryption=none&security=tls&sni=example.com&type=ws&host=example.com&path=%2F"
+            assertTrue("Must reject endpoint port '$port'", VlessUriParser.parse(uri).isFailure)
+        }
+    }
+
+    @Test
+    fun parse_preservesValidBoundaryPorts() {
+        listOf(1, 443, 65535).forEach { port ->
+            val uri = "vless://00000000-0000-0000-0000-000000000000@example.com:$port?encryption=none&security=tls&sni=example.com&type=ws&host=example.com&path=%2F"
+            assertEquals(port, VlessUriParser.parse(uri).getOrThrow().port)
+        }
+    }
+
+    @Test
+    fun parse_rejectsEmptyEndpointHost() {
+        val uri = "vless://00000000-0000-0000-0000-000000000000@:443?encryption=none&security=tls&sni=example.com&type=ws&host=example.com&path=%2F"
+        val result = VlessUriParser.parse(uri)
+        assertTrue("An empty dial endpoint must fail before DNS or core startup", result.isFailure)
+        assertEquals("Missing host", result.exceptionOrNull()?.message)
+    }
+
+    @Test
+    fun parse_finalMaskRejectsNonJsonAndTrailingData() {
+        listOf("{} trailing", "{}{}", "{'tcp':[]}", "{tcp:[]}", "{\"tcp\":}", "/* comment */ {}",
+            "{\"tcp\":NaN}", "{\"tcp\":Infinity}", "[]", "null").forEach { mask ->
+            val uri = "vless://00000000-0000-0000-0000-000000000000@example.com:443?encryption=none&security=tls&sni=example.com&type=xhttp&host=example.com&path=%2F&mode=packet-up&alpn=h2&fm=${Uri.encode(mask)}"
+            val result = VlessUriParser.parse(uri)
+            assertTrue("Must reject FinalMask '$mask'", result.isFailure)
+            assertEquals("Invalid FinalMask JSON", result.exceptionOrNull()?.message)
+        }
+    }
+
+    @Test
+    fun parse_finalMaskPreservesValidObjectAndEncodedStrings() {
+        val mask = " \n{\"tcp\":[],\"note\":\"brace } and quote \\\" and encoded % text\"}\n "
+        val uri = "vless://00000000-0000-0000-0000-000000000000@example.com:443?encryption=none&security=tls&sni=example.com&type=xhttp&host=example.com&path=%2F&mode=packet-up&alpn=h2&fm=${Uri.encode(mask)}"
+        assertEquals(mask.trim(), VlessUriParser.parse(uri).getOrThrow().finalMaskJson)
+    }
+
+    @Test
+    fun parseAllProfiles_invalidEndpointCannotBecomeAnImportedProfile() {
+        val valid = "vless://00000000-0000-0000-0000-000000000000@example.com:443?encryption=none&security=tls&sni=example.com&type=ws&host=example.com&path=%2F"
+        val invalid = valid.replace(":443?", ":65536?")
+        val results = VlessUriParser.parseAllProfiles("$invalid\n$valid")
+        assertEquals(2, results.size)
+        assertTrue(results[0].isFailure)
+        assertEquals(443, results[1].getOrThrow().port)
+        assertEquals(443, VlessUriParser.parseFirstProfile("$invalid\n$valid").getOrThrow().port)
+    }
+
+    @Test
     fun parse_validVlessUri_success() {
         val uri = "vless://00000000-0000-0000-0000-000000000000@example.com:443?encryption=none&security=tls&sni=example.com&type=ws&host=example.com&path=%2F#test"
         val result = VlessUriParser.parse(uri)
@@ -108,7 +161,8 @@ class VlessUriParserTest {
 
     @Test
     fun parse_xhttpExtra_rejectsMalformedNonObjectAndTrailingJson() {
-        listOf("not-json", "[]", "null", "{\"xmux\":}", "{} trailing", "{}{}", "{'xmux':{}}")
+        listOf("not-json", "[]", "null", "{\"xmux\":}", "{} trailing", "{}{}", "{'xmux':{}}",
+            "{\"xmux\":{\"maxConnections\":NaN}}", "{\"values\":[Infinity,-Infinity]}")
             .forEach { extra ->
                 val result = VlessUriParser.parse(xhttpUri(extra))
                 assertTrue("Must reject $extra", result.isFailure)

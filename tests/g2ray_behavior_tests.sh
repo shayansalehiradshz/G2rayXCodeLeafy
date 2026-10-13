@@ -2848,6 +2848,47 @@ test_xhttp_mode_reports_export_failure() {
     pass "XHTTP mode reports failed exports while preserving the saved preference"
 }
 
+test_xhttp_extra_requires_one_complete_object() {
+    (
+        reset_runtime_paths
+        local value link
+        local -a invalid=('{}{}' '{} {}' 'null {}' '[] {}' '{} trailing' '[]' 'null' ''
+                        '{"xmux":{"maxConnections":NaN}}' '{"values":[Infinity,-Infinity]}' '{"value":1e400}')
+        local -a valid=('{}' ' {"xmux":{"maxConnections":3},"note":"brace } and encoded % text"} '
+                      '{"values":[null,true,1,0.25,1e3],"note":"NaN Infinity"}')
+        for value in "${invalid[@]}"; do
+            if xhttp_extra_json_valid "$value"; then
+                fail 'custom XHTTP extra accepted incomplete, non-object, or multiple JSON documents'
+            fi
+        done
+        for value in "${valid[@]}"; do
+            xhttp_extra_json_valid "$value" || fail 'valid single-object XHTTP extra was rejected'
+        done
+        (
+            command() {
+                if [[ "${1:-}" == -v && "${2:-}" == jq ]]; then return 1; fi
+                builtin command "$@"
+            }
+            for value in "${invalid[@]}"; do
+                if xhttp_extra_json_valid "$value"; then fail 'Python fallback accepted invalid XHTTP JSON'; fi
+            done
+            for value in "${valid[@]}"; do
+                xhttp_extra_json_valid "$value" || fail 'Python fallback rejected valid XHTTP JSON'
+            done
+        )
+        write_test_vless_config
+        G2RAY_XHTTP_EXTRA_JSON='{}{}'
+        G2RAY_XHTTP_LINK_TUNING=off
+        link=$(generate_link_for_address 20.0.0.1)
+        [[ "$link" != *'&extra='* ]] || fail 'invalid multi-document extra escaped into an untuned link'
+        G2RAY_XHTTP_LINK_TUNING=on
+        link=$(generate_link_for_address 20.0.0.1)
+        [[ "$link" == *"extra=$(url_encode_query_value "$XHTTP_TUNED_EXTRA_JSON")"* ]] \
+            || fail 'invalid custom extra did not preserve the valid built-in tuning fallback'
+        pass 'custom XHTTP extra requires one complete object and preserves valid tuning fallbacks'
+    )
+}
+
 test_custom_xhttp_extra_json_is_validated() {
     reset_runtime_paths
     G2RAY_XHTTP_LINK_TUNING=off
@@ -4792,6 +4833,7 @@ test_runtime_diagnostics_report_deployed_versions_and_policy() {
     pass "runtime diagnostics distinguish installed core, image pin, configured policy, and kernel state"
 }
 
+test_xhttp_extra_requires_one_complete_object
 test_deadline_includes_exit_cleanup
 test_deadline_preserves_status_without_a_status_write
 test_degraded_probe_keeps_healthy_baseline_at_threshold
