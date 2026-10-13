@@ -10,6 +10,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Dns
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.ConnectionPool
 import okhttp3.logging.HttpLoggingInterceptor
@@ -39,7 +40,8 @@ enum class WorkerRoutePhase {
 data class WorkerRouteProgress(
     val phase: WorkerRoutePhase,
     val message: String,
-    val attempt: Int
+    val attempt: Int,
+    val retryAfterMs: Long? = null
 )
 
 sealed interface WorkerRouteOutcome {
@@ -57,7 +59,7 @@ sealed interface WorkerRouteOutcome {
         val retryAfterMs: Long? = null
     ) : WorkerRouteOutcome
 
-    data class TimedOut(val message: String) : WorkerRouteOutcome
+    data class TimedOut(val message: String, val retryAfterMs: Long? = null) : WorkerRouteOutcome
 }
 
 object WorkerUrlNormalizer {
@@ -73,17 +75,21 @@ object WorkerUrlNormalizer {
             urlString = "https://$urlString"
         }
 
-        val uri = URI(urlString)
-        require(uri.scheme.equals("https", ignoreCase = true) && !uri.authority.isNullOrBlank()) {
-            "Worker URL must contain a valid HTTPS hostname"
+        val uri = runCatching { URI(urlString) }.getOrElse {
+            throw IllegalArgumentException("Worker URL is not a valid HTTPS URL.")
         }
+        require(uri.rawUserInfo == null) { "Worker URL must not include credentials. Use the wake-key field." }
+        // Validate with Retrofit's URL parser without echoing pasted secrets.
+        val parsedUrl = urlString.toHttpUrlOrNull()
+            ?: throw IllegalArgumentException("Worker URL needs a valid hostname and port (1-65535).")
         val path = uri.path?.removeSuffix("/") ?: ""
         val validPaths = setOf("", "/", "/wake", "/api/wake", "/health", "/api/health")
         require(path in validPaths) {
-            "Invalid Worker URL: unexpected path ${uri.path}. Paste only the Worker domain or /wake URL."
+            "Worker URL has an unsupported path. Paste only the Worker domain or /wake URL."
         }
 
-        val baseUrl = "${uri.scheme}://${uri.authority}"
+        val baseUrl = parsedUrl.newBuilder().encodedPath("/").query(null).fragment(null)
+            .build().toString().removeSuffix("/")
         return when (endpoint) {
             WorkerRouteEndpoint.WAKE -> "$baseUrl/wake"
             WorkerRouteEndpoint.HEALTH -> "$baseUrl/api/health"
@@ -227,8 +233,7 @@ class WorkerRouteCoordinator(
     private data class WorkerCall(
         val response: Response<WorkerWakeResponse>,
         val errorBody: WorkerWakeResponse?,
-        val workerBaseUrl: String,
-        val previousRetryDeadlineMs: Long? = null
+        val workerBaseUrl: String
     )
 
     private val errorAdapter = Moshi.Builder()
@@ -259,6 +264,7 @@ class WorkerRouteCoordinator(
         var endpoint = WorkerRouteEndpoint.WAKE
         var attempts = 0
         val startedAt = nowMs()
+        val retryCooldown = WakeRetryCooldown(nowMs)
 
         while (attempts < maxAttempts && nowMs() - startedAt < maxWaitMs) {
             attempts++
@@ -276,12 +282,20 @@ class WorkerRouteCoordinator(
 
             val call = try {
                 withTimeoutOrNull((maxWaitMs - (nowMs() - startedAt)).coerceAtLeast(1L)) {
-                    callWithFailover(orderedBases, endpoint, secret, codespaceId)
-                } ?: return WorkerRouteOutcome.TimedOut("Worker recovery deadline exceeded.")
+                    callWithFailover(orderedBases, endpoint, secret, codespaceId, retryCooldown) { retryAfterMs ->
+                        onProgress(WorkerRouteProgress(
+                            phase = if (endpoint == WorkerRouteEndpoint.WAKE) WorkerRoutePhase.WAKING else WorkerRoutePhase.SETTLING,
+                            message = "Worker requested a retry delay. Checking recovery options...",
+                            attempt = attempts,
+                            retryAfterMs = retryAfterMs
+                        ))
+                    }
+                } ?: return WorkerRouteOutcome.TimedOut("Worker recovery deadline exceeded.", retryCooldown.remainingMs())
             } catch (error: IOException) {
                 return WorkerRouteOutcome.Failed(
                     message = error.localizedMessage ?: "All configured Worker endpoints are unreachable.",
-                    controlPlaneUnavailable = true
+                    controlPlaneUnavailable = true,
+                    retryAfterMs = retryCooldown.remainingMs()
                 )
             }
             orderedBases = listOf(call.workerBaseUrl) + orderedBases.filterNot { it == call.workerBaseUrl }
@@ -324,12 +338,13 @@ class WorkerRouteCoordinator(
                 }
                 return WorkerRouteOutcome.Failed(
                     body?.next_action ?: body?.message ?: "Worker returned an unknown route state.",
-                    response = body
+                    response = body,
+                    retryAfterMs = retryCooldown.remainingMs()
                 )
             }
 
-            if (response.code() == 429 && body?.reason == "wake_recently_succeeded") {
-                val waitSeconds = (body.poll_after_seconds ?: 2).coerceIn(1, 5)
+            if (isSuccessfulWakeSuppression(response, body)) {
+                val waitSeconds = (body?.poll_after_seconds ?: 2).coerceIn(1, 5)
                 sleep(minOf(waitSeconds * 1000L, (maxWaitMs - (nowMs() - startedAt)).coerceAtLeast(0L)))
                 endpoint = WorkerRouteEndpoint.HEALTH
                 continue
@@ -355,21 +370,21 @@ class WorkerRouteCoordinator(
                 httpCode = response.code(),
                 response = body,
                 retryAllowed = retryAllowed,
-                retryAfterMs = if (retryAllowed) {
-                    listOfNotNull(
-                        failureRetryAfterMs(response, body),
-                        call.previousRetryDeadlineMs?.let { (it - nowMs()).coerceAtLeast(0L) }
-                    ).maxOrNull()
-                } else null
+                retryAfterMs = if (retryAllowed) retryCooldown.remainingMs() else null
             )
         }
 
-        return WorkerRouteOutcome.TimedOut("Codespace route did not become ready within ${maxWaitMs / 1000}s.")
+        return WorkerRouteOutcome.TimedOut(
+            "Codespace route did not become ready within ${maxWaitMs / 1000}s.", retryCooldown.remainingMs()
+        )
     }
 
     private fun isRateLimited(response: Response<WorkerWakeResponse>, body: WorkerWakeResponse?): Boolean =
         response.code() == 429 ||
             (response.code() == 403 && body?.reason in setOf("github_rate_limited", "github_secondary_rate_limited"))
+
+    private fun isSuccessfulWakeSuppression(response: Response<WorkerWakeResponse>, body: WorkerWakeResponse?): Boolean =
+        response.code() == 429 && body?.reason == "wake_recently_succeeded"
 
     private fun failureRetryAfterMs(response: Response<WorkerWakeResponse>, body: WorkerWakeResponse?): Long? {
         val retryAfterSeconds = listOfNotNull(
@@ -388,11 +403,12 @@ class WorkerRouteCoordinator(
         baseUrls: List<String>,
         endpoint: WorkerRouteEndpoint,
         secret: String,
-        codespaceId: String?
+        codespaceId: String?,
+        retryCooldown: WakeRetryCooldown,
+        onRetryAfter: (Long) -> Unit
     ): WorkerCall {
         var lastIoError: IOException? = null
         var lastRetryableCall: WorkerCall? = null
-        var previousRetryDeadlineMs: Long? = null
         baseUrls.forEachIndexed { index, baseUrl ->
             val url = WorkerUrlNormalizer.normalize(baseUrl, endpoint)
             val response = try {
@@ -405,17 +421,24 @@ class WorkerRouteCoordinator(
                 lastIoError = error
                 return@forEachIndexed
             }
-            val call = WorkerCall(response, parseErrorBody(response), baseUrl, previousRetryDeadlineMs)
+            val call = WorkerCall(response, parseErrorBody(response), baseUrl)
+            // A completed wake limits another start, not health polling or
+            // local route repair. Only a real failure imposes a global wait.
+            if (!response.isSuccessful && !isSuccessfulWakeSuppression(response, call.errorBody) &&
+                !permanentWakeFailure(call.errorBody) &&
+                (isRateLimited(response, call.errorBody) || wakeHttpFailureRetryAllowed(response.code()))
+            ) {
+                failureRetryAfterMs(response, call.errorBody)?.let {
+                    retryCooldown.record(it)
+                    // Publish before contacting another alias: an enclosing
+                    // wake/service deadline may cancel that next request.
+                    retryCooldown.remainingMs()?.let(onRetryAfter)
+                }
+            }
             val canTryFallback = index + 1 < baseUrls.size &&
                 response.code() in 500..599
             if (canTryFallback) {
-                // A working backup can bypass an unavailable endpoint, but
-                // another failure must not erase its cooldown or restart it.
-                val retryDeadlineMs = failureRetryAfterMs(response, call.errorBody)?.let { waitMs ->
-                    nowMs().coerceIn(0L, Long.MAX_VALUE - waitMs) + waitMs
-                }
-                previousRetryDeadlineMs = listOfNotNull(previousRetryDeadlineMs, retryDeadlineMs).maxOrNull()
-                lastRetryableCall = call.copy(previousRetryDeadlineMs = previousRetryDeadlineMs)
+                lastRetryableCall = call
                 return@forEachIndexed
             }
             return call

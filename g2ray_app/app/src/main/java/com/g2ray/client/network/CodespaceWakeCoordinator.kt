@@ -17,7 +17,8 @@ data class CodespaceWakeProgress(
     val backend: WakeControlBackend,
     val phase: CodespaceWakePhase,
     val message: String,
-    val attempt: Int
+    val attempt: Int,
+    val retryAfterMs: Long? = null
 )
 
 data class CodespaceWakeRequest(
@@ -56,7 +57,8 @@ sealed interface CodespaceWakeOutcome {
 
     data class TimedOut(
         val message: String,
-        val backend: WakeControlBackend
+        val backend: WakeControlBackend,
+        val retryAfterMs: Long? = null
     ) : CodespaceWakeOutcome
 }
 
@@ -105,7 +107,8 @@ class CodespaceWakeCoordinator internal constructor(
     private val githubWake: suspend (
         GitHubWakeInvocation,
         (GitHubCodespaceProgress) -> Unit
-    ) -> GitHubCodespaceOutcome
+    ) -> GitHubCodespaceOutcome,
+    private val nowMs: () -> Long = { android.os.SystemClock.elapsedRealtime() }
 ) {
     constructor(
         workerCoordinator: WorkerRouteCoordinator,
@@ -139,17 +142,19 @@ class CodespaceWakeCoordinator internal constructor(
         var activeBackend = WakeBackendSelector.order(
             request.mode, request.workerConfigured, request.githubDirectConfigured
         ).firstOrNull() ?: WakeControlBackend.WORKER
+        val retryCooldown = WakeRetryCooldown(nowMs)
         return withTimeoutOrNull(maxWaitMs.coerceAtLeast(1L)) {
-            ensureReadyWithinDeadline(request, maxWaitMs) { progress ->
+            ensureReadyWithinDeadline(request, maxWaitMs, retryCooldown) { progress ->
                 activeBackend = progress.backend
                 onProgress(progress)
             }
-        } ?: CodespaceWakeOutcome.TimedOut("Codespace wake deadline exceeded.", activeBackend)
+        } ?: CodespaceWakeOutcome.TimedOut("Codespace wake deadline exceeded.", activeBackend, retryCooldown.remainingMs())
     }
 
     private suspend fun ensureReadyWithinDeadline(
         request: CodespaceWakeRequest,
         maxWaitMs: Long,
+        retryCooldown: WakeRetryCooldown,
         onProgress: (CodespaceWakeProgress) -> Unit
     ): CodespaceWakeOutcome {
         val order = WakeBackendSelector.order(
@@ -161,7 +166,6 @@ class CodespaceWakeCoordinator internal constructor(
             return CodespaceWakeOutcome.Failed(missingConfigurationMessage(request.mode), retryAllowed = false)
         }
 
-        var fallbackRetryAfterMs: Long? = null
         for (backend in order) {
             when (backend) {
                 WakeControlBackend.WORKER -> {
@@ -174,6 +178,7 @@ class CodespaceWakeCoordinator internal constructor(
                             expectedCodespaceName = request.githubCodespaceName.takeIf { it.isNotBlank() }
                         )
                     ) { progress ->
+                        retryCooldown.record(progress.retryAfterMs)
                         onProgress(
                             CodespaceWakeProgress(
                                 backend = backend,
@@ -183,7 +188,8 @@ class CodespaceWakeCoordinator internal constructor(
                                     CodespaceWakePhase.SETTLING
                                 },
                                 message = progress.message,
-                                attempt = progress.attempt
+                                attempt = progress.attempt,
+                                retryAfterMs = progress.retryAfterMs?.let { retryCooldown.remainingMs() }
                             )
                         )
                     }
@@ -193,22 +199,27 @@ class CodespaceWakeCoordinator internal constructor(
                             routeReady = true,
                             workerResponse = outcome.response
                         )
-                        is WorkerRouteOutcome.TimedOut -> return CodespaceWakeOutcome.TimedOut(
-                            message = outcome.message,
-                            backend = backend
-                        )
+                        is WorkerRouteOutcome.TimedOut -> {
+                            retryCooldown.record(outcome.retryAfterMs)
+                            return CodespaceWakeOutcome.TimedOut(
+                                message = outcome.message,
+                                backend = backend,
+                                retryAfterMs = retryCooldown.remainingMs()
+                            )
+                        }
                         is WorkerRouteOutcome.Failed -> {
+                            if (outcome.retryAllowed) retryCooldown.record(outcome.retryAfterMs)
                             val directFallbackAvailable = request.mode == CodespaceWakeMode.AUTO &&
                                 request.githubDirectConfigured &&
                                 outcome.controlPlaneUnavailable
                             if (directFallbackAvailable) {
-                                fallbackRetryAfterMs = listOfNotNull(fallbackRetryAfterMs, outcome.retryAfterMs).maxOrNull()
                                 onProgress(
                                     CodespaceWakeProgress(
                                         backend = WakeControlBackend.GITHUB_DIRECT,
                                         phase = CodespaceWakePhase.WAKING,
                                         message = "Worker is unreachable. Falling back to GitHub directly...",
-                                        attempt = 0
+                                        attempt = 0,
+                                        retryAfterMs = retryCooldown.remainingMs()
                                     )
                                 )
                                 continue
@@ -220,7 +231,7 @@ class CodespaceWakeCoordinator internal constructor(
                                 httpCode = outcome.httpCode,
                                 workerResponse = outcome.response,
                                 retryAllowed = outcome.retryAllowed,
-                                retryAfterMs = outcome.retryAfterMs
+                                retryAfterMs = if (outcome.retryAllowed) retryCooldown.remainingMs() else null
                             )
                         }
                     }
@@ -254,17 +265,21 @@ class CodespaceWakeCoordinator internal constructor(
                         )
                         is GitHubCodespaceOutcome.TimedOut -> CodespaceWakeOutcome.TimedOut(
                             message = outcome.message,
-                            backend = backend
-                        )
-                        is GitHubCodespaceOutcome.Failed -> CodespaceWakeOutcome.Failed(
-                            message = outcome.message,
                             backend = backend,
-                            controlPlaneUnavailable = outcome.controlPlaneUnavailable,
-                            httpCode = outcome.httpCode,
-                            githubResponse = outcome.response,
-                            retryAllowed = outcome.retryAllowed,
-                            retryAfterMs = listOfNotNull(fallbackRetryAfterMs, outcome.retryAfterMs).maxOrNull()
+                            retryAfterMs = retryCooldown.remainingMs()
                         )
+                        is GitHubCodespaceOutcome.Failed -> {
+                            if (outcome.retryAllowed) retryCooldown.record(outcome.retryAfterMs)
+                            CodespaceWakeOutcome.Failed(
+                                message = outcome.message,
+                                backend = backend,
+                                controlPlaneUnavailable = outcome.controlPlaneUnavailable,
+                                httpCode = outcome.httpCode,
+                                githubResponse = outcome.response,
+                                retryAllowed = outcome.retryAllowed,
+                                retryAfterMs = if (outcome.retryAllowed) retryCooldown.remainingMs() else null
+                            )
+                        }
                     }
                 }
             }

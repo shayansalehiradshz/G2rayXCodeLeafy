@@ -1,9 +1,45 @@
 package com.g2ray.client.network
 
+import kotlinx.coroutines.delay
+
 internal const val MAX_WAKE_RETRY_DELAY_MS = 24 * 60 * 60 * 1000L
 
 internal fun wakeHttpFailureRetryAllowed(httpCode: Int?): Boolean =
     httpCode !in setOf(400, 401, 402, 403, 404, 405, 410, 415, 422)
+
+/** Keep a retry boundary across fallbacks and deadline cancellation. */
+internal class WakeRetryCooldown(private val nowMs: () -> Long) {
+    private var deadlineMs: Long? = null
+
+    fun record(retryAfterMs: Long?) {
+        val delayMs = retryAfterMs?.takeIf { it >= 0L }
+            ?.coerceAtMost(MAX_WAKE_RETRY_DELAY_MS) ?: return
+        val now = nowMs().coerceAtLeast(0L)
+        val candidate = now.coerceAtMost(Long.MAX_VALUE - delayMs) + delayMs
+        deadlineMs = maxOf(deadlineMs ?: 0L, candidate)
+    }
+
+    fun remainingMs(): Long? = deadlineMs?.let {
+        (it - nowMs().coerceAtLeast(0L)).coerceIn(0L, MAX_WAKE_RETRY_DELAY_MS)
+    }
+}
+
+/** Coroutine timers pause in deep sleep; recheck Android's elapsed clock. */
+internal suspend fun awaitWakeRetryDelay(
+    delayMs: Long,
+    nowMs: () -> Long,
+    sleep: suspend (Long) -> Unit = { delay(it) }
+) {
+    val durationMs = delayMs.coerceAtLeast(0L)
+    val deadlineMs = nowMs().coerceIn(0L, Long.MAX_VALUE - durationMs) + durationMs
+    while (true) {
+        val remainingMs = deadlineMs - nowMs().coerceAtLeast(0L)
+        if (remainingMs <= 0L) return
+        // These timers do not wake the CPU. A resumed device checks its
+        // remaining cooldown within a second instead of restarting the wait.
+        sleep(minOf(remainingMs, 1_000L))
+    }
+}
 
 /** GitHub specifies seconds for Retry-After and UTC epoch seconds for reset. */
 internal fun rateLimitRetryAfterMs(

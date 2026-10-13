@@ -47,8 +47,10 @@ import com.g2ray.client.network.GitHubNetwork
 import com.g2ray.client.network.MAX_WAKE_RETRY_DELAY_MS
 import com.g2ray.client.network.WakeBackendSelector
 import com.g2ray.client.network.WakeControlBackend
+import com.g2ray.client.network.WakeRetryCooldown
 import com.g2ray.client.network.WorkerNetwork
 import com.g2ray.client.network.WorkerRouteCoordinator
+import com.g2ray.client.network.awaitWakeRetryDelay
 import com.g2ray.client.parser.VlessUriParser
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
@@ -2031,16 +2033,23 @@ class G2RayVpnService : VpnService() {
         lifecycleToken: Long,
         initialError: String,
         initialFailureScope: RouteFailureScope = RouteFailureScope.Unknown
-    ): RunningRouteResult = withTimeoutOrNull(WORKER_ROUTE_RECOVERY_TIMEOUT_MS) {
-        recoverRouteWithinDeadline(profile, tun, lifecycleToken, initialError, initialFailureScope)
-    } ?: RunningRouteResult(false, "Tunnel recovery deadline reached; automatic retry remains enabled")
+    ): RunningRouteResult {
+        val retryCooldown = WakeRetryCooldown(SystemClock::elapsedRealtime)
+        return withTimeoutOrNull(WORKER_ROUTE_RECOVERY_TIMEOUT_MS) {
+            recoverRouteWithinDeadline(profile, tun, lifecycleToken, initialError, initialFailureScope, retryCooldown)
+        } ?: RunningRouteResult(
+            false, "Tunnel recovery deadline reached; automatic retry remains enabled",
+            retryAfterMs = retryCooldown.remainingMs()
+        )
+    }
 
     private suspend fun recoverRouteWithinDeadline(
         profile: G2RayProfile,
         tun: ParcelFileDescriptor,
         lifecycleToken: Long,
         initialError: String,
-        initialFailureScope: RouteFailureScope = RouteFailureScope.Unknown
+        initialFailureScope: RouteFailureScope,
+        retryCooldown: WakeRetryCooldown
     ): RunningRouteResult {
         var recoveryError = initialError
         while (isTunnelCurrent(lifecycleToken, tun)) {
@@ -2053,7 +2062,8 @@ class G2RayVpnService : VpnService() {
                 tun = tun,
                 lifecycleToken = lifecycleToken,
                 initialError = recoveryError,
-                initialFailureScope = initialFailureScope
+                initialFailureScope = initialFailureScope,
+                retryCooldown = retryCooldown
             )
             if (route.success || !route.retryAllowed || route.retryAfterMs != null) return route
             if (
@@ -2075,7 +2085,8 @@ class G2RayVpnService : VpnService() {
         tun: ParcelFileDescriptor,
         lifecycleToken: Long,
         initialError: String,
-        initialFailureScope: RouteFailureScope
+        initialFailureScope: RouteFailureScope,
+        retryCooldown: WakeRetryCooldown
     ): RunningRouteResult {
         var lastError = initialError
         if (initialFailureScope == RouteFailureScope.PacketEngine && activeEngine == ActiveVpnEngine.Hev) {
@@ -2118,6 +2129,7 @@ class G2RayVpnService : VpnService() {
             request = wake.request,
             maxWaitMs = WORKER_ROUTE_RECOVERY_TIMEOUT_MS
         ) { progress ->
+            retryCooldown.record(progress.retryAfterMs)
             markTunnelUnverified(progress.message)
         }
         when (outcome) {
@@ -2141,22 +2153,28 @@ class G2RayVpnService : VpnService() {
                 }
             }
             is CodespaceWakeOutcome.Failed -> {
+                if (outcome.retryAllowed) retryCooldown.record(outcome.retryAfterMs)
                 if (outcome.controlPlaneUnavailable) {
                     val alternative = tryAlternativeStoredProfiles(profile, tun, lifecycleToken)
                         ?: RunningRouteResult(false, outcome.message)
                     return if (alternative.success) alternative else alternative.copy(
                         retryAllowed = alternative.retryAllowed && outcome.retryAllowed,
-                        retryAfterMs = listOfNotNull(alternative.retryAfterMs, outcome.retryAfterMs).maxOrNull()
+                        retryAfterMs = listOfNotNull(alternative.retryAfterMs, retryCooldown.remainingMs()).maxOrNull()
                     )
                 }
                 return RunningRouteResult(
                     false, outcome.message,
-                    retryAllowed = outcome.retryAllowed, retryAfterMs = outcome.retryAfterMs
+                    retryAllowed = outcome.retryAllowed,
+                    retryAfterMs = if (outcome.retryAllowed) retryCooldown.remainingMs() else null
                 )
             }
             is CodespaceWakeOutcome.TimedOut -> {
-                return tryAlternativeStoredProfiles(profile, tun, lifecycleToken)
+                retryCooldown.record(outcome.retryAfterMs)
+                val alternative = tryAlternativeStoredProfiles(profile, tun, lifecycleToken)
                     ?: RunningRouteResult(false, outcome.message)
+                return if (alternative.success) alternative else alternative.copy(
+                    retryAfterMs = listOfNotNull(alternative.retryAfterMs, retryCooldown.remainingMs()).maxOrNull()
+                )
             }
         }
 
@@ -2238,7 +2256,7 @@ class G2RayVpnService : VpnService() {
                                 markTunnelVerified("VPN reconnected and route verified")
                             } else if (!route.retryAllowed) {
                                 failAndStop(route.error ?: "VPN needs configuration changes")
-                            } else if (waitingForUnderlyingNetwork) {
+                            } else if (waitingForUnderlyingNetwork && route.retryAfterMs == null) {
                                 markTunnelUnverified("No underlying network. Waiting to reconnect...")
                             } else {
                                 schedulePersistentReconnect(route.error ?: "Tunnel recovery failed", route.retryAfterMs)
@@ -2277,7 +2295,9 @@ class G2RayVpnService : VpnService() {
                 val retryDelay = reconnectDelayMs(attempt, retryWaitMs)
                 attempt = (attempt + 1).coerceAtMost(4)
                 markTunnelUnverified("$retryReason Retrying automatically in ${(retryDelay + 999L) / 1000L}s...")
-                delay(retryDelay + Random.nextLong(0L, backoff / 5L + 1L))
+                awaitWakeRetryDelay(
+                    retryDelay + Random.nextLong(0L, backoff / 5L + 1L), SystemClock::elapsedRealtime
+                )
                 if (!desiredConnected || !isTunnelCurrent(token, tun)) break
                 lifecycleOperationMutex.withLock {
                     val profile = activeProfile ?: return@withLock

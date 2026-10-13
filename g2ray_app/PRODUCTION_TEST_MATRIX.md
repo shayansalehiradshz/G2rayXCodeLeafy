@@ -194,6 +194,17 @@ Do not advertise always-on/lockdown as production-tested until every case passes
   missing dashboard token binding, or deleted host state. The app must show a
   configuration/service error rather than an endless automatic retry. Repeat
   while the underlying network disappears or changes.
+- Return a long retry hint, then let a Worker alias or direct fallback fail or
+  hang. The remaining wait must consume elapsed time and survive every enclosing
+  deadline; it must not restart from the original response. Explicit Stop must
+  cancel the wait and any in-flight fallback. Repeat after sleep and network loss.
+- Return `wake_recently_succeeded` with a long start-suppression delay. Health
+  polling and local route recovery must remain possible; this is not a global
+  API-rate cooldown. Repeat with a real GitHub rate-limit response to verify
+  that its mandatory delay is still honored.
+- Reject malformed Worker authorities and credentials in a URL before network
+  access. Canonicalize equivalent host/scheme/default-port spellings. A bad
+  primary must not discard an explicitly configured valid backup.
 
 ## Pinned server core acceptance
 

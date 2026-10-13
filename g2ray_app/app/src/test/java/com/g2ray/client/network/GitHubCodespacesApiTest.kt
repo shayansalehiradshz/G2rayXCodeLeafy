@@ -52,7 +52,8 @@ class GitHubCodespacesApiTest {
         val api = FakeGitHubApi(ArrayDeque(listOf(error(403, "You have exceeded a secondary rate limit"))))
         val coordinator = CodespaceWakeCoordinator(
             workerWake = { _, _ -> error("Worker must not be used in direct mode") },
-            githubWake = { _, _ -> GitHubCodespaceCoordinator(api, nowMs = { 0L }).ensureAvailable("demo", "token") }
+            githubWake = { _, _ -> GitHubCodespaceCoordinator(api, nowMs = { 0L }).ensureAvailable("demo", "token") },
+            nowMs = { 0L }
         )
         val outcome = coordinator.ensureReady(CodespaceWakeRequest(
             CodespaceWakeMode.GITHUB_DIRECT, "demo", githubToken = "token"

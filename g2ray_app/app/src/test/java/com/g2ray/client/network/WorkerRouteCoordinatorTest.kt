@@ -1,6 +1,8 @@
 package com.g2ray.client.network
 
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.launch
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.Assert.assertEquals
@@ -10,6 +12,274 @@ import retrofit2.Response
 import java.io.IOException
 
 class WorkerRouteCoordinatorTest {
+    @Test
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    fun successfulWakeSuppressionDoesNotBecomeAGlobalRecoveryCooldown() = runTest {
+        val api = FakeWorkerApiService(
+            wakeHandler = {
+                workerError(429, """{"reason":"wake_recently_succeeded","retry_after_seconds":180}""",
+                    mapOf("Retry-After" to "180"))
+            },
+            healthHandler = {
+                Response.success(WorkerWakeResponse(ok = true, route_ready = false, poll_after_seconds = 2))
+            }
+        )
+        val hints = mutableListOf<Long>()
+        val result = WorkerRouteCoordinator(api, nowMs = { testScheduler.currentTime }).ensureRouteReady(
+            listOf("worker.example"), "secret", maxWaitMs = 2_500L,
+            onProgress = { it.retryAfterMs?.let(hints::add) }
+        ) as WorkerRouteOutcome.TimedOut
+        assertEquals(null, result.retryAfterMs)
+        assertTrue(hints.isEmpty())
+        assertEquals(listOf("https://worker.example/wake", "https://worker.example/api/health"), api.calls)
+        assertEquals(2_500L, testScheduler.currentTime)
+    }
+
+    @Test
+    fun malformedWorkerUrlsDoNotEchoPastedCredentials() {
+        for (url in listOf(
+            "https://user:private-token@worker.example:65536/wake",
+            "https://user:private-token@worker.example/%ZZ",
+            "https://worker.example/private-token"
+        )) {
+            val error = runCatching { WorkerUrlNormalizer.baseUrl(url) }.exceptionOrNull()
+            assertTrue(error is IllegalArgumentException)
+            assertEquals(false, error?.message?.contains("private-token"))
+        }
+    }
+
+    @Test
+    fun invalidPrimaryDoesNotDiscardAValidCanonicalBackup() = runTest {
+        val api = FakeWorkerApiService(wakeHandler = {
+            Response.success(WorkerWakeResponse(ok = true, route_ready = true))
+        })
+        val result = WorkerRouteCoordinator(api, nowMs = { 0L }).ensureRouteReady(
+            listOf("https://worker.example:65536", "HTTPS://BACKUP.example:443/wake"), "secret"
+        ) as WorkerRouteOutcome.Ready
+        assertEquals("https://backup.example", result.workerBaseUrl)
+        assertEquals(listOf("https://backup.example/wake"), api.calls)
+    }
+
+    @Test
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    fun callerCancellationStillStopsTheBackupWithoutReturningATimeout() = runTest {
+        var cancelled = false
+        var returned = false
+        val api = FakeWorkerApiService(wakeHandler = { url ->
+            if (url.contains("primary.example")) {
+                workerError(503, """{"error":"temporary"}""", mapOf("Retry-After" to "600"))
+            } else {
+                try {
+                    kotlinx.coroutines.awaitCancellation()
+                } finally {
+                    cancelled = true
+                }
+            }
+        })
+        val job = launch {
+            WorkerRouteCoordinator(api, nowMs = { testScheduler.currentTime }).ensureRouteReady(
+                listOf("primary.example", "backup.example"), "secret"
+            )
+            returned = true
+        }
+        testScheduler.runCurrent()
+        job.cancelAndJoin()
+        assertTrue(cancelled)
+        assertEquals(false, returned)
+        assertEquals(2, api.calls.size)
+    }
+
+    @Test
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    fun successfulDirectFallbackDoesNotWaitForTheUnavailableWorker() = runTest {
+        val coordinator = CodespaceWakeCoordinator(
+            workerWake = { _, _ -> WorkerRouteOutcome.Failed(
+                "Worker unavailable", controlPlaneUnavailable = true, httpCode = 503, retryAfterMs = 180_000L
+            ) },
+            githubWake = { _, _ -> GitHubCodespaceOutcome.Ready(GitHubCodespaceResponse(state = "Available")) },
+            nowMs = { testScheduler.currentTime }
+        )
+        val result = coordinator.ensureReady(CodespaceWakeRequest(
+            com.g2ray.client.model.CodespaceWakeMode.AUTO, "demo",
+            workerBaseUrls = listOf("worker.example"), workerSecret = "secret", githubToken = "token"
+        )) as CodespaceWakeOutcome.Ready
+        assertEquals(WakeControlBackend.GITHUB_DIRECT, result.backend)
+        assertEquals(0L, testScheduler.currentTime)
+    }
+
+    @Test
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    fun aReturnedDirectTimeoutRetainsTheRemainingWorkerCooldown() = runTest {
+        val coordinator = CodespaceWakeCoordinator(
+            workerWake = { _, _ -> WorkerRouteOutcome.Failed(
+                "Worker unavailable", controlPlaneUnavailable = true, httpCode = 503, retryAfterMs = 180_000L
+            ) },
+            githubWake = { _, _ ->
+                kotlinx.coroutines.delay(60_000L)
+                GitHubCodespaceOutcome.TimedOut("GitHub deadline exceeded")
+            },
+            nowMs = { testScheduler.currentTime }
+        )
+        val result = coordinator.ensureReady(CodespaceWakeRequest(
+            com.g2ray.client.model.CodespaceWakeMode.AUTO, "demo",
+            workerBaseUrls = listOf("worker.example"), workerSecret = "secret", githubToken = "token"
+        ), maxWaitMs = 300_000L) as CodespaceWakeOutcome.TimedOut
+        assertEquals(120_000L, result.retryAfterMs)
+        assertEquals(WakeControlBackend.GITHUB_DIRECT, result.backend)
+    }
+
+    @Test
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    fun workerDeadlinePreservesTheReportedCooldownAndCancelsTheHungAlias() = runTest {
+        var cancelled = false
+        val api = FakeWorkerApiService(wakeHandler = { url ->
+            if (url.contains("primary.example")) {
+                workerError(503, """{"error":"temporary"}""", mapOf("Retry-After" to "600"))
+            } else {
+                try {
+                    kotlinx.coroutines.awaitCancellation()
+                } finally {
+                    cancelled = true
+                }
+            }
+        })
+        val result = WorkerRouteCoordinator(api, nowMs = { testScheduler.currentTime }).ensureRouteReady(
+            listOf("primary.example", "backup.example"), "secret", maxWaitMs = 500L
+        ) as WorkerRouteOutcome.TimedOut
+        assertEquals(599_500L, result.retryAfterMs)
+        assertEquals(500L, testScheduler.currentTime)
+        assertTrue(cancelled)
+        assertEquals(2, api.calls.size)
+    }
+
+    @Test
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    fun sharedWakeDeadlineKeepsTheWorkerCooldownEvenBeforeAnOutcomeReturns() = runTest {
+        var cancelled = false
+        val api = FakeWorkerApiService(wakeHandler = { url ->
+            if (url.contains("primary.example")) {
+                workerError(503, """{"error":"temporary"}""", mapOf("Retry-After" to "600"))
+            } else {
+                try {
+                    kotlinx.coroutines.awaitCancellation()
+                } finally {
+                    cancelled = true
+                }
+            }
+        })
+        val coordinator = CodespaceWakeCoordinator(
+            workerWake = { request, progress ->
+                WorkerRouteCoordinator(api, nowMs = { testScheduler.currentTime }).ensureRouteReady(
+                    request.workerBaseUrls, request.secret, maxWaitMs = request.maxWaitMs, onProgress = progress
+                )
+            },
+            githubWake = { _, _ -> error("Worker mode must not use direct GitHub") },
+            nowMs = { testScheduler.currentTime }
+        )
+        val result = coordinator.ensureReady(CodespaceWakeRequest(
+            com.g2ray.client.model.CodespaceWakeMode.WORKER, "demo",
+            workerBaseUrls = listOf("primary.example", "backup.example"), workerSecret = "secret"
+        ), maxWaitMs = 500L) as CodespaceWakeOutcome.TimedOut
+        assertEquals(599_500L, result.retryAfterMs)
+        assertEquals(WakeControlBackend.WORKER, result.backend)
+        assertTrue(cancelled)
+        assertEquals(2, api.calls.size)
+    }
+
+    @Test
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    fun failedDirectFallbackConsumesTheWorkerCooldown() = runTest {
+        val coordinator = CodespaceWakeCoordinator(
+            workerWake = { _, _ -> WorkerRouteOutcome.Failed(
+                "Worker unavailable", controlPlaneUnavailable = true, httpCode = 503, retryAfterMs = 180_000L
+            ) },
+            githubWake = { _, _ ->
+                kotlinx.coroutines.delay(60_000L)
+                GitHubCodespaceOutcome.Failed("GitHub unavailable", controlPlaneUnavailable = true)
+            },
+            nowMs = { testScheduler.currentTime }
+        )
+        val result = coordinator.ensureReady(CodespaceWakeRequest(
+            com.g2ray.client.model.CodespaceWakeMode.AUTO, "demo",
+            workerBaseUrls = listOf("worker.example"), workerSecret = "secret", githubToken = "token"
+        ), maxWaitMs = 300_000L) as CodespaceWakeOutcome.Failed
+        assertEquals(120_000L, result.retryAfterMs)
+        assertTrue(result.retryAllowed)
+        assertEquals(WakeControlBackend.GITHUB_DIRECT, result.backend)
+    }
+
+    @Test
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    fun sharedWakeDeadlinePreservesCooldownWhenDirectFallbackHangs() = runTest {
+        var cancelled = false
+        val coordinator = CodespaceWakeCoordinator(
+            workerWake = { _, _ -> WorkerRouteOutcome.Failed(
+                "Worker unavailable", controlPlaneUnavailable = true, httpCode = 503, retryAfterMs = 180_000L
+            ) },
+            githubWake = { _, _ ->
+                try {
+                    kotlinx.coroutines.awaitCancellation()
+                } finally {
+                    cancelled = true
+                }
+            },
+            nowMs = { testScheduler.currentTime }
+        )
+        val result = coordinator.ensureReady(CodespaceWakeRequest(
+            com.g2ray.client.model.CodespaceWakeMode.AUTO, "demo",
+            workerBaseUrls = listOf("worker.example"), workerSecret = "secret", githubToken = "token"
+        ), maxWaitMs = 500L) as CodespaceWakeOutcome.TimedOut
+        assertEquals(179_500L, result.retryAfterMs)
+        assertEquals(WakeControlBackend.GITHUB_DIRECT, result.backend)
+        assertTrue(cancelled)
+    }
+
+    @Test
+    fun invalidWorkerAuthorityIsATerminalConfigurationResult() = runTest {
+        val api = WorkerNetwork.createApiService(loggingEnabled = false)
+        for (url in listOf("https://worker.example:65536", "https://worker.example:0", "https://:443")) {
+            val result = WorkerRouteCoordinator(api, nowMs = { 0L })
+                .ensureRouteReady(listOf(url), "secret") as WorkerRouteOutcome.Failed
+            assertEquals(false, result.retryAllowed)
+        }
+    }
+
+    @Test
+    fun workerAliasesCanonicalizeHostSchemeAndDefaultPort() {
+        assertEquals("https://worker.example", WorkerUrlNormalizer.baseUrl("HTTPS://WORKER.example:443/wake"))
+        assertEquals("https://worker.example:8443", WorkerUrlNormalizer.baseUrl("https://WORKER.example:8443/api/health"))
+        assertEquals("https://[2001:db8::1]:8443", WorkerUrlNormalizer.baseUrl("https://[2001:db8::1]:8443/wake"))
+    }
+
+    @Test
+    fun workerUrlDoesNotAcceptCredentialsInItsAuthority() {
+        for (url in listOf("https://user:password@worker.example/wake", "https://@worker.example")) {
+            val error = runCatching { WorkerUrlNormalizer.baseUrl(url) }.exceptionOrNull()
+            assertTrue(error is IllegalArgumentException)
+        }
+    }
+
+    @Test
+    fun slowUnreachableAliasesConsumeRatherThanRestartTheOriginalCooldown() = runTest {
+        for ((elapsed, expectedRemaining) in listOf(60_000L to 120_000L, 190_000L to 0L)) {
+            var elapsedMs = 0L
+            val api = FakeWorkerApiService(wakeHandler = { url ->
+                if (url.contains("primary.example")) {
+                    workerError(503, """{"error":"temporary"}""", mapOf("Retry-After" to "180"))
+                } else {
+                    elapsedMs = elapsed
+                    throw IOException("backup connection timed out")
+                }
+            })
+            val result = WorkerRouteCoordinator(api, nowMs = { elapsedMs }).ensureRouteReady(
+                listOf("primary.example", "backup.example", "last.example"), "secret", maxWaitMs = 300_000L
+            ) as WorkerRouteOutcome.Failed
+            assertTrue(result.retryAllowed)
+            assertEquals(expectedRemaining, result.retryAfterMs)
+            assertEquals(3, api.calls.size)
+        }
+    }
+
     @Test
     fun failedWorkerAliasesPreserveTheLaterRetryBoundary() = runTest {
         for ((backupHint, networkFailure, expectedMs) in listOf(
@@ -77,7 +347,8 @@ class WorkerRouteCoordinatorTest {
             workerWake = { _, _ -> WorkerRouteOutcome.Failed(
                 "Worker unavailable", controlPlaneUnavailable = true, httpCode = 503, retryAfterMs = 180_000L
             ) },
-            githubWake = { _, _ -> GitHubCodespaceOutcome.Failed("GitHub unavailable", controlPlaneUnavailable = true) }
+            githubWake = { _, _ -> GitHubCodespaceOutcome.Failed("GitHub unavailable", controlPlaneUnavailable = true) },
+            nowMs = { 0L }
         )
         val result = coordinator.ensureReady(CodespaceWakeRequest(
             com.g2ray.client.model.CodespaceWakeMode.AUTO, "demo",
@@ -205,7 +476,8 @@ class WorkerRouteCoordinatorTest {
         val coordinator = CodespaceWakeCoordinator(
             workerWake = { _, _ -> WorkerRouteCoordinator(api, nowMs = { 0L })
                 .ensureRouteReady(listOf("worker.example"), "secret") },
-            githubWake = { _, _ -> error("Rate limits must not trigger direct-GitHub bypass") }
+            githubWake = { _, _ -> error("Rate limits must not trigger direct-GitHub bypass") },
+            nowMs = { 0L }
         )
         val result = coordinator.ensureReady(CodespaceWakeRequest(
             com.g2ray.client.model.CodespaceWakeMode.AUTO, "demo",
