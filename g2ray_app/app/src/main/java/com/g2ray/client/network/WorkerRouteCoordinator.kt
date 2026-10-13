@@ -227,7 +227,8 @@ class WorkerRouteCoordinator(
     private data class WorkerCall(
         val response: Response<WorkerWakeResponse>,
         val errorBody: WorkerWakeResponse?,
-        val workerBaseUrl: String
+        val workerBaseUrl: String,
+        val previousRetryDeadlineMs: Long? = null
     )
 
     private val errorAdapter = Moshi.Builder()
@@ -346,30 +347,41 @@ class WorkerRouteCoordinator(
                     else -> "Worker failed with HTTP ${response.code()}."
                 }
             val requestId = response.headers()["x-g2ray-request-id"]?.takeIf { it.isNotBlank() }
-            val retryAfterSeconds = listOfNotNull(
-                response.headers()["Retry-After"]?.trim()?.toLongOrNull()?.takeIf { it >= 0L },
-                body?.retry_after_seconds?.toLong()?.takeIf { it >= 0L }
-            ).maxOrNull()?.toString()
-            val resetEpochSeconds = body?.retry_after_epoch?.takeIf {
-                body.github_rate_limit_remaining == 0
-            }?.toString()
-            val rateLimited = response.code() == 429 ||
-                (response.code() == 403 && body?.reason in setOf("github_rate_limited", "github_secondary_rate_limited"))
             val retryAllowed = !permanentWakeFailure(body) &&
-                (rateLimited || wakeHttpFailureRetryAllowed(response.code()))
+                (isRateLimited(response, body) || wakeHttpFailureRetryAllowed(response.code()))
             return WorkerRouteOutcome.Failed(
                 message = if (requestId == null) message else "$message Request ID: $requestId",
                 controlPlaneUnavailable = response.code() in 500..599,
                 httpCode = response.code(),
                 response = body,
                 retryAllowed = retryAllowed,
-                retryAfterMs = if (retryAllowed && (rateLimited || retryAfterSeconds != null || resetEpochSeconds != null)) {
-                    rateLimitRetryAfterMs(retryAfterSeconds, resetEpochSeconds, nowEpochMs())
+                retryAfterMs = if (retryAllowed) {
+                    listOfNotNull(
+                        failureRetryAfterMs(response, body),
+                        call.previousRetryDeadlineMs?.let { (it - nowMs()).coerceAtLeast(0L) }
+                    ).maxOrNull()
                 } else null
             )
         }
 
         return WorkerRouteOutcome.TimedOut("Codespace route did not become ready within ${maxWaitMs / 1000}s.")
+    }
+
+    private fun isRateLimited(response: Response<WorkerWakeResponse>, body: WorkerWakeResponse?): Boolean =
+        response.code() == 429 ||
+            (response.code() == 403 && body?.reason in setOf("github_rate_limited", "github_secondary_rate_limited"))
+
+    private fun failureRetryAfterMs(response: Response<WorkerWakeResponse>, body: WorkerWakeResponse?): Long? {
+        val retryAfterSeconds = listOfNotNull(
+            response.headers()["Retry-After"]?.trim()?.toLongOrNull()?.takeIf { it >= 0L },
+            body?.retry_after_seconds?.toLong()?.takeIf { it >= 0L }
+        ).maxOrNull()?.toString()
+        val resetEpochSeconds = body?.retry_after_epoch?.takeIf {
+            body.github_rate_limit_remaining == 0
+        }?.toString()
+        return if (isRateLimited(response, body) || retryAfterSeconds != null || resetEpochSeconds != null) {
+            rateLimitRetryAfterMs(retryAfterSeconds, resetEpochSeconds, nowEpochMs())
+        } else null
     }
 
     private suspend fun callWithFailover(
@@ -380,6 +392,7 @@ class WorkerRouteCoordinator(
     ): WorkerCall {
         var lastIoError: IOException? = null
         var lastRetryableCall: WorkerCall? = null
+        var previousRetryDeadlineMs: Long? = null
         baseUrls.forEachIndexed { index, baseUrl ->
             val url = WorkerUrlNormalizer.normalize(baseUrl, endpoint)
             val response = try {
@@ -392,11 +405,17 @@ class WorkerRouteCoordinator(
                 lastIoError = error
                 return@forEachIndexed
             }
-            val call = WorkerCall(response, parseErrorBody(response), baseUrl)
+            val call = WorkerCall(response, parseErrorBody(response), baseUrl, previousRetryDeadlineMs)
             val canTryFallback = index + 1 < baseUrls.size &&
                 response.code() in 500..599
             if (canTryFallback) {
-                lastRetryableCall = call
+                // A working backup can bypass an unavailable endpoint, but
+                // another failure must not erase its cooldown or restart it.
+                val retryDeadlineMs = failureRetryAfterMs(response, call.errorBody)?.let { waitMs ->
+                    nowMs().coerceIn(0L, Long.MAX_VALUE - waitMs) + waitMs
+                }
+                previousRetryDeadlineMs = listOfNotNull(previousRetryDeadlineMs, retryDeadlineMs).maxOrNull()
+                lastRetryableCall = call.copy(previousRetryDeadlineMs = previousRetryDeadlineMs)
                 return@forEachIndexed
             }
             return call

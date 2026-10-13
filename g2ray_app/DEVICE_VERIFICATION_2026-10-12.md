@@ -226,3 +226,21 @@ See [the dated verification report](../AUDIT_VERIFICATION_2026-10-13.md) for
 exact measurements, failed as well as successful runs, audit claim
 dispositions, and the limits of this retest. The earlier no-device-testing
 section describes the earlier pass; it is not the status of this later retest.
+
+## Post-Core-Upgrade Retest: 13 October 2026
+
+The live server was subsequently upgraded from 26.5.9 to the verified 26.7.28
+pin after independently reproducing an upload-queue expiry defect. The current
+Android retry-policy revision was installed in place when the phone was
+reconnected again. Three packaged-core smoke checks passed, and both packet
+engines recovered from two actual core stops with successful HTTPS traffic.
+
+HEV/XHTTP passed both a shorter interactive idle check and a controlled
+five-minute screen-off check. Native/XHTTP still failed the unchanged retained
+HTTP/2 responsiveness gate, with a timeout and a 13-second response while fresh
+requests were fast. A HEV/WS repeat timed out on all three retained connections
+while all fresh requests succeeded. The core queue upgrade is therefore not an
+idle-stall cure.
+Issue #1 stays open. See the
+[production re-audit verification](../PRODUCTION_REAUDIT_VERIFICATION_2026-10-13.md)
+for exact timings, source/phone boundaries, and remaining acceptance work.

@@ -5959,7 +5959,7 @@ create_support_bundle() {
     git_rev=$(git -C "$BASE_DIR" log --oneline -1 2>/dev/null || printf 'unknown')
     xray_ver="unknown"
     if [[ -x "$XRAY_BIN" ]]; then
-        xray_ver=$("$XRAY_BIN" version 2>/dev/null | head -1 || true)
+        xray_ver=$("$XRAY_BIN" version 2>/dev/null | sed -n '1p' || true)
         [[ -n "$xray_ver" ]] || xray_ver="unknown"
     fi
     {

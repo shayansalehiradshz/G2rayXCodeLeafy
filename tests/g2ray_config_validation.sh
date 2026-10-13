@@ -27,7 +27,7 @@ ensure_route_cache_for_export() { return 0; }
 refresh_config_exports() { return 0; }
 xhttp_probe_metrics() { printf '200 1 ready\n'; }
 
-"$XRAY_BIN" version | head -n 1
+"$XRAY_BIN" version | sed -n '1p'
 for profile in balanced low_latency streaming low_overhead max_throughput; do
     for ws in enabled disabled; do
         printf '%s\n' "$profile" > "$PERFORMANCE_PROFILE_FILE"

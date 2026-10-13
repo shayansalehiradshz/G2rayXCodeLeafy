@@ -11,6 +11,67 @@ import java.io.IOException
 
 class WorkerRouteCoordinatorTest {
     @Test
+    fun failedWorkerAliasesPreserveTheLaterRetryBoundary() = runTest {
+        for ((backupHint, networkFailure, expectedMs) in listOf(
+            Triple(null, false, 180_000L),
+            Triple("120", false, 180_000L),
+            Triple("240", false, 240_000L),
+            Triple(null, true, 180_000L)
+        )) {
+            val api = FakeWorkerApiService(wakeHandler = { url ->
+                if (url.contains("primary.example")) {
+                    workerError(503, """{"error":"temporary"}""", mapOf("Retry-After" to "180"))
+                } else {
+                    if (networkFailure) throw IOException("blocked backup")
+                    workerError(503, """{"error":"temporary"}""",
+                        backupHint?.let { mapOf("Retry-After" to it) }.orEmpty())
+                }
+            })
+            val result = WorkerRouteCoordinator(api, nowMs = { 0L }).ensureRouteReady(
+                listOf("primary.example", "backup.example"), "secret"
+            ) as WorkerRouteOutcome.Failed
+            assertTrue(result.retryAllowed)
+            assertEquals(expectedMs, result.retryAfterMs)
+            assertEquals(2, api.calls.size)
+        }
+    }
+
+    @Test
+    fun terminalBackupFailureDoesNotBecomeRetryableBecauseAnotherAliasHadACooldown() = runTest {
+        val api = FakeWorkerApiService(wakeHandler = { url ->
+            if (url.contains("primary.example")) {
+                workerError(503, """{"error":"temporary"}""", mapOf("Retry-After" to "180"))
+            } else {
+                workerError(401, """{"error":"unauthorized"}""", emptyMap())
+            }
+        })
+        val result = WorkerRouteCoordinator(api, nowMs = { 0L }).ensureRouteReady(
+            listOf("primary.example", "backup.example"), "secret"
+        ) as WorkerRouteOutcome.Failed
+        assertEquals(false, result.retryAllowed)
+        assertEquals(null, result.retryAfterMs)
+        assertEquals(2, api.calls.size)
+    }
+
+    @Test
+    fun timeSpentContactingAFailedAliasDoesNotRestartTheEarlierCooldown() = runTest {
+        var elapsedMs = 0L
+        val api = FakeWorkerApiService(wakeHandler = { url ->
+            if (url.contains("primary.example")) {
+                workerError(503, """{"error":"temporary"}""", mapOf("Retry-After" to "180"))
+            } else {
+                elapsedMs = 60_000L
+                workerError(503, """{"error":"temporary"}""", emptyMap())
+            }
+        })
+        val result = WorkerRouteCoordinator(api, nowMs = { elapsedMs }).ensureRouteReady(
+            listOf("primary.example", "backup.example"), "secret"
+        ) as WorkerRouteOutcome.Failed
+        assertEquals(120_000L, result.retryAfterMs)
+        assertEquals(2, api.calls.size)
+    }
+
+    @Test
     fun failedDirectFallbackCannotDiscardTheWorkerRetryBoundary() = runTest {
         val coordinator = CodespaceWakeCoordinator(
             workerWake = { _, _ -> WorkerRouteOutcome.Failed(
@@ -322,11 +383,10 @@ class WorkerRouteCoordinatorTest {
 
     @Test
     fun primaryServerFailureUsesBackupWorker() = runTest {
-        val body = """{"ok":false,"error":"temporary"}"""
-            .toResponseBody("application/json".toMediaType())
         val api = FakeWorkerApiService(wakeHandler = { url ->
-            if (url.contains("primary.example")) Response.error(503, body)
-            else Response.success(WorkerWakeResponse(ok = true, route_ready = true))
+            if (url.contains("primary.example")) {
+                workerError(503, """{"ok":false,"error":"temporary"}""", mapOf("Retry-After" to "180"))
+            } else Response.success(WorkerWakeResponse(ok = true, route_ready = true))
         })
         val coordinator = WorkerRouteCoordinator(api, nowMs = { 0L }, sleep = {})
 
