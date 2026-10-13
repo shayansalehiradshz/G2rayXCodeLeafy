@@ -215,6 +215,14 @@ forced single-outbound proof.
 
 ## Six-hour soak
 
+Before attributing an improvement to adaptive learning, run the
+[network-provenance acceptance](../NETWORK_AWARE_ROUTE_LEARNING_2026-10-14.md).
+Old or different-network measurements must remain historical, not current
+latency/throughput or verified standby evidence. Test both ordinary handoff and
+switch-away-and-back during ping-all; a mixed-path run must not change saved
+health or selection. Confirm callback cleanup and legacy-data preservation.
+These source fixtures do not replace actual physical-network acceptance.
+
 1. Start with the Codespace stopped and press Start VPN once with **Worker** mode and once with **GitHub** mode. Record time until route verification succeeds and confirm both paths use the same selected profile.
 2. Stream 1080p video for 60 minutes.
 3. Leave the phone idle with the screen off for 30 minutes, then browse immediately.

@@ -14,6 +14,17 @@ import org.robolectric.RobolectricTestRunner
 @RunWith(RobolectricTestRunner::class)
 class G2RayVpnServiceTest {
     @Test
+    fun legacyTimestampWithoutNetworkProvenanceCannotVerifyAStandbyRoute() {
+        val legacy = storedProfile("legacy", "203.0.113.2", 80).copy(
+            lastDelayTestedAt = 9_000L,
+            lastDelayNetworkKey = null,
+            lastDelaySuccessfulSamples = 3,
+            lastDelaySampleCount = 3
+        )
+        assertFalse(G2RayVpnService.persistedRouteMeasurementFresh(legacy, 10_000L))
+    }
+
+    @Test
     fun automaticReconnectHonorsServerWaitWithoutRemovingLocalBackoff() {
         assertEquals(180_000L, G2RayVpnService.reconnectDelayMs(0, 180_000L))
         assertEquals(60_000L, G2RayVpnService.reconnectDelayMs(4, 10_000L))
@@ -191,7 +202,9 @@ class G2RayVpnServiceTest {
             isDefault = false,
             createdAt = delayMs,
             updatedAt = delayMs,
-            lastDelayMs = delayMs
+            lastDelayMs = delayMs,
+            lastDelayTestedAt = System.currentTimeMillis(),
+            lastDelayNetworkKey = "test-network"
         )
     }
 
@@ -644,7 +657,8 @@ class G2RayVpnServiceTest {
             profiles = listOf(unstable, stable),
             accountId = "account",
             currentRawUri = "vless://current@20.0.0.9:443",
-            maxCandidates = 2
+            maxCandidates = 2,
+            networkKey = "test-network"
         )
 
         assertEquals(listOf("stable", "unstable"), selected.map { it.id })
@@ -1120,15 +1134,32 @@ class G2RayVpnServiceTest {
         val future = fresh.copy(id = "future", lastDelayTestedAt = 11_000L)
         val failing = fresh.copy(id = "failing", delayFailureCount = 1)
 
-        assertTrue(G2RayVpnService.persistedRouteMeasurementFresh(fresh, now, maxAgeMs = 2_000L))
-        assertFalse(G2RayVpnService.persistedRouteMeasurementFresh(stale, now, maxAgeMs = 2_000L))
-        assertFalse(G2RayVpnService.persistedRouteMeasurementFresh(future, now, maxAgeMs = 2_000L))
-        assertFalse(G2RayVpnService.persistedRouteMeasurementFresh(failing, now, maxAgeMs = 2_000L))
+        assertTrue(G2RayVpnService.persistedRouteMeasurementFresh(fresh, now, maxAgeMs = 2_000L, networkKey = "test-network"))
+        assertFalse(G2RayVpnService.persistedRouteMeasurementFresh(stale, now, maxAgeMs = 2_000L, networkKey = "test-network"))
+        assertFalse(G2RayVpnService.persistedRouteMeasurementFresh(future, now, maxAgeMs = 2_000L, networkKey = "test-network"))
+        assertFalse(G2RayVpnService.persistedRouteMeasurementFresh(failing, now, maxAgeMs = 2_000L, networkKey = "test-network"))
         assertFalse(G2RayVpnService.persistedRouteMeasurementFresh(
-            fresh.copy(lastDelaySuccessfulSamples = 1, lastDelaySampleCount = 3), now
+            fresh.copy(lastDelaySuccessfulSamples = 1, lastDelaySampleCount = 3), now, networkKey = "test-network"
         ))
         assertFalse(G2RayVpnService.persistedRouteMeasurementFresh(
-            fresh.copy(lastDelaySuccessfulSamples = 1, lastDelaySampleCount = 1), now
+            fresh.copy(lastDelaySuccessfulSamples = 1, lastDelaySampleCount = 1), now, networkKey = "test-network"
+        ))
+    }
+
+    @Test
+    fun otherNetworkHistoryCannotQualifyOrOutrankAMeasuredCurrentNetworkRoute() {
+        val now = 10_000L
+        val oldFast = storedProfile("old-fast", "203.0.113.1", 10).copy(lastDelayTestedAt = now, lastDelayNetworkKey = "old-network")
+        val current = storedProfile("current", "203.0.113.2", 200).copy(lastDelayTestedAt = now)
+        val chosen = G2RayVpnService.selectAlternativeProfiles(
+            listOf(oldFast, current), "account", "vless://selected", maxCandidates = 2,
+            networkKey = "test-network", nowMs = now
+        )
+        assertEquals(listOf("current", "old-fast"), chosen.map { it.id })
+        assertEquals(Long.MAX_VALUE, G2RayVpnService.persistedRouteScore(oldFast, "test-network", now))
+        assertEquals(Long.MAX_VALUE, G2RayVpnService.persistedRouteScore(current.copy(lastDelayTestedAt = now + 1L), "test-network", now))
+        assertFalse(G2RayVpnService.persistedRouteMeasurementFresh(
+            oldFast.copy(lastDelaySuccessfulSamples = 3, lastDelaySampleCount = 3), now, networkKey = "test-network"
         ))
     }
 

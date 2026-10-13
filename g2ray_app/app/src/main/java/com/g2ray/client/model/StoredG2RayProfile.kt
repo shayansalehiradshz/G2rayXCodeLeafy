@@ -25,5 +25,7 @@ data class StoredG2RayProfile(
     val lastDownloadBps: Long? = null,
     val lastUploadBps: Long? = null,
     val lastThroughputTestedAt: Long? = null,
-    val lastThroughputError: String? = null
+    val lastThroughputError: String? = null,
+    val lastDelayNetworkKey: String? = null,
+    val lastThroughputNetworkKey: String? = null
 )

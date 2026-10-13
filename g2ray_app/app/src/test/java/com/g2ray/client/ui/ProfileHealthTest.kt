@@ -8,11 +8,18 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ProfileHealthTest {
+    private val networkKey = "network-a"
+    @Test
+    fun legacyTimestampWithoutNetworkProvenanceIsNotCurrentPathEvidence() {
+        val now = 1_000_000L
+        assertFalse(ProfileHealth.isDelayFresh(profile(now, 3, 3).copy(lastDelayNetworkKey = null), now, networkKey))
+    }
+
     @Test
     fun freshFailureDoesNotResurrectStoredSuccessOrAppearStale() {
         val now = 1_000_000L
         val stored = profile(now - 1000, 3, 3)
-        val result = ProfileHealth.displayDelay(stored, ProfileDelayState(error = "timeout", testedAt = now), now)
+        val result = ProfileHealth.displayDelay(stored, ProfileDelayState(error = "timeout", testedAt = now, networkKey = networkKey), now, networkKey)
         assertEquals(null, result.delayMs)
         assertEquals(0, result.sampleCount)
         assertEquals("Unavailable", ProfileHealth.delayLabel(result))
@@ -22,9 +29,9 @@ class ProfileHealthTest {
     fun freshPersistedFailureAppearsUnavailableUntilItActuallyExpires() {
         val now = 1_000_000L
         val stored = profile(now, 0, 1).copy(lastDelayMs = null, lastDelayError = "timeout")
-        assertEquals("Unavailable", ProfileHealth.delayLabel(ProfileHealth.displayDelay(stored, null, now)))
+        assertEquals("Unavailable", ProfileHealth.delayLabel(ProfileHealth.displayDelay(stored, null, now, networkKey)))
         assertEquals("Stale; refresh", ProfileHealth.delayLabel(ProfileHealth.displayDelay(
-            stored, null, now + ProfileHealth.DELAY_FRESHNESS_MS + 1
+            stored, null, now + ProfileHealth.DELAY_FRESHNESS_MS + 1, networkKey
         )))
     }
 
@@ -33,8 +40,8 @@ class ProfileHealthTest {
         val now = 1_000_000L
         val stored = profile(now - 1000, 3, 3).copy(lastDelayError = "old failure")
         val result = ProfileHealth.displayDelay(stored, ProfileDelayState(
-            delayMs = 280, testedAt = now, sampleCount = 1, successfulSamples = 1
-        ), now)
+            delayMs = 280, testedAt = now, sampleCount = 1, successfulSamples = 1, networkKey = networkKey
+        ), now, networkKey)
         assertEquals(null, result.error)
         assertEquals("280 ms (quick)", ProfileHealth.delayLabel(result))
     }
@@ -43,8 +50,8 @@ class ProfileHealthTest {
     fun olderUiSnapshotDoesNotOverrideNewerPersistedMeasurement() {
         val now = 1_000_000L
         val result = ProfileHealth.displayDelay(profile(now, 3, 3), ProfileDelayState(
-            error = "old failure", testedAt = now - 1
-        ), now)
+            error = "old failure", testedAt = now - 1, networkKey = networkKey
+        ), now, networkKey)
         assertEquals(100L, result.delayMs)
         assertEquals(null, result.error)
     }
@@ -74,8 +81,8 @@ class ProfileHealthTest {
         val full = profile(now - 1_000, successfulSamples = 3, sampleCount = 3)
         val provisional = profile(now - 1_000, successfulSamples = 1, sampleCount = 3)
 
-        assertEquals(0, ProfileHealth.rank(full, now))
-        assertEquals(1, ProfileHealth.rank(provisional, now))
+        assertEquals(0, ProfileHealth.rank(full, now, networkKey))
+        assertEquals(1, ProfileHealth.rank(provisional, now, networkKey))
     }
 
     @Test
@@ -83,7 +90,7 @@ class ProfileHealthTest {
         val now = 1_000_000L
         val quick = profile(now - 1_000, successfulSamples = 1, sampleCount = 1)
 
-        assertEquals(1, ProfileHealth.rank(quick, now))
+        assertEquals(1, ProfileHealth.rank(quick, now, networkKey))
     }
 
     @Test
@@ -91,16 +98,17 @@ class ProfileHealthTest {
         val now = 10_000_000L
         val fresh = profile(now, successfulSamples = 3, sampleCount = 3).copy(
             lastDownloadBps = 1_000_000L,
-            lastThroughputTestedAt = now - ProfileHealth.THROUGHPUT_FRESHNESS_MS
+            lastThroughputTestedAt = now - ProfileHealth.THROUGHPUT_FRESHNESS_MS,
+            lastThroughputNetworkKey = networkKey
         )
 
-        assertTrue(ProfileHealth.isThroughputFresh(fresh, now))
+        assertTrue(ProfileHealth.isThroughputFresh(fresh, now, networkKey))
         assertFalse(ProfileHealth.isThroughputFresh(
             fresh.copy(lastThroughputTestedAt = now - ProfileHealth.THROUGHPUT_FRESHNESS_MS - 1L),
-            now
+            now, networkKey
         ))
-        assertFalse(ProfileHealth.isThroughputFresh(fresh.copy(lastThroughputTestedAt = now + 1L), now))
-        assertFalse(ProfileHealth.isThroughputFresh(fresh.copy(lastDownloadBps = null), now))
+        assertFalse(ProfileHealth.isThroughputFresh(fresh.copy(lastThroughputTestedAt = now + 1L), now, networkKey))
+        assertFalse(ProfileHealth.isThroughputFresh(fresh.copy(lastDownloadBps = null), now, networkKey))
     }
 
     @Test
@@ -114,9 +122,9 @@ class ProfileHealthTest {
         val repeatedFailure = oneFailure.copy(delayFailureCount = ProfileHealth.UNAVAILABLE_DELETE_FAILURES)
         val healthy = profile(now, successfulSamples = 3, sampleCount = 3)
 
-        assertFalse(ProfileHealth.isUnavailableForCleanup(oneFailure))
-        assertTrue(ProfileHealth.isUnavailableForCleanup(repeatedFailure))
-        assertFalse(ProfileHealth.isUnavailableForCleanup(healthy))
+        assertFalse(ProfileHealth.isUnavailableForCleanup(oneFailure, now, networkKey))
+        assertTrue(ProfileHealth.isUnavailableForCleanup(repeatedFailure, now, networkKey))
+        assertFalse(ProfileHealth.isUnavailableForCleanup(healthy, now, networkKey))
     }
 
     @Test
@@ -128,7 +136,51 @@ class ProfileHealthTest {
         )
         val unstable = stable.copy(lastDelayP95Ms = 400L, lastDelayJitterMs = 80L)
 
-        assertTrue(ProfileHealth.delaySortValue(stable, now) < ProfileHealth.delaySortValue(unstable, now))
+        assertTrue(ProfileHealth.delaySortValue(stable, now, networkKey) < ProfileHealth.delaySortValue(unstable, now, networkKey))
+    }
+
+    @Test
+    fun anotherNetworksFreshSuccessIsRetainedButNeverRankedOrDisplayedAsCurrent() {
+        val now = 1_000_000L
+        val stored = profile(now, 3, 3)
+        assertTrue(ProfileHealth.isDelayFresh(stored, now, networkKey))
+        assertFalse(ProfileHealth.isDelayFresh(stored, now, "network-b"))
+        assertFalse(ProfileHealth.isDelayFresh(stored, now, null))
+        assertEquals(3, ProfileHealth.rank(stored, now, "network-b"))
+        assertEquals(Long.MAX_VALUE, ProfileHealth.delaySortValue(stored, now, "network-b"))
+        assertEquals("Stale; refresh", ProfileHealth.delayLabel(ProfileHealth.displayDelay(stored, null, now, "network-b")))
+        assertEquals(100L, stored.lastDelayMs)
+    }
+
+    @Test
+    fun historicalFailuresCannotDeleteAConfigOnAnotherNetworkOrAfterExpiry() {
+        val now = 1_000_000L
+        val failure = profile(now, 0, 3).copy(lastDelayMs = null, lastDelayError = "timeout", delayFailureCount = 3)
+        assertTrue(ProfileHealth.isUnavailableForCleanup(failure, now, networkKey))
+        assertFalse(ProfileHealth.isUnavailableForCleanup(failure, now, "network-b"))
+        assertFalse(ProfileHealth.isUnavailableForCleanup(failure, now + ProfileHealth.DELAY_FRESHNESS_MS + 1L, networkKey))
+        assertEquals(3, ProfileHealth.rank(failure, now, "network-b"))
+    }
+
+    @Test
+    fun throughputNeedsItsOwnMatchingNetworkEvenAfterAFreshDelayMeasurement() {
+        val now = 1_000_000L
+        val stored = profile(now, 3, 3).copy(
+            lastDownloadBps = 1_000_000L, lastThroughputTestedAt = now,
+            lastDelayNetworkKey = "network-b", lastThroughputNetworkKey = networkKey
+        )
+        assertTrue(ProfileHealth.isDelayFresh(stored, now, "network-b"))
+        assertFalse(ProfileHealth.isThroughputFresh(stored, now, "network-b"))
+        assertTrue(ProfileHealth.isThroughputFresh(stored, now, networkKey))
+    }
+
+    @Test
+    fun matchingUiResultWinsOverAnotherNetworkRegardlessOfTheOldTimestamp() {
+        val now = 1_000_000L
+        val stored = profile(now, 3, 3)
+        val current = ProfileDelayState(delayMs = 250L, testedAt = now - 1L, networkKey = "network-b")
+        assertEquals(250L, ProfileHealth.displayDelay(stored, current, now, "network-b").delayMs)
+        assertEquals(100L, ProfileHealth.displayDelay(stored, current, now, networkKey).delayMs)
     }
 
     private fun profile(testedAt: Long, successfulSamples: Int, sampleCount: Int) = StoredG2RayProfile(
@@ -148,6 +200,7 @@ class ProfileHealthTest {
         lastDelayMs = 100L,
         lastDelayTestedAt = testedAt,
         lastDelaySuccessfulSamples = successfulSamples,
-        lastDelaySampleCount = sampleCount
+        lastDelaySampleCount = sampleCount,
+        lastDelayNetworkKey = networkKey
     )
 }

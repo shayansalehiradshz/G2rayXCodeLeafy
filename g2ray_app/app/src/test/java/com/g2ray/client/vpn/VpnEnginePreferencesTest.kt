@@ -41,6 +41,27 @@ class VpnEnginePreferencesTest {
         assertEquals(0L, preferences.getLastRouteOptimizationAttemptAt("account-b"))
     }
 
+    @Test
+    fun routeOptimizationCooldownDoesNotCarryAcrossPhysicalNetworks() {
+        val store = InMemoryStore()
+        val preferences = VpnEnginePreferences(store)
+        preferences.setLastRouteOptimizationAttemptAt("account-a", 1234L, "network-a")
+        val reloaded = VpnEnginePreferences(store)
+        assertEquals(1234L, reloaded.getLastRouteOptimizationAttemptAt("account-a", "network-a"))
+        assertEquals(0L, reloaded.getLastRouteOptimizationAttemptAt("account-a", "network-b"))
+        assertEquals(0L, reloaded.getLastRouteOptimizationAttemptAt("account-b", "network-a"))
+        reloaded.setLastRouteOptimizationAttemptAt("account-a", 2345L, "network-b")
+        assertEquals(2345L, reloaded.getLastRouteOptimizationAttemptAt("account-a", "network-b"))
+        assertEquals(0L, reloaded.getLastRouteOptimizationAttemptAt("account-a", "network-a"))
+    }
+
+    @Test
+    fun legacyOptimizationTimestampDoesNotSuppressTheFirstScopedScan() {
+        val preferences = VpnEnginePreferences(InMemoryStore())
+        preferences.setLastRouteOptimizationAttemptAt("account-a", 1234L)
+        assertEquals(0L, preferences.getLastRouteOptimizationAttemptAt("account-a", "network-a"))
+    }
+
     private class InMemoryStore : SecureKeyValueStore {
         private val values = mutableMapOf<String, String>()
 

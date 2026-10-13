@@ -71,6 +71,7 @@ fun HomeScreen(
     val accounts by viewModel.accounts.collectAsState()
     val codespaceProfiles by viewModel.activeCodespaceProfiles.collectAsState()
     val delayStates by viewModel.profileDelayStates.collectAsState()
+    val measurementNetworkKey by viewModel.measurementNetworkKey.collectAsState()
     val controlPlane by viewModel.workerControlPlane.collectAsState()
     val statusMessage by viewModel.statusMessage.collectAsState()
     val isWakingUp by viewModel.isWakingUp.collectAsState()
@@ -89,7 +90,7 @@ fun HomeScreen(
         vpnUiState.tunnelState == TunnelState.Connected ||
         vpnUiState.tunnelState == TunnelState.Stopping
     val unavailableProfiles = codespaceProfiles.filter {
-        ProfileHealth.isUnavailableForCleanup(it) && delayStates[it.id]?.testing != true
+        ProfileHealth.isUnavailableForCleanup(it, networkKey = measurementNetworkKey) && delayStates[it.id]?.testing != true
     }
     val isAnyDelayTesting = codespaceProfiles.any { delayStates[it.id]?.testing == true }
     var pendingDeleteProfileId by remember { mutableStateOf<String?>(null) }
@@ -423,7 +424,7 @@ fun HomeScreen(
                 }
                 codespaceProfiles.forEach { profile ->
                     val state = delayStates[profile.id]
-                    val delayText = ProfileHealth.delayLabel(ProfileHealth.displayDelay(profile, state))
+                    val delayText = ProfileHealth.delayLabel(ProfileHealth.displayDelay(profile, state, networkKey = measurementNetworkKey))
                     Card(
                         modifier = Modifier.fillMaxWidth(),
                         colors = CardDefaults.cardColors(
@@ -448,7 +449,7 @@ fun HomeScreen(
                                     overflow = TextOverflow.Ellipsis
                                 )
                                 profile.lastDownloadBps?.takeIf { it > 0L }?.let { downloadBps ->
-                                    val sampleText = if (ProfileHealth.isThroughputFresh(profile)) {
+                                    val sampleText = if (ProfileHealth.isThroughputFresh(profile, networkKey = measurementNetworkKey)) {
                                         val uploadText = profile.lastUploadBps
                                             ?.takeIf { it > 0L }
                                             ?.let { "  UL ${SpeedFormatter.formatBps(it)}" }

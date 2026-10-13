@@ -8,6 +8,9 @@ import java.net.InetAddress
 import java.net.Socket
 import java.net.UnknownHostException
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 object SocketProtector {
     @Volatile
@@ -15,6 +18,11 @@ object SocketProtector {
 
     @Volatile
     private var underlyingNetwork: Network? = null
+    private val _underlyingNetworks = MutableStateFlow<Network?>(null)
+    val underlyingNetworks = _underlyingNetworks.asStateFlow()
+    private val networkGeneration = AtomicLong()
+
+    fun underlyingNetworkGeneration(): Long = networkGeneration.get()
 
     private val lastDialerFailure = AtomicReference<String?>(null)
 
@@ -54,7 +62,9 @@ object SocketProtector {
     @Synchronized
     fun updateUnderlyingNetwork(network: Network?) {
         val changed = underlyingNetwork != network
+        if (changed) networkGeneration.incrementAndGet()
         underlyingNetwork = network
+        _underlyingNetworks.value = network
         if (changed) {
             ControlPlaneConnectionPools.evictAll()
         }

@@ -526,6 +526,63 @@ class AccountRepositoryTest {
     }
 
     @Test
+    fun measurementNetworkKeysRoundTripAndLegacyHistoryStillLoads() {
+        val store = InMemorySecureStore()
+        val repository = AccountRepository(store)
+        val account = repository.addAccount("History", "https://example.com", null)
+        val parsed = VlessUriParser.parse(
+            "vless://00000000-0000-0000-0000-000000000000@example.com:443?encryption=none&security=tls&sni=example.com&type=ws&host=example.com&path=%2F"
+        ).getOrThrow()
+        val profile = repository.importProfile(account.id, parsed.name, parsed.rawUri, parsed)
+        repository.recordProfileDelay(profile.id, true, 87, null, successfulSamples = 3, sampleCount = 3)
+        val legacy = AccountRepository(store)
+        assertNull(legacy.loadError.value)
+        assertNull(legacy.profiles.value.single().lastDelayNetworkKey)
+        assertEquals(87L, legacy.profiles.value.single().lastDelayMs)
+        repository.recordProfileDelays(listOf(ProfileDelayUpdate(
+            profile.id, true, 90, null, successfulSamples = 3, sampleCount = 3,
+            networkKey = "network-a", downloadBps = 4_000_000L, throughputTestedAt = 123_456L
+        )))
+        val scoped = AccountRepository(store).profiles.value.single()
+        assertEquals("network-a", scoped.lastDelayNetworkKey)
+        assertEquals("network-a", scoped.lastThroughputNetworkKey)
+        assertEquals(4_000_000L, scoped.lastDownloadBps)
+        assertEquals(profile.rawUri, scoped.rawUri)
+        assertEquals(profile.id, AccountRepository(store).activeSelection.value.profileId)
+    }
+
+    @Test
+    fun failureCountsRestartOnANewNetworkWithoutErasingAnotherNetworksTransferHistory() {
+        val store = InMemorySecureStore()
+        val repository = AccountRepository(store)
+        val account = repository.addAccount("Networks", "https://example.com", null)
+        val parsed = VlessUriParser.parse(
+            "vless://00000000-0000-0000-0000-000000000000@example.com:443?encryption=none&security=tls&sni=example.com&type=ws&host=example.com&path=%2F"
+        ).getOrThrow()
+        val profile = repository.importProfile(account.id, parsed.name, parsed.rawUri, parsed)
+        repeat(2) { repository.recordProfileDelay(profile.id, false, null, "timeout", networkKey = "network-a") }
+        assertEquals(2, repository.profiles.value.single().delayFailureCount)
+        repository.recordProfileDelays(listOf(ProfileDelayUpdate(
+            profile.id, true, 90, null, successfulSamples = 1, sampleCount = 3,
+            networkKey = "network-a", downloadBps = 4_000_000L, throughputTestedAt = 123_456L
+        )))
+        assertEquals(2, repository.profiles.value.single().delayFailureCount)
+        repository.recordProfileDelay(profile.id, false, null, "timeout", networkKey = "network-b")
+        val firstFailure = AccountRepository(store).profiles.value.single()
+        assertEquals(1, firstFailure.delayFailureCount)
+        assertEquals("network-b", firstFailure.lastDelayNetworkKey)
+        assertEquals("network-a", firstFailure.lastThroughputNetworkKey)
+        assertEquals(4_000_000L, firstFailure.lastDownloadBps)
+        repository.recordProfileDelay(profile.id, false, null, "timeout", networkKey = "network-b")
+        assertEquals(2, repository.profiles.value.single().delayFailureCount)
+        assertEquals(4_000_000L, repository.profiles.value.single().lastDownloadBps)
+        repository.recordProfileDelay(profile.id, false, null, "timeout", networkKey = "network-a")
+        assertEquals(1, repository.profiles.value.single().delayFailureCount)
+        assertNull(repository.profiles.value.single().lastDownloadBps)
+        assertNull(repository.profiles.value.single().lastThroughputNetworkKey)
+    }
+
+    @Test
     fun bulkProfileDelayResultsPersistInOneAtomicWrite() {
         val store = InMemorySecureStore()
         val repository = AccountRepository(store)

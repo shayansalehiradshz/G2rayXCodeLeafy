@@ -17,6 +17,7 @@ import com.g2ray.client.network.CodespaceWakeRequest
 import com.g2ray.client.network.GitHubCodespaceCoordinator
 import com.g2ray.client.network.GitHubNetwork
 import com.g2ray.client.network.RouteCandidateDiscovery
+import com.g2ray.client.network.RouteMeasurementContext
 import com.g2ray.client.network.WakeBackendSelector
 import com.g2ray.client.network.WakeControlBackend
 import com.g2ray.client.network.WorkerNetwork
@@ -52,7 +53,8 @@ data class ProfileDelayState(
     val successfulSamples: Int = 0,
     val sampleCount: Int = 0,
     val error: String? = null,
-    val testedAt: Long? = null
+    val testedAt: Long? = null,
+    val networkKey: String? = null
 )
 
 private fun failedDelaySummary(message: String): XrayDelaySummary {
@@ -73,7 +75,12 @@ private data class RouteOptimizationProbe(
     val generated: Boolean
 )
 
-class G2RayViewModel(application: Application) : AndroidViewModel(application) {
+class G2RayViewModel internal constructor(
+    application: Application,
+    private val routeProbeManagerFactory: () -> XrayCoreManager,
+    private val vpnEnginePreferences: VpnEnginePreferences
+) : AndroidViewModel(application) {
+    constructor(application: Application) : this(application, { XrayCoreManager() }, VpnEnginePreferences(application))
 
     enum class VpnStartPlan {
         DirectProbeThenWake,
@@ -87,7 +94,9 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     val repository = (application as G2RayApplication).accountRepository
-    private val vpnEnginePreferences = VpnEnginePreferences(application)
+    private val measurementContext = (application as G2RayApplication).routeMeasurementContext
+    val measurementNetworkKey = measurementContext.changes()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
     val accounts: StateFlow<List<G2RayAccount>> = repository.accounts
     val apiKeys: StateFlow<List<G2RayApiKey>> = repository.apiKeys
@@ -104,13 +113,12 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
         profs.find { it.id == sel.profileId && it.accountId == sel.accountId }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
-    val activeCodespaceProfiles: StateFlow<List<StoredG2RayProfile>> = profiles.combine(activeSelection) { profs, sel ->
+    val activeCodespaceProfiles: StateFlow<List<StoredG2RayProfile>> = combine(profiles, activeSelection, measurementNetworkKey) { profs, sel, networkKey ->
         val now = System.currentTimeMillis()
         profs.filter { it.accountId == sel.accountId }
             .sortedWith(
-                compareBy<StoredG2RayProfile> { ProfileHealth.rank(it, now) }
-                    .thenBy { ProfileHealth.delaySortValue(it, now) }
-                    .thenBy { it.delayFailureCount }
+                compareBy<StoredG2RayProfile> { ProfileHealth.rank(it, now, networkKey) }
+                    .thenBy { ProfileHealth.delaySortValue(it, now, networkKey) }
                     .thenByDescending { it.lastDelayTestedAt ?: 0L }
                     .thenBy { it.createdAt }
             )
@@ -248,9 +256,10 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
         internal fun hasOptimizationReadinessEvidence(
             availableWakeAt: Long?,
             profiles: List<StoredG2RayProfile>,
-            now: Long
+            now: Long,
+            networkKey: String? = null
         ): Boolean = availableWakeAt?.let { now - it in 0..OPTIMIZATION_WAKE_FRESHNESS_MS } == true ||
-            profiles.any { ProfileHealth.isDelayFresh(it, now) &&
+            profiles.any { ProfileHealth.isDelayFresh(it, now, networkKey) &&
                 it.lastDelayMs?.let { delay -> delay in 1..9_999 } == true && it.delayFailureCount == 0 }
 
         enum class WorkerEndpoint {
@@ -1503,9 +1512,14 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
             _statusMessage.value = "Stop VPN before changing configs."
             return
         }
+        val measurement = measurementContext.capture()
+        if (measurement == null) {
+            _statusMessage.value = "Connect to the tested network before deleting unavailable configs."
+            return
+        }
         val ids = activeCodespaceProfiles.value
             .filter {
-                ProfileHealth.isUnavailableForCleanup(it) &&
+                ProfileHealth.isUnavailableForCleanup(it, networkKey = measurement.networkKey) &&
                     _profileDelayStates.value[it.id]?.testing != true
             }
             .mapTo(linkedSetOf()) { it.id }
@@ -1515,7 +1529,10 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
         }
         launchConfigurationMutation(
             operation = "delete unavailable configs",
-            mutation = { repository.deleteProfiles(ids) }
+            mutation = {
+                checkMeasurementNetwork(measurement)
+                repository.deleteProfiles(ids)
+            }
         ) { result ->
             if (result.isSuccess) {
                 _profileDelayStates.value = _profileDelayStates.value - ids
@@ -1536,6 +1553,7 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun autoOptimizeRoutesIfNeeded() {
+        val networkKey = measurementContext.currentKey() ?: return
         val selection = repository.activeSelection.value
         val accountId = selection.accountId ?: return
         val account = repository.accounts.value.firstOrNull { it.id == accountId } ?: return
@@ -1548,13 +1566,14 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
             routeOptimizationJob?.isActive == true
         if (!shouldAutoOptimizeRoutes(
                 enabled = autoRouteOptimizationEnabled.value,
-                lastAttemptAt = vpnEnginePreferences.getLastRouteOptimizationAttemptAt(accountId),
+                lastAttemptAt = vpnEnginePreferences.getLastRouteOptimizationAttemptAt(accountId, networkKey),
                 now = now,
                 routeWasReady = VpnStateRepository.state.value.routeReady || account.lastRouteReady == true ||
                     hasOptimizationReadinessEvidence(
                         availableWakeAt[accountId],
                         repository.profiles.value.filter { it.accountId == accountId },
-                        now
+                        now,
+                        networkKey
                     ),
                 profileCount = accountProfileCount,
                 tunnelState = VpnStateRepository.state.value.tunnelState,
@@ -1646,6 +1665,8 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private suspend fun runRouteOptimization(accountId: String, manual: Boolean) {
+        val measurement = requireMeasurementNetwork()
+        val networkKey = measurement.networkKey
         val selection = repository.activeSelection.value
         val storedProfiles = repository.profiles.value.filter { it.accountId == accountId }
         val parsedProfiles = storedProfiles.mapNotNull { stored ->
@@ -1661,10 +1682,10 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
                 ?: parsedProfiles.first()
             _statusMessage.value = "Checking saved routes before automatic optimization..."
             val ranked = parsedProfiles.sortedWith(
-                compareBy<Pair<StoredG2RayProfile, G2RayProfile>> { ProfileHealth.rank(it.first) }
-                    .thenBy { ProfileHealth.delaySortValue(it.first) }
+                compareBy<Pair<StoredG2RayProfile, G2RayProfile>> { ProfileHealth.rank(it.first, networkKey = networkKey) }
+                    .thenBy { ProfileHealth.delaySortValue(it.first, networkKey = networkKey) }
             ).map { it.second }
-            val guards = measureQuickProfiles(optimizationGuardCandidates(selected.second, ranked))
+            val guards = measureQuickProfiles(optimizationGuardCandidates(selected.second, ranked), measurement = measurement)
             if (guards.none { it.success && it.medianMs?.let { ms -> ms in 1..9999 } == true }) {
                 _statusMessage.value =
                     "Automatic route optimization postponed because none of the checked Codespace routes responded."
@@ -1675,7 +1696,8 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
         // An unavailable startup route is not a completed discovery attempt.
         // Start the heavy-scan cooldown only after the readiness guard passes.
         withContext(Dispatchers.IO) {
-            vpnEnginePreferences.setLastRouteOptimizationAttemptAt(accountId, System.currentTimeMillis())
+            checkMeasurementNetwork(measurement)
+            vpnEnginePreferences.setLastRouteOptimizationAttemptAt(accountId, System.currentTimeMillis(), networkKey)
         }
         _statusMessage.value = "Discovering Codespaces routes from the phone network..."
         val hostnames = parsedProfiles.asSequence()
@@ -1696,8 +1718,8 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
         val orderedExisting = parsedProfiles.sortedWith(
             compareBy<Pair<StoredG2RayProfile, G2RayProfile>> {
                 if (it.first.id == selection.profileId) 0 else 1
-            }.thenBy { ProfileHealth.rank(it.first, now) }
-                .thenBy { ProfileHealth.delaySortValue(it.first, now) }
+            }.thenBy { ProfileHealth.rank(it.first, now, networkKey) }
+                .thenBy { ProfileHealth.delaySortValue(it.first, now, networkKey) }
                 .thenBy { it.first.createdAt }
         )
         val existingLimit = (MAX_ROUTE_OPTIMIZATION_PROBES - generatedProfiles.size).coerceAtLeast(1)
@@ -1719,7 +1741,7 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
             _profileDelayStates.value = _profileDelayStates.value + (id to ProfileDelayState(testing = true))
         }
         _statusMessage.value = "Verifying ${probes.size} routes through libXray from this phone..."
-        val summaries = measureQuickProfiles(probes.map { it.profile })
+        val summaries = measureQuickProfiles(probes.map { it.profile }, measurement = measurement)
         val delayMeasuredAt = System.currentTimeMillis()
         val measured = probes.zip(summaries)
         val successful = measured.filter { (_, summary) ->
@@ -1733,7 +1755,8 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
                         stored.id to ProfileDelayState(
                             testing = false,
                             error = summary.error ?: "Route unavailable; saved health was preserved.",
-                            testedAt = System.currentTimeMillis()
+                            testedAt = System.currentTimeMillis(),
+                            networkKey = networkKey
                         )
                     )
                 }
@@ -1748,6 +1771,7 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
         }
         val idsBeforeImport = repository.profiles.value.mapTo(hashSetOf()) { it.id }
         val importedGenerated = withContext(Dispatchers.IO) {
+            checkMeasurementNetwork(measurement)
             repository.importProfiles(accountId, generatedSuccesses)
         }
         val generatedByUri = importedGenerated.associateBy { it.rawUri.trim() }
@@ -1760,7 +1784,9 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
         fun persistedPerformance(stored: StoredG2RayProfile): RoutePerformanceSummary? {
             val testedAt = stored.lastThroughputTestedAt ?: return null
             val age = performanceNow - testedAt
-            if (age !in 0..THROUGHPUT_RESULT_MAX_AGE_MS) return null
+            if (age !in 0..THROUGHPUT_RESULT_MAX_AGE_MS ||
+                !RouteMeasurementContext.matches(stored.lastThroughputNetworkKey, networkKey)
+            ) return null
             val download = stored.lastDownloadBps?.takeIf { it > 0L } ?: return null
             return RoutePerformanceSummary(
                 success = true,
@@ -1792,12 +1818,13 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
         val measuredPerformance = linkedMapOf<String, RoutePerformanceSummary>()
         val measuredPerformanceAt = linkedMapOf<String, Long>()
         if (performanceTargets.isNotEmpty()) {
-            val performanceManager = XrayCoreManager()
+            val performanceManager = routeProbeManagerFactory()
             performanceTargets.forEachIndexed { index, (stored, profile, _) ->
                 _statusMessage.value =
                     "Measuring real transfer ${index + 1}/${performanceTargets.size} on ${stored.displayName}..."
                 val result = try {
                     withContext(Dispatchers.IO) {
+                        checkMeasurementNetwork(measurement)
                         performanceManager.measureRoutePerformance(
                             profile = profile,
                             datDir = getApplication<Application>().filesDir.absolutePath,
@@ -1809,6 +1836,7 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
                 } catch (error: Exception) {
                     RoutePerformanceSummary(false, error = error.localizedMessage ?: error.javaClass.simpleName)
                 }
+                checkMeasurementNetwork(measurement)
                 measuredPerformance[stored.id] = result
                 measuredPerformanceAt[stored.id] = System.currentTimeMillis()
                 if (result.success) {
@@ -1825,7 +1853,7 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
             val preserveFreshAccurateHistory = delayMs != null &&
                 stored.lastDelaySampleCount >= 3 &&
                 stored.lastDelaySuccessfulSamples * 2 >= stored.lastDelaySampleCount &&
-                ProfileHealth.isDelayFresh(stored)
+                ProfileHealth.isDelayFresh(stored, networkKey = networkKey)
             if (preserveFreshAccurateHistory && performance == null) return@mapNotNull null
             ProfileDelayUpdate(
                 id = stored.id,
@@ -1844,10 +1872,14 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
                 uploadBps = performance?.uploadBps,
                 throughputTestedAt = measuredPerformanceAt[stored.id],
                 throughputError = performance?.error,
-                delayTestedAt = if (preserveFreshAccurateHistory) stored.lastDelayTestedAt else delayMeasuredAt
+                delayTestedAt = if (preserveFreshAccurateHistory) stored.lastDelayTestedAt else delayMeasuredAt,
+                networkKey = networkKey
             )
         }
-        withContext(Dispatchers.IO) { repository.recordProfileDelays(updates) }
+        withContext(Dispatchers.IO) {
+            checkMeasurementNetwork(measurement)
+            repository.recordProfileDelays(updates)
+        }
 
         measuredStored.forEach { (stored, _, summary) ->
             val delayMs = summary.medianMs?.takeIf { summary.success && it in 1..9999 }
@@ -1860,7 +1892,8 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
                     successfulSamples = summary.successfulSamples,
                     sampleCount = summary.totalSamples,
                     error = if (delayMs == null) summary.error ?: "Delay test failed" else null,
-                    testedAt = System.currentTimeMillis()
+                    testedAt = System.currentTimeMillis(),
+                    networkKey = networkKey
                 )
             )
         }
@@ -1898,7 +1931,10 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
             chosen.first.id != selection.profileId &&
             repository.activeSelection.value.accountId == accountId
         ) {
-            withContext(Dispatchers.IO) { repository.selectProfile(chosen.first.id) }
+            withContext(Dispatchers.IO) {
+                checkMeasurementNetwork(measurement)
+                repository.selectProfile(chosen.first.id)
+            }
         }
         val addedCount = importedGenerated.count { it.id !in idsBeforeImport }
         val selectedDelay = chosen?.third?.medianMs
@@ -1919,10 +1955,11 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun measureQuickProfiles(
         profiles: List<G2RayProfile>,
-        onProgress: ((completed: Int, total: Int) -> Unit)? = null
+        onProgress: ((completed: Int, total: Int) -> Unit)? = null,
+        measurement: RouteMeasurementContext.Snapshot
     ): List<XrayDelaySummary> {
         if (profiles.isEmpty()) return emptyList()
-        val manager = XrayCoreManager()
+        val manager = routeProbeManagerFactory()
         val datDir = getApplication<Application>().filesDir.absolutePath
         return buildList {
             var completed = 0
@@ -1933,7 +1970,7 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
                             profiles = chunk,
                             datDir = datDir,
                             dpiCompatibilityEnabled = dpiCompatibilityEnabled.value,
-                            checkActive = { coroutineContext.ensureActive() }
+                            checkActive = { coroutineContext.ensureActive(); checkMeasurementNetwork(measurement) }
                         )
                     }
                 } catch (cancelled: CancellationException) {
@@ -1952,6 +1989,7 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
                     chunk.forEach { profile ->
                         val summary = try {
                             withContext(Dispatchers.IO) {
+                                checkMeasurementNetwork(measurement)
                                 manager.measureDelayQuick(
                                     profile = profile,
                                     datDir = datDir,
@@ -1966,9 +2004,19 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
                         add(summary)
                     }
                 }
+                checkMeasurementNetwork(measurement)
                 completed += chunk.size
                 onProgress?.invoke(completed, profiles.size)
             }
+        }
+    }
+
+    private fun requireMeasurementNetwork(): RouteMeasurementContext.Snapshot = measurementContext.capture()
+        ?: throw IOException("Network is not ready for route measurements; retry shortly.")
+
+    private fun checkMeasurementNetwork(expected: RouteMeasurementContext.Snapshot) {
+        if (!measurementContext.isCurrent(expected)) {
+            throw IOException("Physical network changed during the route test; refresh on the current network.")
         }
     }
 
@@ -1999,6 +2047,13 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
+        val measurement = measurementContext.capture()
+        if (measurement == null) {
+            _statusMessage.value = "Network is not ready for route measurements; retry shortly."
+            return
+        }
+        val networkKey = measurement.networkKey
+
         _profileDelayStates.value = _profileDelayStates.value + (profileId to ProfileDelayState(testing = true))
 
         val delayJob = viewModelScope.launch(start = CoroutineStart.LAZY) {
@@ -2006,11 +2061,13 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 val summary = try {
                     withContext(Dispatchers.IO) {
+                        checkMeasurementNetwork(measurement)
                         val profile = VlessUriParser.parse(stored.rawUri).getOrThrow()
-                        XrayCoreManager().measureDelaySummary(
+                        routeProbeManagerFactory().measureDelaySummary(
                             profile = profile,
                             datDir = getApplication<Application>().filesDir.absolutePath,
-                            dpiCompatibilityEnabled = dpiCompatibilityEnabled.value
+                            dpiCompatibilityEnabled = dpiCompatibilityEnabled.value,
+                            checkActive = { coroutineContext.ensureActive(); checkMeasurementNetwork(measurement) }
                         )
                     }
                 } catch (cancelled: CancellationException) {
@@ -2018,11 +2075,13 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
                 } catch (error: Exception) {
                     failedDelaySummary(error.localizedMessage ?: error.javaClass.simpleName)
                 }
+                checkMeasurementNetwork(measurement)
                 val cleanDelay = summary.medianMs?.takeIf { summary.success && it in 1..9999 }
                 val error = if (cleanDelay != null) null else (summary.error ?: "Delay test failed")
 
                 val persistenceError = try {
                     withContext(Dispatchers.IO) {
+                        checkMeasurementNetwork(measurement)
                         repository.recordProfileDelay(
                             id = profileId,
                             success = cleanDelay != null,
@@ -2031,7 +2090,8 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
                             p95Ms = summary.p95Ms,
                             jitterMs = summary.jitterMs,
                             successfulSamples = summary.successfulSamples,
-                            sampleCount = summary.totalSamples
+                            sampleCount = summary.totalSamples,
+                            networkKey = networkKey
                         )
                     }
                     null
@@ -2053,10 +2113,13 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
                         successfulSamples = summary.successfulSamples,
                         sampleCount = summary.totalSamples,
                         error = error,
-                        testedAt = System.currentTimeMillis()
+                        testedAt = System.currentTimeMillis(),
+                        networkKey = networkKey
                     )
                 )
                 completed = true
+            } catch (error: IOException) {
+                _statusMessage.value = error.localizedMessage ?: "Route measurement was interrupted."
             } finally {
                 if (!completed) {
                     clearInterruptedDelayTests(
@@ -2098,6 +2161,12 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
             _statusMessage.value = "A delay scan is already running for these configs."
             return
         }
+        val measurement = measurementContext.capture()
+        if (measurement == null) {
+            _statusMessage.value = "Network is not ready for route measurements; retry shortly."
+            return
+        }
+        val networkKey = measurement.networkKey
         pending.forEach { stored ->
             _profileDelayStates.value = _profileDelayStates.value + (stored.id to ProfileDelayState(testing = true))
         }
@@ -2122,6 +2191,7 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
 
                 val validSummaries = measureQuickProfiles(
                     profiles = validProfiles.map { it.second },
+                    measurement = measurement,
                     onProgress = { done, total ->
                         _statusMessage.value = "Pinging $done/$total configs..."
                     }
@@ -2149,11 +2219,13 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
                         p95Ms = summary.p95Ms,
                         jitterMs = summary.jitterMs,
                         successfulSamples = summary.successfulSamples,
-                        sampleCount = summary.totalSamples
+                        sampleCount = summary.totalSamples,
+                        networkKey = networkKey
                     )
                 }
                 val persistenceError = try {
                     withContext(Dispatchers.IO) {
+                        checkMeasurementNetwork(measurement)
                         repository.recordProfileDelays(updates)
                     }
                     null
@@ -2176,7 +2248,8 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
                             successfulSamples = summary.successfulSamples,
                             sampleCount = summary.totalSamples,
                             error = error,
-                            testedAt = System.currentTimeMillis()
+                            testedAt = System.currentTimeMillis(),
+                            networkKey = networkKey
                         )
                     )
                     _statusMessage.value = "Checked ${index + 1}/${results.size} configs."

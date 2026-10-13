@@ -1,6 +1,7 @@
 package com.g2ray.client.ui
 
 import com.g2ray.client.model.StoredG2RayProfile
+import com.g2ray.client.network.RouteMeasurementContext
 
 object ProfileHealth {
     const val DELAY_FRESHNESS_MS = 15 * 60 * 1000L
@@ -10,11 +11,14 @@ object ProfileHealth {
     fun displayDelay(
         profile: StoredG2RayProfile,
         current: ProfileDelayState?,
-        now: Long = System.currentTimeMillis()
+        now: Long = System.currentTimeMillis(),
+        networkKey: String? = null
     ): ProfileDelayState {
         val useCurrent = current != null && (current.testing ||
             (current.testedAt == null && current.error != null) ||
-            (current.testedAt != null && current.testedAt >= (profile.lastDelayTestedAt ?: Long.MIN_VALUE)))
+            (current.testedAt != null && RouteMeasurementContext.matches(current.networkKey, networkKey) &&
+                (!RouteMeasurementContext.matches(profile.lastDelayNetworkKey, networkKey) ||
+                    current.testedAt >= (profile.lastDelayTestedAt ?: Long.MIN_VALUE))))
         val result = if (useCurrent) current!! else ProfileDelayState(
             delayMs = profile.lastDelayMs,
             p95Ms = profile.lastDelayP95Ms,
@@ -22,9 +26,12 @@ object ProfileHealth {
             successfulSamples = profile.lastDelaySuccessfulSamples,
             sampleCount = profile.lastDelaySampleCount,
             error = profile.lastDelayError,
-            testedAt = profile.lastDelayTestedAt
+            testedAt = profile.lastDelayTestedAt,
+            networkKey = profile.lastDelayNetworkKey
         )
-        if (result.testing || result.testedAt == null || isDelayFresh(result.testedAt, now)) return result
+        if (result.testing || result.testedAt == null ||
+            (RouteMeasurementContext.matches(result.networkKey, networkKey) && isDelayFresh(result.testedAt, now))
+        ) return result
         return result.copy(
             delayMs = null, p95Ms = null, jitterMs = null,
             successfulSamples = 0, sampleCount = 0, error = "Stale; refresh"
@@ -49,36 +56,38 @@ object ProfileHealth {
         return age in 0..DELAY_FRESHNESS_MS
     }
 
-    fun isDelayFresh(profile: StoredG2RayProfile, now: Long = System.currentTimeMillis()): Boolean {
-        return isDelayFresh(profile.lastDelayTestedAt, now)
+    fun isDelayFresh(profile: StoredG2RayProfile, now: Long = System.currentTimeMillis(), networkKey: String? = null): Boolean {
+        return RouteMeasurementContext.matches(profile.lastDelayNetworkKey, networkKey) &&
+            isDelayFresh(profile.lastDelayTestedAt, now)
     }
 
-    fun isThroughputFresh(profile: StoredG2RayProfile, now: Long = System.currentTimeMillis()): Boolean {
+    fun isThroughputFresh(profile: StoredG2RayProfile, now: Long = System.currentTimeMillis(), networkKey: String? = null): Boolean {
         val testedAt = profile.lastThroughputTestedAt ?: return false
         val age = now - testedAt
-        return age in 0..THROUGHPUT_FRESHNESS_MS &&
+        return RouteMeasurementContext.matches(profile.lastThroughputNetworkKey, networkKey) &&
+            age in 0..THROUGHPUT_FRESHNESS_MS &&
             profile.lastDownloadBps?.let { it > 0L } == true
     }
 
-    fun rank(profile: StoredG2RayProfile, now: Long = System.currentTimeMillis()): Int {
+    fun rank(profile: StoredG2RayProfile, now: Long = System.currentTimeMillis(), networkKey: String? = null): Int {
         return when {
-            profile.delayFailureCount > 0 -> 4
             profile.lastDelayTestedAt == null -> 2
-            !isDelayFresh(profile, now) -> 3
+            !isDelayFresh(profile, now, networkKey) -> 3
+            profile.delayFailureCount > 0 -> 4
             profile.lastDelaySampleCount < 3 ||
                 profile.lastDelaySuccessfulSamples * 2 < profile.lastDelaySampleCount -> 1
             else -> 0
         }
     }
 
-    fun isUnavailableForCleanup(profile: StoredG2RayProfile): Boolean {
-        return profile.lastDelayMs == null &&
+    fun isUnavailableForCleanup(profile: StoredG2RayProfile, now: Long = System.currentTimeMillis(), networkKey: String? = null): Boolean {
+        return isDelayFresh(profile, now, networkKey) && profile.lastDelayMs == null &&
             profile.lastDelayError != null &&
             profile.delayFailureCount >= UNAVAILABLE_DELETE_FAILURES
     }
 
-    fun delaySortValue(profile: StoredG2RayProfile, now: Long = System.currentTimeMillis()): Long {
-        if (!isDelayFresh(profile, now)) return Long.MAX_VALUE
+    fun delaySortValue(profile: StoredG2RayProfile, now: Long = System.currentTimeMillis(), networkKey: String? = null): Long {
+        if (!isDelayFresh(profile, now, networkKey)) return Long.MAX_VALUE
         val median = profile.lastDelayMs?.takeIf { it in 1..9_999 } ?: return Long.MAX_VALUE
         val p95 = profile.lastDelayP95Ms?.takeIf { it in median..60_000L } ?: median
         val tailPenalty = (p95 - median) / 2L

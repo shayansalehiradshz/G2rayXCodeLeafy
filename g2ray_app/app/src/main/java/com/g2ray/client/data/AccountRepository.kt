@@ -23,7 +23,8 @@ data class ProfileDelayUpdate(
     val uploadBps: Long? = null,
     val throughputTestedAt: Long? = null,
     val throughputError: String? = null,
-    val delayTestedAt: Long? = null
+    val delayTestedAt: Long? = null,
+    val networkKey: String? = null
 )
 
 private data class ProfileImportRequest(
@@ -765,7 +766,8 @@ class AccountRepository(private val store: SecureKeyValueStore) {
         p95Ms: Long? = null,
         jitterMs: Long? = null,
         successfulSamples: Int = 0,
-        sampleCount: Int = 0
+        sampleCount: Int = 0,
+        networkKey: String? = null
     ) {
         recordProfileDelays(
             listOf(
@@ -777,7 +779,8 @@ class AccountRepository(private val store: SecureKeyValueStore) {
                     p95Ms = p95Ms,
                     jitterMs = jitterMs,
                     successfulSamples = successfulSamples,
-                    sampleCount = sampleCount
+                    sampleCount = sampleCount,
+                    networkKey = networkKey
                 )
             )
         )
@@ -804,15 +807,19 @@ class AccountRepository(private val store: SecureKeyValueStore) {
             } else {
                 val delayTestedAt = update.delayTestedAt?.coerceIn(0L, now) ?: now
                 val partial = update.sampleCount > 0 && update.successfulSamples < update.sampleCount
+                val sameNetwork = profile.lastDelayNetworkKey == update.networkKey
+                val sameThroughputNetwork = profile.lastThroughputNetworkKey == update.networkKey
+                val previousFailures = if (sameNetwork) profile.delayFailureCount else 0
                 val delayUpdated = if (update.success && update.delayMs != null) {
                     profile.copy(
                         lastDelayMs = update.delayMs,
                         lastDelayTestedAt = delayTestedAt,
+                        lastDelayNetworkKey = update.networkKey,
                         lastDelayP95Ms = update.p95Ms,
                         lastDelayJitterMs = update.jitterMs,
                         lastDelaySuccessfulSamples = update.successfulSamples.coerceAtLeast(0),
                         lastDelaySampleCount = update.sampleCount.coerceAtLeast(0),
-                        delayFailureCount = if (partial) profile.delayFailureCount else 0,
+                        delayFailureCount = if (partial) previousFailures else 0,
                         lastDelayError = if (partial) {
                             update.error?.takeIf { it.isNotBlank() }
                                 ?: "Only ${update.successfulSamples}/${update.sampleCount} delay samples succeeded"
@@ -823,20 +830,22 @@ class AccountRepository(private val store: SecureKeyValueStore) {
                     profile.copy(
                         lastDelayMs = null,
                         lastDelayTestedAt = delayTestedAt,
+                        lastDelayNetworkKey = update.networkKey,
                         lastDelayP95Ms = null,
                         lastDelayJitterMs = null,
                         lastDelaySuccessfulSamples = 0,
                         lastDelaySampleCount = update.sampleCount.coerceAtLeast(0),
-                        delayFailureCount = if (profile.delayFailureCount == Int.MAX_VALUE) {
+                        delayFailureCount = if (previousFailures == Int.MAX_VALUE) {
                             Int.MAX_VALUE
                         } else {
-                            profile.delayFailureCount + 1
+                            previousFailures + 1
                         },
                         lastDelayError = update.error?.takeIf { it.isNotBlank() } ?: "Delay test failed",
-                        lastDownloadBps = null,
-                        lastUploadBps = null,
-                        lastThroughputTestedAt = null,
-                        lastThroughputError = null,
+                        lastDownloadBps = if (sameThroughputNetwork) null else profile.lastDownloadBps,
+                        lastUploadBps = if (sameThroughputNetwork) null else profile.lastUploadBps,
+                        lastThroughputTestedAt = if (sameThroughputNetwork) null else profile.lastThroughputTestedAt,
+                        lastThroughputError = if (sameThroughputNetwork) null else profile.lastThroughputError,
+                        lastThroughputNetworkKey = if (sameThroughputNetwork) null else profile.lastThroughputNetworkKey,
                         updatedAt = now
                     )
                 }
@@ -845,6 +854,7 @@ class AccountRepository(private val store: SecureKeyValueStore) {
                         lastDownloadBps = update.downloadBps?.takeIf { it > 0L },
                         lastUploadBps = update.uploadBps?.takeIf { it > 0L },
                         lastThroughputTestedAt = update.throughputTestedAt.coerceAtLeast(0L),
+                        lastThroughputNetworkKey = update.networkKey,
                         lastThroughputError = update.throughputError?.takeIf { it.isNotBlank() },
                         updatedAt = now
                     )

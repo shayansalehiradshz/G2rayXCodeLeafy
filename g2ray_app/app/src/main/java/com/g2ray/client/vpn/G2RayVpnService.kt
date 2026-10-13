@@ -45,6 +45,7 @@ import com.g2ray.client.network.CodespaceWakeRequest
 import com.g2ray.client.network.GitHubCodespaceCoordinator
 import com.g2ray.client.network.GitHubNetwork
 import com.g2ray.client.network.MAX_WAKE_RETRY_DELAY_MS
+import com.g2ray.client.network.RouteMeasurementContext
 import com.g2ray.client.network.WakeBackendSelector
 import com.g2ray.client.network.WakeControlBackend
 import com.g2ray.client.network.WakeRetryCooldown
@@ -404,7 +405,9 @@ class G2RayVpnService : VpnService() {
             accountId: String?,
             currentRawUri: String,
             maxCandidates: Int = 6,
-            sessionHealth: Map<String, SessionProfileHealth> = emptyMap()
+            sessionHealth: Map<String, SessionProfileHealth> = emptyMap(),
+            networkKey: String? = null,
+            nowMs: Long = System.currentTimeMillis()
         ): List<StoredG2RayProfile> {
             if (accountId.isNullOrBlank() || maxCandidates <= 0) return emptyList()
             val ranked = profiles
@@ -421,19 +424,19 @@ class G2RayVpnService : VpnService() {
                             if (sessionHealth[it.rawUri]?.lastAttemptSucceeded == true) {
                                 false
                             } else {
-                                it.lastDelayError != null
+                                persistedRouteHistoryFresh(it, nowMs, networkKey) && it.lastDelayError != null
                             }
                         }
                         .thenBy {
                             if (sessionHealth[it.rawUri]?.lastAttemptSucceeded == true) {
                                 0
                             } else {
-                                it.delayFailureCount
+                                if (persistedRouteHistoryFresh(it, nowMs, networkKey)) it.delayFailureCount else 0
                             }
                         }
                         .thenBy {
                             sessionHealth[it.rawUri]?.lastSuccessLatencyMs
-                                ?: persistedRouteScore(it)
+                                ?: persistedRouteScore(it, networkKey, nowMs)
                         }
                         .thenBy { it.createdAt }
                 )
@@ -534,7 +537,8 @@ class G2RayVpnService : VpnService() {
             }
         }
 
-        internal fun persistedRouteScore(profile: StoredG2RayProfile): Long {
+        internal fun persistedRouteScore(profile: StoredG2RayProfile, networkKey: String? = null, nowMs: Long = System.currentTimeMillis()): Long {
+            if (!persistedRouteHistoryFresh(profile, nowMs, networkKey)) return Long.MAX_VALUE
             val median = profile.lastDelayMs?.takeIf { it in 1..9_999 } ?: return Long.MAX_VALUE
             val p95 = profile.lastDelayP95Ms?.takeIf { it in median..60_000L } ?: median
             val tailPenalty = (p95 - median) / 2L
@@ -545,16 +549,24 @@ class G2RayVpnService : VpnService() {
         internal fun persistedRouteMeasurementFresh(
             profile: StoredG2RayProfile,
             nowMs: Long,
-            maxAgeMs: Long = LIVE_ROUTE_MEASUREMENT_MAX_AGE_MS
+            maxAgeMs: Long = LIVE_ROUTE_MEASUREMENT_MAX_AGE_MS,
+            networkKey: String? = null
         ): Boolean {
-            val testedAt = profile.lastDelayTestedAt ?: return false
-            val ageMs = nowMs - testedAt
-            return ageMs in 0..maxAgeMs.coerceAtLeast(0L) &&
+            return persistedRouteHistoryFresh(profile, nowMs, networkKey, maxAgeMs) &&
                 profile.lastDelaySuccessfulSamples >= 2 &&
                 profile.lastDelaySuccessfulSamples == profile.lastDelaySampleCount &&
                 profile.lastDelayMs?.let { it in 1..9_999 } == true &&
                 profile.lastDelayError == null &&
                 profile.delayFailureCount == 0
+        }
+
+        private fun persistedRouteHistoryFresh(
+            profile: StoredG2RayProfile, nowMs: Long, networkKey: String?,
+            maxAgeMs: Long = LIVE_ROUTE_MEASUREMENT_MAX_AGE_MS
+        ): Boolean {
+            val testedAt = profile.lastDelayTestedAt ?: return false
+            return RouteMeasurementContext.matches(profile.lastDelayNetworkKey, networkKey) &&
+                nowMs - testedAt in 0..maxAgeMs.coerceAtLeast(0L)
         }
 
         internal fun updatedSessionProfileHealth(
@@ -1823,17 +1835,20 @@ class G2RayVpnService : VpnService() {
         val accountId = activeAccountId ?: accountRepository.activeSelection.value.accountId
         val sessionHealth = sessionProfileHealthSnapshot()
         val nowMs = System.currentTimeMillis()
+        val networkKey = (application as G2RayApplication).routeMeasurementContext.keyFor(underlyingNetwork)
         val storedCandidates = selectAlternativeProfiles(
             profiles = accountRepository.profiles.value,
             accountId = accountId,
             currentRawUri = selected.rawUri,
             maxCandidates = 10,
-            sessionHealth = sessionHealth
+            sessionHealth = sessionHealth,
+            networkKey = networkKey,
+            nowMs = nowMs
         )
         val verifiedCandidates = storedCandidates.mapNotNull { stored ->
             val observed = sessionHealth[stored.rawUri]
             val verified = observed?.lastAttemptSucceeded == true ||
-                persistedRouteMeasurementFresh(stored, nowMs)
+                persistedRouteMeasurementFresh(stored, nowMs, networkKey = networkKey)
             if (!verified) return@mapNotNull null
             VlessUriParser.parse(stored.rawUri).getOrNull()
         }
@@ -2025,7 +2040,8 @@ class G2RayVpnService : VpnService() {
             accountId = accountId,
             currentRawUri = currentProfile.rawUri,
             maxCandidates = maxCandidates,
-            sessionHealth = sessionProfileHealthSnapshot()
+            sessionHealth = sessionProfileHealthSnapshot(),
+            networkKey = (application as G2RayApplication).routeMeasurementContext.keyFor(underlyingNetwork)
         )
 
         var lastFailure: RunningRouteResult? = null

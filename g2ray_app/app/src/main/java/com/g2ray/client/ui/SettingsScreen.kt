@@ -756,12 +756,12 @@ fun ProfilesScreen(
     val profiles by viewModel.profiles.collectAsState()
     val activeSelection by viewModel.activeSelection.collectAsState()
     val now = System.currentTimeMillis()
+    val measurementNetworkKey by viewModel.measurementNetworkKey.collectAsState()
     val accountProfiles = profiles
         .filter { it.accountId == accountId }
         .sortedWith(
-            compareBy<StoredG2RayProfile> { ProfileHealth.rank(it, now) }
-                .thenBy { ProfileHealth.delaySortValue(it, now) }
-                .thenBy { it.delayFailureCount }
+            compareBy<StoredG2RayProfile> { ProfileHealth.rank(it, now, measurementNetworkKey) }
+                .thenBy { ProfileHealth.delaySortValue(it, now, measurementNetworkKey) }
                 .thenByDescending { it.lastDelayTestedAt ?: 0L }
                 .thenBy { it.createdAt }
         )
@@ -811,7 +811,7 @@ fun ProfilesScreen(
                 accountProfiles.forEach { profile ->
                     val isActive = profile.id == activeSelection.profileId
                     val delayState = delayStates[profile.id]
-                    val displayedDelay = ProfileHealth.displayDelay(profile, delayState)
+                    val displayedDelay = ProfileHealth.displayDelay(profile, delayState, networkKey = measurementNetworkKey)
                     val effectiveDelayMs = displayedDelay.delayMs
                     val effectiveP95Ms = displayedDelay.p95Ms
                     val effectiveSuccessfulSamples = displayedDelay.successfulSamples
@@ -851,7 +851,7 @@ fun ProfilesScreen(
                                 Text("Address: ${profile.address}:${profile.port}", style = MaterialTheme.typography.bodySmall)
                                 Text("Transport: ${profile.transport.name} (${profile.path})", style = MaterialTheme.typography.bodySmall)
                                 profile.lastDownloadBps?.takeIf { it > 0L }?.let { downloadBps ->
-                                    val sampleText = if (ProfileHealth.isThroughputFresh(profile)) {
+                                    val sampleText = if (ProfileHealth.isThroughputFresh(profile, networkKey = measurementNetworkKey)) {
                                         val uploadText = profile.lastUploadBps
                                             ?.takeIf { it > 0L }
                                             ?.let { "  UL ${SpeedFormatter.formatBps(it)}" }

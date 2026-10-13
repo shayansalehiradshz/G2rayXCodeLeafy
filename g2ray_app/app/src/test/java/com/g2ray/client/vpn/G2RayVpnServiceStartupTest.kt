@@ -5,6 +5,7 @@ import android.net.Network
 import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import com.g2ray.client.data.AccountRepository
+import com.g2ray.client.G2RayApplication
 import com.g2ray.client.data.AccountRepositoryTest.InMemorySecureStore
 import com.g2ray.client.model.ActiveVpnEngine
 import com.g2ray.client.model.ApiKeyKind
@@ -38,7 +39,7 @@ import org.robolectric.shadow.api.Shadow
 import org.json.JSONObject
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [Build.VERSION_CODES.S], shadows = [G2RayVpnServiceStartupTest.EndpointNetworkShadow::class])
+@Config(sdk = [Build.VERSION_CODES.S], application = G2RayApplication::class, shadows = [G2RayVpnServiceStartupTest.EndpointNetworkShadow::class])
 class G2RayVpnServiceStartupTest {
     @Test
     fun lifecycleChangedDuringEndpointDnsNeverStartsTheCore() = runTest {

@@ -51,15 +51,19 @@ class VpnEnginePreferences internal constructor(
         store.putString(PREF_SEAMLESS_FAILOVER_ENABLED, enabled.toString())
     }
 
-    fun getLastRouteOptimizationAttemptAt(accountId: String): Long {
+    fun getLastRouteOptimizationAttemptAt(accountId: String, networkKey: String? = null): Long {
+        if (!networkKey.isNullOrBlank() &&
+            store.getString("${routeOptimizationAttemptKey(accountId)}_network", null) != networkKey
+        ) return 0L
         return store.getString(routeOptimizationAttemptKey(accountId), null)
             ?.toLongOrNull()
             ?.coerceAtLeast(0L)
             ?: 0L
     }
 
-    fun setLastRouteOptimizationAttemptAt(accountId: String, timestampMs: Long) {
-        store.putString(routeOptimizationAttemptKey(accountId), timestampMs.coerceAtLeast(0L).toString())
+    fun setLastRouteOptimizationAttemptAt(accountId: String, timestampMs: Long, networkKey: String? = null) {
+        val key = routeOptimizationAttemptKey(accountId)
+        store.putStrings(mapOf(key to timestampMs.coerceAtLeast(0L).toString(), "${key}_network" to networkKey))
     }
 
     private fun readBoolean(key: String, defaultValue: Boolean = false): Boolean {

@@ -463,7 +463,8 @@ class XrayCoreManager : TunnelCore {
         timeoutSeconds: Int = 4,
         testUrls: List<String> = DEFAULT_PREFLIGHT_URLS,
         sampleCount: Int = 3,
-        dpiCompatibilityEnabled: Boolean = false
+        dpiCompatibilityEnabled: Boolean = false,
+        checkActive: () -> Unit = {}
     ): XrayDelaySummary {
         if (!canMeasureDelay()) {
             return XrayDelaySummary(false, null, null, null, 0, 0, "libXray ping is not available in this build.")
@@ -474,6 +475,7 @@ class XrayCoreManager : TunnelCore {
         val delays = mutableListOf<Long>()
         val errors = mutableListOf<String>()
         repeat(requestedSamples) { index ->
+            checkActive()
             val url = urls[index % urls.size]
             val result = measureDelay(
                 profile = profile,
@@ -482,6 +484,7 @@ class XrayCoreManager : TunnelCore {
                 testUrl = url,
                 dpiCompatibilityEnabled = dpiCompatibilityEnabled
             )
+            checkActive()
             val delay = result.delayMs?.takeIf { result.success && it in 1..9999 }
             if (delay != null) {
                 delays += delay

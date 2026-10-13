@@ -70,11 +70,12 @@ class RouteOptimizationCandidatesTest {
             transport = Transport.WS, address = "203.0.113.1", port = 443,
             sni = "demo-443.app.github.dev", hostHeader = "demo-443.app.github.dev", path = "/",
             isDefault = false, createdAt = 1, updatedAt = 1,
-            lastDelayMs = 280, lastDelayTestedAt = now
+            lastDelayMs = 280, lastDelayTestedAt = now, lastDelayNetworkKey = "network-a"
         )
-        assertTrue(G2RayViewModel.hasOptimizationReadinessEvidence(null, listOf(stored), now))
-        assertFalse(G2RayViewModel.hasOptimizationReadinessEvidence(null, listOf(stored.copy(delayFailureCount = 1)), now))
-        assertFalse(G2RayViewModel.hasOptimizationReadinessEvidence(null, listOf(stored.copy(lastDelayMs = null)), now))
-        assertFalse(G2RayViewModel.hasOptimizationReadinessEvidence(null, listOf(stored), now + ProfileHealth.DELAY_FRESHNESS_MS + 1))
+        assertTrue(G2RayViewModel.hasOptimizationReadinessEvidence(null, listOf(stored), now, "network-a"))
+        assertFalse(G2RayViewModel.hasOptimizationReadinessEvidence(null, listOf(stored.copy(delayFailureCount = 1)), now, "network-a"))
+        assertFalse(G2RayViewModel.hasOptimizationReadinessEvidence(null, listOf(stored.copy(lastDelayMs = null)), now, "network-a"))
+        assertFalse(G2RayViewModel.hasOptimizationReadinessEvidence(null, listOf(stored), now + ProfileHealth.DELAY_FRESHNESS_MS + 1, "network-a"))
+        assertFalse(G2RayViewModel.hasOptimizationReadinessEvidence(null, listOf(stored), now, "network-b"))
     }
 }

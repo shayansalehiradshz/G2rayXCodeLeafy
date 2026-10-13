@@ -707,6 +707,29 @@ class XrayCoreManagerTest {
     }
 
     @Test
+    fun detailedDelayStopsBetweenNativeSamplesWhenItsMeasurementContextChanges() {
+        val bridge = FakeXrayBridge(available = true).apply {
+            pingResult = XrayPingResult(true, 100L, null)
+        }
+        val manager = XrayCoreManager(bridge)
+        var checks = 0
+        val failure = runCatching {
+            manager.measureDelaySummary(
+                sampleProfile(), System.getProperty("java.io.tmpdir") ?: ".", sampleCount = 3,
+                checkActive = {
+                    checks++
+                    if (checks > 1) throw java.io.IOException("Physical network changed")
+                }
+            )
+        }.exceptionOrNull()
+        assertTrue(failure is java.io.IOException)
+        assertEquals(1, bridge.pingRequests.size)
+        val request = JSONObject(String(android.util.Base64.decode(bridge.pingRequest, android.util.Base64.DEFAULT)))
+        assertFalse(java.io.File(request.getString("configPath")).exists())
+        assertTrue(manager.measureDelayQuick(sampleProfile(), System.getProperty("java.io.tmpdir") ?: ".").success)
+    }
+
+    @Test
     fun measureDelayQuickBatch_cancellationAfterNativeCallSkipsEveryRetryAndCleansFiles() {
         val bridge = FakeXrayBridge(available = true).apply {
             invokeAvailable = true
