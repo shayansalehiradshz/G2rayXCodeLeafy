@@ -1,0 +1,79 @@
+# Representative R8 mapping. The fields mirror the persisted Moshi model contracts.
+com.g2ray.client.model.ActiveSelection -> com.g2ray.client.model.ActiveSelection:
+    java.lang.String accountId -> accountId
+    java.lang.String profileId -> profileId
+    java.lang.String apiKeyId -> apiKeyId
+    1:1:void <init>(java.lang.String,java.lang.String,java.lang.String):3:3 -> <init>
+com.g2ray.client.model.ApiKeyKind -> com.g2ray.client.model.ApiKeyKind:
+    com.g2ray.client.model.ApiKeyKind WORKER_WAKE_SECRET -> WORKER_WAKE_SECRET
+    com.g2ray.client.model.ApiKeyKind GITHUB_TOKEN -> GITHUB_TOKEN
+com.g2ray.client.model.CodespaceWakeMode -> com.g2ray.client.model.CodespaceWakeMode:
+    com.g2ray.client.model.CodespaceWakeMode AUTO -> AUTO
+    com.g2ray.client.model.CodespaceWakeMode WORKER -> WORKER
+    com.g2ray.client.model.CodespaceWakeMode GITHUB_DIRECT -> GITHUB_DIRECT
+com.g2ray.client.model.G2RayAccount -> com.g2ray.client.model.G2RayAccount:
+    java.lang.String id -> id
+    java.lang.String displayName -> displayName
+    java.lang.String workerBaseUrl -> workerBaseUrl
+    java.lang.String fallbackWorkerBaseUrl -> fallbackWorkerBaseUrl
+    java.lang.String codespaceName -> codespaceName
+    java.lang.String workerCodespaceId -> workerCodespaceId
+    com.g2ray.client.model.CodespaceWakeMode wakeMode -> wakeMode
+    int priority -> priority
+    boolean enabled -> enabled
+    java.lang.String lastSelectedProfileId -> lastSelectedProfileId
+    java.lang.Long lastHealthAt -> lastHealthAt
+    java.lang.Boolean lastRouteReady -> lastRouteReady
+    java.lang.String quotaResetEstimateUtc -> quotaResetEstimateUtc
+    java.lang.String retentionExpiresAt -> retentionExpiresAt
+    java.lang.String lastWorkerMessage -> lastWorkerMessage
+    boolean isDefault -> isDefault
+    long createdAt -> createdAt
+    long updatedAt -> updatedAt
+com.g2ray.client.model.G2RayApiKey -> com.g2ray.client.model.G2RayApiKey:
+    java.lang.String id -> id
+    java.lang.String accountId -> accountId
+    java.lang.String label -> label
+    com.g2ray.client.model.ApiKeyKind kind -> kind
+    java.lang.String encryptedValue -> encryptedValue
+    boolean enabled -> enabled
+    int priority -> priority
+    long createdAt -> createdAt
+    long updatedAt -> updatedAt
+    java.lang.Long lastUsedAt -> lastUsedAt
+com.g2ray.client.model.StoredG2RayProfile -> com.g2ray.client.model.StoredG2RayProfile:
+    java.lang.String id -> id
+    java.lang.String accountId -> accountId
+    java.lang.String displayName -> displayName
+    java.lang.String rawUri -> rawUri
+    com.g2ray.client.model.Transport transport -> transport
+    java.lang.String address -> address
+    int port -> port
+    java.lang.String sni -> sni
+    java.lang.String hostHeader -> hostHeader
+    java.lang.String path -> path
+    boolean isDefault -> isDefault
+    long createdAt -> createdAt
+    long updatedAt -> updatedAt
+    java.lang.Long lastDelayMs -> lastDelayMs
+    java.lang.Long lastDelayTestedAt -> lastDelayTestedAt
+    java.lang.Long lastDelayP95Ms -> lastDelayP95Ms
+    java.lang.Long lastDelayJitterMs -> lastDelayJitterMs
+    int lastDelaySuccessfulSamples -> lastDelaySuccessfulSamples
+    int lastDelaySampleCount -> lastDelaySampleCount
+    int delayFailureCount -> delayFailureCount
+    java.lang.String lastDelayError -> lastDelayError
+    java.lang.Long lastDownloadBps -> lastDownloadBps
+    java.lang.Long lastUploadBps -> lastUploadBps
+    java.lang.Long lastThroughputTestedAt -> lastThroughputTestedAt
+    java.lang.String lastThroughputError -> lastThroughputError
+    java.lang.String lastDelayNetworkKey -> lastDelayNetworkKey
+    java.lang.String lastThroughputNetworkKey -> lastThroughputNetworkKey
+com.g2ray.client.model.Transport -> com.g2ray.client.model.Transport:
+    com.g2ray.client.model.Transport XHTTP -> XHTTP
+    com.g2ray.client.model.Transport WS -> WS
+com.g2ray.client.model.WorkerControlPlane -> com.g2ray.client.model.WorkerControlPlane:
+    java.lang.String workerBaseUrl -> workerBaseUrl
+    java.lang.String fallbackWorkerBaseUrl -> fallbackWorkerBaseUrl
+    java.lang.String encryptedWakeSecret -> encryptedWakeSecret
+    long updatedAt -> updatedAt

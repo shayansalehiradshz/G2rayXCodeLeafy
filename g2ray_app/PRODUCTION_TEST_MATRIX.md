@@ -6,6 +6,7 @@ Run these checks on the same physical Android phone and ISP used for daily traff
 
 ```powershell
 ./gradlew.bat testDebugUnitTest assembleFunctionalDebug lintDebug
+./gradlew.bat -p buildSrc test
 ./gradlew.bat connectedDebugAndroidTest
 ./gradlew.bat bundleRelease
 ```
@@ -16,6 +17,18 @@ toolchain contract. The device test must report that both libXray and HEV load
 on the phone's real ABI.
 `bundleRelease` must run the same libXray patch, AAR hash, HEV ABI/hash, and
 pinned-builder checks before signing.
+Release packaging must also run `verifyReleasePersistenceSchema` against the
+actual R8 mapping, kept-member report, and removed-member report. The five
+persisted Moshi models and their three enums must
+retain their names, constructors, fields, and enum constants. A mapping with
+renamed or removed persisted fields must fail the build. Keep this check and
+its contract synchronized when adding a new persisted model or field.
+The mapping gate verifies schema preservation, not on-device deserialization.
+For release acceptance, install a correctly signed release over a previous
+release made with the same signing key, preserve existing app data, and check
+accounts, wake keys/modes, profiles, selected account/profile, and route history
+after process death and relaunch. Never replace a user's installed app with a
+disposable-key verification APK or uninstall it to make signing succeed.
 The packaged-core device smoke test must also start and stop a three-outbound
 least-ping config; compiling its JSON alone is not enough to validate the JNI
 and pinned Xray runtime boundary.

@@ -63,3 +63,5 @@ jobs:
           :app:compileDebugAndroidTestKotlin
           :app:verifyHevBundle :app:verifyLibXrayBuildContract
           --no-daemon --console=plain
+      - name: Test release-schema mapping verifier
+        run: bash ./gradlew -p buildSrc test --no-daemon --console=plain

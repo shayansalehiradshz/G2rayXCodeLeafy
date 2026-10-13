@@ -3,6 +3,8 @@ import java.util.Properties
 import com.g2ray.gradle.VerifyHevBundleTask
 import com.g2ray.gradle.VerifyLibXrayBuildContractTask
 import com.g2ray.gradle.VerifyLibXrayBundleTask
+import com.g2ray.gradle.VerifyPersistedJsonSchemaTask
+import com.android.build.api.artifact.SingleArtifact
 
 plugins {
     alias(libs.plugins.android.application)
@@ -170,6 +172,20 @@ val verifyHevBundle = tasks.register<VerifyHevBundleTask>("verifyHevBundle") {
     metadataFile.set(hevMetadataFile)
 }
 
+val verifyReleasePersistenceSchema = tasks.register<VerifyPersistedJsonSchemaTask>("verifyReleasePersistenceSchema") {
+    group = "verification"
+    description = "Checks that R8 preserves the reflection-based saved account/profile JSON schema."
+}
+
+androidComponents.onVariants(androidComponents.selector().withBuildType("release")) { variant ->
+    val r8Mapping = variant.artifacts.get(SingleArtifact.OBFUSCATION_MAPPING_FILE)
+    verifyReleasePersistenceSchema.configure {
+        mappingFile.set(r8Mapping)
+        seedsFile.set(layout.file(r8Mapping.map { it.asFile.resolveSibling("seeds.txt") }))
+        usageFile.set(layout.file(r8Mapping.map { it.asFile.resolveSibling("usage.txt") }))
+    }
+}
+
 tasks.register("assembleFunctionalDebug") {
     group = "build"
     description = "Builds a debug APK only after verifying that the functional VPN core is bundled."
@@ -188,6 +204,8 @@ tasks.named("check") {
     dependsOn(verifyLibXrayBuildContract, verifyHevBundle)
 }
 
-tasks.matching { it.name == "assembleRelease" || it.name == "bundleRelease" }.configureEach {
-    dependsOn(verifyBundledCore, verifyHevBundle, verifyLibXrayBuildContract)
+tasks.matching {
+    it.name in setOf("assembleRelease", "bundleRelease", "packageRelease", "signReleaseBundle")
+}.configureEach {
+    dependsOn(verifyBundledCore, verifyHevBundle, verifyLibXrayBuildContract, verifyReleasePersistenceSchema)
 }
