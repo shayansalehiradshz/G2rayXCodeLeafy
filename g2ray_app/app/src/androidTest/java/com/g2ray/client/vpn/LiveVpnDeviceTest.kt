@@ -10,19 +10,31 @@ import android.os.PowerManager
 import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.ViewModelProvider
 import androidx.test.core.app.ActivityScenario
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.g2ray.client.G2RayApplication
 import com.g2ray.client.MainActivity
+import com.g2ray.client.ui.G2RayViewModel
 import com.g2ray.client.model.ActiveVpnEngine
+import com.g2ray.client.model.ApiKeyKind
+import com.g2ray.client.model.CodespaceWakeMode
 import com.g2ray.client.model.TunnelState
 import com.g2ray.client.model.TunnelTrafficSource
 import com.g2ray.client.model.Transport
 import com.g2ray.client.model.VpnEngineMode
 import com.g2ray.client.model.VpnStateRepository
+import com.g2ray.client.network.CodespaceWakeCoordinator
+import com.g2ray.client.network.CodespaceWakeOutcome
+import com.g2ray.client.network.CodespaceWakeRequest
+import com.g2ray.client.network.GitHubCodespaceCoordinator
+import com.g2ray.client.network.GitHubNetwork
+import com.g2ray.client.network.WorkerNetwork
+import com.g2ray.client.network.WorkerRouteCoordinator
 import java.net.Proxy
+import java.net.Socket
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -53,7 +65,76 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 class LiveVpnDeviceTest {
     @Test
+    fun selectedAccountWakesOnPhysicalNetwork() = runBlocking {
+        val args = InstrumentationRegistry.getArguments()
+        assumeTrue("Wake tests require -e liveWake true", args.getString("liveWake") == "true")
+        val context = ApplicationProvider.getApplicationContext<G2RayApplication>()
+        val connectivity = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        assertTrue("Stop the VPN before the standalone wake test",
+            connectivity.getNetworkCapabilities(connectivity.activeNetwork)
+                ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) != true)
+        val request = selectedWakeRequest(context)
+        report("event=wake_configuration mode=${request.mode} " +
+            "worker_configured=${request.workerConfigured} direct_configured=${request.githubDirectConfigured} " +
+            "worker_aliases=${request.workerBaseUrls.size}")
+        val coordinator = CodespaceWakeCoordinator(
+            WorkerRouteCoordinator(WorkerNetwork.createApiService(loggingEnabled = false)),
+            GitHubCodespaceCoordinator(GitHubNetwork.createApiService(loggingEnabled = false))
+        )
+        val startedAt = SystemClock.elapsedRealtime()
+        val outcome = coordinator.ensureReady(request, maxWaitMs = 90_000L) {
+            report("event=wake_progress backend=${it.backend} phase=${it.phase} attempt=${it.attempt} " +
+                "retry_after_ms=${it.retryAfterMs} elapsed_ms=${SystemClock.elapsedRealtime() - startedAt}")
+        }
+        when (outcome) {
+            is CodespaceWakeOutcome.Ready -> report("event=wake_ready backend=${outcome.backend} " +
+                "route_ready=${outcome.routeReady} elapsed_ms=${SystemClock.elapsedRealtime() - startedAt}")
+            is CodespaceWakeOutcome.Failed -> report("event=wake_failed backend=${outcome.backend} " +
+                "http=${outcome.httpCode} control_plane_unavailable=${outcome.controlPlaneUnavailable} " +
+                "retry_allowed=${outcome.retryAllowed} retry_after_ms=${outcome.retryAfterMs} " +
+                "elapsed_ms=${SystemClock.elapsedRealtime() - startedAt}")
+            is CodespaceWakeOutcome.TimedOut -> report("event=wake_timeout backend=${outcome.backend} " +
+                "retry_after_ms=${outcome.retryAfterMs} elapsed_ms=${SystemClock.elapsedRealtime() - startedAt}")
+        }
+        assertTrue("The selected account could not wake its Codespace on the physical network",
+            outcome is CodespaceWakeOutcome.Ready)
+    }
+
+    private fun selectedWakeRequest(context: G2RayApplication): CodespaceWakeRequest {
+        val repository = context.accountRepository
+        assertTrue("Saved data failed to load", repository.loadError.value == null)
+        val selection = repository.activeSelection.value
+        val account = repository.accounts.value.firstOrNull { it.id == selection.accountId }
+            ?: error("Select a Codespace account before this test")
+        val workerKey = repository.apiKeys.value.firstOrNull {
+            it.id == selection.apiKeyId && it.accountId == account.id && it.enabled &&
+                it.kind == ApiKeyKind.WORKER_WAKE_SECRET
+        } ?: repository.enabledApiKey(account.id, ApiKeyKind.WORKER_WAKE_SECRET)
+        val githubKey = repository.enabledApiKey(account.id, ApiKeyKind.GITHUB_TOKEN)
+        val controlPlane = repository.workerControlPlane.value
+        val mode = InstrumentationRegistry.getArguments().getString("wakeBackend")?.let {
+            CodespaceWakeMode.valueOf(it)
+        } ?: account.wakeMode
+        return CodespaceWakeRequest(
+            mode = mode,
+            githubCodespaceName = account.codespaceName.orEmpty(),
+            workerCodespaceId = account.workerCodespaceId ?: account.codespaceName,
+            workerBaseUrls = controlPlane?.workerBaseUrls()?.takeIf { it.isNotEmpty() }
+                ?: account.workerBaseUrls(),
+            workerSecret = controlPlane?.encryptedWakeSecret?.takeIf { it.isNotBlank() }
+                ?: workerKey?.encryptedValue,
+            githubToken = githubKey?.encryptedValue
+        )
+    }
+
+    @Test
     fun selectedProfileCarriesTrafficAndRecoversAfterBackgroundIdle() = runLiveTest()
+
+    @Test
+    fun selectedProfileStartsThroughUiAndSurvivesIdle() = runLiveTest(uiStart = true)
+
+    @Test
+    fun selectedAccountControlPlaneWorksWhileVpnIsActive() = runLiveTest(controlPlaneCheck = true)
 
     @Test
     fun selectedProfileRecoversAfterRepeatedCoreFailures() {
@@ -64,7 +145,11 @@ class LiveVpnDeviceTest {
         runLiveTest(coreFailureCycles = 2)
     }
 
-    private fun runLiveTest(coreFailureCycles: Int = 0) = runBlocking {
+    private fun runLiveTest(
+        coreFailureCycles: Int = 0,
+        uiStart: Boolean = false,
+        controlPlaneCheck: Boolean = false
+    ) = runBlocking {
         val args = InstrumentationRegistry.getArguments()
         assumeTrue("Live network tests require -e liveVpn true", args.getString("liveVpn") == "true")
         val context = ApplicationProvider.getApplicationContext<G2RayApplication>()
@@ -84,8 +169,13 @@ class LiveVpnDeviceTest {
             }
         }
         assertNotNull("No matching saved transport profile exists on the selected edge", profile)
-        val mode = VpnEngineMode.fromStorage(args.getString("engine") ?: "hev")
+        assertTrue("UI startup uses the selected profile, not a transport override",
+            !uiStart || transport == null || transport == selected!!.transport)
+        val mode = if (uiStart) VpnEnginePreferences(context).getMode() else {
+            VpnEngineMode.fromStorage(args.getString("engine") ?: "hev")
+        }
         val idleSeconds = (args.getString("idleSeconds")?.toLongOrNull() ?: 60L).coerceIn(60L, 600L)
+        val resumeVpnActivity = args.getString("resumeVpnActivity") != "false"
         val client = OkHttpClient.Builder()
             // No SOCKS proxy, socket protection, or underlying-network binding:
             // these requests must traverse Android's default full-device VPN.
@@ -105,24 +195,31 @@ class LiveVpnDeviceTest {
 
         var scenario = ActivityScenario.launch(MainActivity::class.java)
         var startRequested = false
+        var uiViewModel: G2RayViewModel? = null
         val lifecycleTrace = launch(Dispatchers.Default) {
             VpnStateRepository.state
-                .map { Triple(it.tunnelState, it.tunnelVerified, it.activeVpnEngine) }
+                .map { Triple(it.tunnelState, it.tunnelVerified, it.activeVpnEngine) to startupPhase(it.message) }
                 .distinctUntilChanged()
-                .collect { (state, verified, engine) ->
+                .collect { (stateInfo, phase) ->
+                    val (state, verified, engine) = stateInfo
                     report("event=tunnel_state state=$state verified=$verified engine=$engine " +
-                        "elapsed_ms=${SystemClock.elapsedRealtime()}")
+                        "phase=$phase elapsed_ms=${SystemClock.elapsedRealtime()}")
                 }
         }
         try {
             val startedAt = SystemClock.elapsedRealtime()
             scenario.onActivity { activity ->
-                ContextCompat.startForegroundService(activity, Intent(activity, G2RayVpnService::class.java).apply {
-                    action = G2RayVpnService.ACTION_START
-                    putExtra(G2RayVpnService.EXTRA_RAW_PROFILE_URI, profile!!.rawUri)
-                    putExtra(G2RayVpnService.EXTRA_ACCOUNT_ID, selection.accountId)
-                    putExtra(G2RayVpnService.EXTRA_VPN_ENGINE_MODE, mode.storageValue)
-                })
+                if (uiStart) {
+                    uiViewModel = ViewModelProvider(activity)[G2RayViewModel::class.java]
+                    uiViewModel!!.startVpn(activity)
+                } else {
+                    ContextCompat.startForegroundService(activity, Intent(activity, G2RayVpnService::class.java).apply {
+                        action = G2RayVpnService.ACTION_START
+                        putExtra(G2RayVpnService.EXTRA_RAW_PROFILE_URI, profile!!.rawUri)
+                        putExtra(G2RayVpnService.EXTRA_ACCOUNT_ID, selection.accountId)
+                        putExtra(G2RayVpnService.EXTRA_VPN_ENGINE_MODE, mode.storageValue)
+                    })
+                }
                 startRequested = true
             }
             val connected = withTimeout(180_000L) {
@@ -133,7 +230,7 @@ class LiveVpnDeviceTest {
             assertEquals("Tunnel failed to verify", TunnelState.Connected, connected.tunnelState)
             val expectedEngine = if (mode == VpnEngineMode.XrayNative) ActiveVpnEngine.XrayNative else ActiveVpnEngine.Hev
             assertEquals("The requested engine was not exercised", expectedEngine, connected.activeVpnEngine)
-            report("engine=${mode.storageValue} transport=${profile!!.transport} " +
+            report("engine=${mode.storageValue} transport=${profile!!.transport} ui_start=$uiStart " +
                 "verified_start_ms=${SystemClock.elapsedRealtime() - startedAt}")
 
             val connectivity = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -156,6 +253,10 @@ class LiveVpnDeviceTest {
                 assertEquals(TunnelTrafficSource.Unavailable, VpnStateRepository.state.value.tunnelTrafficSource)
             }
 
+            if (controlPlaneCheck) {
+                verifyActiveControlPlane(context)
+                return@runBlocking
+            }
             if (coreFailureCycles > 0) {
                 repeatCoreFailureRecovery(client, coreFailureCycles)
                 return@runBlocking
@@ -171,14 +272,17 @@ class LiveVpnDeviceTest {
             // Reopen through Android's normal activity launch path. Trying to
             // force a stopped test activity to RESUMED after screen-off can
             // fail in the harness without demonstrating any VPN failure.
-            scenario.close()
-            scenario = ActivityScenario.launch(MainActivity::class.java)
+            if (resumeVpnActivity) {
+                scenario.close()
+                scenario = ActivityScenario.launch(MainActivity::class.java)
+            }
             assertTrue(
                 "Default network left the VPN after idle or activity recreation",
                 connectivity.getNetworkCapabilities(connectivity.activeNetwork)
                     ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
             )
             report("idle_finished_device_interactive=${power.isInteractive} " +
+                "resumed_vpn_activity=$resumeVpnActivity " +
                 "actual_idle_gap_ms=${SystemClock.elapsedRealtime() - idleStartedAt}")
             val retainedResponsive = probeHttpsQuorum(client, "idle_resume_retained_pool")
             client.connectionPool.evictAll()
@@ -190,9 +294,15 @@ class LiveVpnDeviceTest {
             try {
                 if (startRequested) {
                     // Cleanup must not depend on restoring a foreground UI.
-                    context.startService(Intent(context, G2RayVpnService::class.java).apply {
-                        action = G2RayVpnService.ACTION_STOP
-                    })
+                    if (uiViewModel != null) {
+                        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                            uiViewModel!!.stopVpn(context)
+                        }
+                    } else {
+                        context.startService(Intent(context, G2RayVpnService::class.java).apply {
+                            action = G2RayVpnService.ACTION_STOP
+                        })
+                    }
                     withTimeout(15_000L) {
                         VpnStateRepository.state.first { it.tunnelState == TunnelState.Disconnected }
                     }
@@ -208,6 +318,48 @@ class LiveVpnDeviceTest {
                 }
             }
         }
+    }
+
+    @Suppress("DEPRECATION")
+    private suspend fun verifyActiveControlPlane(context: G2RayApplication) {
+        val service = SocketProtector.vpnService ?: error("The test VPN service is not active")
+        val connectivity = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val physical = connectivity.allNetworks.firstOrNull {
+            val capabilities = connectivity.getNetworkCapabilities(it)
+            capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true &&
+                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+        } ?: error("No physical network is available")
+        Socket().use { socket ->
+            report("event=socket_descriptor_probe protect_before_materialization=" +
+                runCatching { service.protect(socket) }.getOrDefault(false))
+        }
+        Socket().use { socket ->
+            physical.bindSocket(socket)
+            report("event=socket_descriptor_probe protect_after_network_bind=${service.protect(socket)}")
+        }
+        Socket().use { socket ->
+            assertTrue("The production recovery socket was rejected before connect",
+                SocketProtector.protectControlPlane(socket))
+            assertTrue("Protection unexpectedly connected the recovery socket", !socket.isConnected)
+        }
+        val coordinator = CodespaceWakeCoordinator(
+            WorkerRouteCoordinator(WorkerNetwork.createApiService(
+                loggingEnabled = false,
+                protectSocket = SocketProtector::protectControlPlane,
+                dnsLookup = SocketProtector::lookupControlPlane
+            )),
+            GitHubCodespaceCoordinator(GitHubNetwork.createApiService(
+                loggingEnabled = false,
+                protectSocket = SocketProtector::protectControlPlane,
+                dnsLookup = SocketProtector::lookupControlPlane
+            ))
+        )
+        val startedAt = SystemClock.elapsedRealtime()
+        val outcome = coordinator.ensureReady(selectedWakeRequest(context), maxWaitMs = 30_000L)
+        report("event=active_control_plane outcome=${outcome.javaClass.simpleName} " +
+            "elapsed_ms=${SystemClock.elapsedRealtime() - startedAt}")
+        assertTrue("Recovery could not contact its backend while the VPN was active",
+            outcome is CodespaceWakeOutcome.Ready)
     }
 
     private suspend fun repeatCoreFailureRecovery(client: OkHttpClient, cycles: Int) =
@@ -318,6 +470,22 @@ class LiveVpnDeviceTest {
         InstrumentationRegistry.getInstrumentation().sendStatus(2, Bundle().apply {
             putString("stream", "\nLIVE_VPN $message\n")
         })
+    }
+
+    private fun startupPhase(message: String): String = when {
+        message.startsWith("Contacting Codespace Worker") -> "worker_contact"
+        message.startsWith("Worker is unreachable") -> "direct_fallback"
+        message.startsWith("Codespace route is settling") -> "route_settling"
+        message.startsWith("Checking Codespace route") -> "route_check"
+        message.startsWith("Checking Codespace state with GitHub") -> "direct_check"
+        message.startsWith("Starting Codespace through GitHub") -> "direct_start"
+        message.startsWith("Waiting for GitHub") -> "direct_settling"
+        message.startsWith("No underlying network") -> "network_wait"
+        message.contains("Retrying automatically") -> "retry_backoff"
+        message.contains("Recovering...") -> "initial_route_failure"
+        message.startsWith("Checking config route") -> "initial_route_check"
+        message.startsWith("The Android packet path stalled") -> "packet_engine_repair"
+        else -> "other"
     }
 
     private companion object {

@@ -78,11 +78,12 @@ object SocketProtector {
      */
     fun protectControlPlane(socket: Socket): Boolean {
         val service = vpnService ?: return true
-        if (!service.protect(socket)) {
-            return false
-        }
         val network = underlyingNetwork ?: return false
         return runCatching {
+            // Android creates Socket's native FD lazily. Read an option before
+            // protect(), without binding or connecting through the dead VPN.
+            socket.soLinger
+            if (!service.protect(socket)) return@runCatching false
             network.bindSocket(socket)
             true
         }.getOrDefault(false)

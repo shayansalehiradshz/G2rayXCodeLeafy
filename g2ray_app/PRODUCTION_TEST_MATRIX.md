@@ -39,6 +39,28 @@ does not prove a screen-off test. Retained and fresh HTTPS each need two of
 three endpoints within six seconds. Failed retained checks must remain visible
 even when fresh sockets work.
 
+Repeat with `-e resumeVpnActivity false` so the data requests resume while the
+VPN activity remains stopped. This models returning to a different app rather
+than opening the VPN UI and triggering its foreground re-verification.
+
+Test the ordinary Start VPN path separately with the Codespace stopped:
+
+```powershell
+adb shell am instrument -w -r -e class 'com.g2ray.client.vpn.LiveVpnDeviceTest#selectedProfileStartsThroughUiAndSurvivesIdle' -e liveVpn true -e idleSeconds 60 com.g2ray.client.test/androidx.test.runner.AndroidJUnitRunner
+```
+
+This uses the selected profile and saved engine preference through the actual
+ViewModel action. The service-only test above remains separate for restoration
+and recovery coverage; passing the UI path must not hide a service-start failure.
+
+With VPN stopped, `selectedAccountWakesOnPhysicalNetwork` and `-e liveWake true`
+checks the saved wake backend directly. With a ready Codespace,
+`selectedAccountControlPlaneWorksWhileVpnIsActive` and `-e liveVpn true` checks
+the production protected socket and real recovery API while VPN is active.
+The optional `-e wakeBackend WORKER` or `GITHUB_DIRECT` selects a test backend
+without changing saved account settings. These opt-in calls can start a host.
+No keys, raw profile links, or backend error bodies are printed.
+
 Run core-failure recovery independently, again with both engines:
 
 ```powershell
