@@ -398,6 +398,8 @@ test_tcp_fast_open_is_gated_and_outbound_only() {
         || fail 'script does not provide a kernel-gated TCP Fast Open toggle'
     grep_fixed 'G2RAY_TCP_FAST_OPEN' "$SCRIPT" \
         || fail 'TCP Fast Open is not configurable via G2RAY_TCP_FAST_OPEN'
+    grep_fixed '${G2RAY_TCP_FAST_OPEN:-0}' "$SCRIPT" \
+        || fail 'origin TCP Fast Open must not be enabled by kernel capability alone'
     grep_fixed '/proc/sys/net/ipv4/tcp_fastopen' "$SCRIPT" \
         || fail 'TCP Fast Open auto mode does not check kernel client support before enabling'
     grep_fixed 'tcpFastOpen\": true' "$SCRIPT" \
@@ -408,7 +410,7 @@ test_tcp_fast_open_is_gated_and_outbound_only() {
         || fail 'README does not document the TCP Fast Open toggle'
     grep_fixed 'TCP FastOpen:' "$SCRIPT" \
         || fail 'diagnostics do not surface TCP Fast Open status'
-    pass 'TCP Fast Open is kernel-gated and applied only to the direct outbound'
+    pass 'TCP Fast Open is opt-in, supports kernel-gated auto, and applies only to the direct outbound'
 }
 
 test_connection_keepalive_and_halfclose_are_tuned() {

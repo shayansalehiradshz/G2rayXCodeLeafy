@@ -674,17 +674,16 @@ support_include_network_enabled() {
 }
 
 tcp_fast_open_outbound_enabled() {
-    # TCP Fast Open on the freedom (direct) outbound lets Codespace->origin
-    # connections skip a round-trip on setup. It applies ONLY to outbound dials
-    # to destination sites, never to the inbound XHTTP tunnel from GitHub's edge.
-    # Default "auto" enables it only when the kernel advertises client TFO
-    # support (net.ipv4.tcp_fastopen bit 0x1); on a kernel without it we leave it
-    # off so a setsockopt failure can never break outbound dialing.
+    # Kernel capability does not prove path compatibility: origin TFO caused
+    # retained HTTPS stalls in live A/B checks. Keep it opt-in. Explicit auto
+    # still checks the kernel's client-support bit; never apply it to inbounds.
     local override value
-    override=$(printf '%s' "${G2RAY_TCP_FAST_OPEN:-auto}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    override=$(printf '%s' "${G2RAY_TCP_FAST_OPEN:-0}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
     case "$override" in
         0|false|no|off|disabled) return 1 ;;
         1|true|yes|on|enabled) return 0 ;;
+        auto) ;;
+        *) return 1 ;;
     esac
     value=$(cat /proc/sys/net/ipv4/tcp_fastopen 2>/dev/null || printf '0')
     [[ "$value" =~ ^[0-9]+$ ]] || value=0
@@ -3156,12 +3155,14 @@ upgrade_config_dns() {
         return 0
     fi
 
-    local tmp
+    local tmp origin_tfo=false
     tmp=$(mktemp "${CONFIG_FILE}.dns.XXXXXX") || {
         log_event WARN "config_dns temp_create_failed"
         return 1
     }
-    if jq --argjson ws_heartbeat "$WS_HEARTBEAT_PERIOD_SEC" --argjson max_buffered_posts "$XHTTP_SERVER_MAX_BUFFERED_POSTS" '
+    if tcp_fast_open_outbound_enabled; then origin_tfo=true; fi
+    if jq --argjson ws_heartbeat "$WS_HEARTBEAT_PERIOD_SEC" --argjson max_buffered_posts "$XHTTP_SERVER_MAX_BUFFERED_POSTS" \
+      --argjson origin_tfo "$origin_tfo" '
       .dns = {
         "servers": ["localhost", "168.63.129.16", "1.1.1.1", "1.0.0.1", "8.8.8.8"],
         "queryStrategy": "UseIPv4",
@@ -3189,6 +3190,7 @@ upgrade_config_dns() {
           (if . == null or . < $max_buffered_posts then $max_buffered_posts else . end)
       | (.inbounds[]? | select(.tag == "vless-ws" and .streamSettings.wsSettings?) | .streamSettings.wsSettings.heartbeatPeriod) = $ws_heartbeat
       | (.outbounds[]? | select(.protocol == "blackhole") | .settings.response.type) = "none"
+      | (.outbounds[]? | select(.tag == "direct" and .protocol == "freedom") | .streamSettings.sockopt.tcpFastOpen) = $origin_tfo
       | (.policy.levels["0"].handshake) |=
           (if . == null or . < 4 then 4 else . end)
     ' "$CONFIG_FILE" > "$tmp" 2>/dev/null; then
@@ -3307,7 +3309,12 @@ _start_xray_impl() {
         log_event ERROR "start_xray config_backup_failed"
         return 1
     fi
-    upgrade_config_dns >/dev/null 2>&1 || true
+    if ! upgrade_config_dns >/dev/null 2>&1; then
+        restore_prestart_config_backup "$config_backup" "config_migration_failed" || true
+        log_event ERROR "start_xray config_migration_failed action=preserve_current_engine"
+        echo -e "  ${RED}Could not migrate Xray config. Current engine was not stopped.${NC}"
+        return 1
+    fi
     if ! xray_validate_config; then
         restore_prestart_config_backup "$config_backup" "migration_validation_failed" || true
         return 1
@@ -4086,13 +4093,14 @@ _generate_config_impl() {
     # its inbound mode is auto. Client links still use the explicit panel
     # preference, preserving a conservative packet-up default.
     xhttp_accept_mode="auto"
-    # Outbound socket options: TCP keepalive always (keep origin connections warm
-    # and detect dead peers), plus TCP Fast Open when the kernel supports it.
+    # Keep origin connections warm, with Fast Open only when explicitly enabled.
     local direct_sockopt tfo_state="off" sockopt_inner
     sockopt_inner="\"tcpKeepAliveInterval\": ${TCP_KEEPALIVE_INTERVAL_SEC}, \"tcpKeepAliveIdle\": ${TCP_KEEPALIVE_IDLE_SEC}"
     if tcp_fast_open_outbound_enabled; then
         sockopt_inner="\"tcpFastOpen\": true, ${sockopt_inner}"
         tfo_state="on"
+    else
+        sockopt_inner="\"tcpFastOpen\": false, ${sockopt_inner}"
     fi
     direct_sockopt=", \"streamSettings\": { \"sockopt\": { ${sockopt_inner} } }"
     local ws_inbound_json="" ws_path

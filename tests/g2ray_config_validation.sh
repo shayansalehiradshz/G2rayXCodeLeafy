@@ -9,6 +9,7 @@ CORE="${1:-/usr/local/bin/xray}"
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/g2ray-config-validation.XXXXXX")"
 trap 'rm -rf "$TMP_ROOT"' EXIT
 export G2RAY_SOURCE_ONLY=1 G2RAY_DATA_DIR="$TMP_ROOT/data" G2RAY_LOG_DIR="$TMP_ROOT/logs"
+export G2RAY_TCP_FAST_OPEN=0
 # shellcheck source=../g2ray.sh
 source "$ROOT_DIR/g2ray.sh"
 XRAY_BIN="$CORE"
@@ -35,12 +36,15 @@ for profile in balanced low_latency streaming low_overhead max_throughput; do
         if [[ "$ws" == enabled ]]; then touch "$WS_FALLBACK_FILE"; else touch "$WS_FALLBACK_DISABLED_FILE"; fi
         generate_config > "$TMP_ROOT/generate.log" 2>&1 || { cat "$TMP_ROOT/generate.log"; exit 1; }
         jq -e '[.inbounds[] | select(.protocol == "vless") | .sniffing.routeOnly] | all(. == true)' "$CONFIG_FILE" >/dev/null
+        jq -e '.outbounds[] | select(.tag == "direct") | .streamSettings.sockopt.tcpFastOpen == false' "$CONFIG_FILE" >/dev/null
         # Exercise the same migration used for existing user configs.
-        jq '(.inbounds[] | select(.protocol == "vless") | .sniffing.routeOnly) = false' "$CONFIG_FILE" > "$TMP_ROOT/old.json"
+        jq '(.inbounds[] | select(.protocol == "vless") | .sniffing.routeOnly) = false
+            | (.outbounds[] | select(.tag == "direct") | .streamSettings.sockopt.tcpFastOpen) = true' "$CONFIG_FILE" > "$TMP_ROOT/old.json"
         mv "$TMP_ROOT/old.json" "$CONFIG_FILE"
         upgrade_config_dns
         xray_validate_config_file "$CONFIG_FILE"
         jq -e '[.inbounds[] | select(.protocol == "vless") | .sniffing.routeOnly] | all(. == true)' "$CONFIG_FILE" >/dev/null
+        jq -e '.outbounds[] | select(.tag == "direct") | .streamSettings.sockopt.tcpFastOpen == false' "$CONFIG_FILE" >/dev/null
         printf 'PASS: real Xray accepts generated and migrated %s / WS %s\n' "$profile" "$ws"
     done
 done

@@ -1,5 +1,7 @@
 /data/
 /logs/
+__pycache__/
+*.py[cod]
 /configs.txt
 /configs-to-copy-for-mobile.txt
 /configs-to-copy-for-mobile.txt.*

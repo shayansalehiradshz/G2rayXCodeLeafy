@@ -108,12 +108,31 @@ def exercise(library, with_payload):
         if with_payload:
             local.send(packet(1001, server_sequence + 1, 0x10))
             local.send(packet(1001, server_sequence + 1, 0x18, b"request"))
-            while time.monotonic() < deadline and library.hev_socks5_tunnel_tcp_payload_stats() < len(payload):
-                if select.select([local], [], [], 0.05)[0]:
-                    local.recv(65535)
+            received = bytearray()
+            expected_sequence = server_sequence + 1
+            closed_to_app = False
+            while time.monotonic() < deadline and not closed_to_app:
+                if not select.select([local], [], [], 0.05)[0]:
+                    continue
+                response = local.recv(65535)
+                offset = (response[0] & 15) * 4
+                sequence = struct.unpack_from("!I", response, offset + 4)[0]
+                data_offset = offset + (response[offset + 12] >> 4) * 4
+                data = response[data_offset:]
+                flags = response[offset + 13]
+                if data and sequence == expected_sequence:
+                    received.extend(data)
+                    expected_sequence += len(data)
+                if flags & 0x01 and sequence + len(data) == expected_sequence:
+                    expected_sequence += 1
+                    closed_to_app = True
+                local.send(packet(1008, expected_sequence, 0x10))
             assert not server_errors, server_errors
+            assert bytes(received) == payload, "HEV lost or changed response bytes"
             assert library.hev_socks5_tunnel_tcp_payload_stats() == len(payload)
             print("PASS: genuine SOCKS response payload increments the upstream counter", flush=True)
+            assert closed_to_app, "Upstream EOF did not reach the app as a TCP FIN within five seconds"
+            print("PASS: upstream EOF closes the app-facing flow after delivering all payload", flush=True)
         else:
             counters = [ctypes.c_size_t() for _ in range(4)]
             library.hev_socks5_tunnel_stats(*(ctypes.byref(value) for value in counters))

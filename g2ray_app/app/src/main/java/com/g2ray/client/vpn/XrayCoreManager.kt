@@ -41,6 +41,7 @@ data class RunningRouteResult(
 
 enum class RouteFailureScope {
     None,
+    Configuration,
     PacketEngine,
     XrayRoute,
     DialerBinding,
@@ -340,6 +341,7 @@ class XrayCoreManager : TunnelCore {
     override val state: StateFlow<TunnelCoreState> = _state.asStateFlow()
     private val _lastError = MutableStateFlow<String?>(null)
     val lastError: StateFlow<String?> = _lastError.asStateFlow()
+    private var startupRetryAllowed = true
     private var consecutiveStateQueryFailures = 0
     private val nativeRuntime by lazy {
         if (bridge is ReflectionXrayBridge) NativeRuntimeCoordinator.process else NativeRuntimeCoordinator()
@@ -779,7 +781,9 @@ class XrayCoreManager : TunnelCore {
         dpiCompatibilityEnabled: Boolean = false,
         fallbackProfiles: List<G2RayProfile> = emptyList()
     ) {
+        startupRetryAllowed = true
         if (!bridge.isAvailable()) {
+            startupRetryAllowed = false
             _lastError.value = MISSING_CORE_MESSAGE
             _state.value = TunnelCoreState.Error
             return
@@ -835,6 +839,9 @@ class XrayCoreManager : TunnelCore {
                 }
 
                 lastStartupError = result.error ?: "Local SOCKS listener did not become ready after starting Xray"
+                // Xray's config decoder/builder rejects these before any route
+                // is dialed. Retrying ports or waking a server cannot fix them.
+                startupRetryAllowed = !lastStartupError.contains("infra/conf", ignoreCase = true)
                 runCatching { bridge.stop() }
                 healthSocksPort = null
                 if (runCatching { bridge.getState() }.getOrDefault(true)) {
@@ -859,6 +866,8 @@ class XrayCoreManager : TunnelCore {
         } catch (e: Exception) {
             runCatching { bridge.stop() }
             healthSocksPort = null
+            startupRetryAllowed = e !is org.json.JSONException &&
+                e !is IllegalArgumentException && e !is NoSuchMethodException
             _lastError.value = e.localizedMessage ?: e.javaClass.simpleName
             _state.value = TunnelCoreState.Error
         } finally {
@@ -867,6 +876,13 @@ class XrayCoreManager : TunnelCore {
     }
 
     fun activeSocksPort(): Int? = healthSocksPort
+
+    internal fun startupFailureResult(): RunningRouteResult = RunningRouteResult(
+        success = false,
+        error = _lastError.value ?: "Xray failed to start",
+        failureScope = if (startupRetryAllowed) RouteFailureScope.Unknown else RouteFailureScope.Configuration,
+        retryAllowed = startupRetryAllowed
+    )
 
     fun resetRouteProbeConnections() {
         runningRouteProbe.reset()

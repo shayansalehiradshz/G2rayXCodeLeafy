@@ -32,6 +32,12 @@ jobs:
           cache: npm
           cache-dependency-path: worker/codespace-waker/package-lock.json
 
+      - name: Set up Go for the standalone diagnostic fixtures
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.3"
+          cache: false
+
       - name: Install Worker dependencies
         working-directory: worker/codespace-waker
         run: npm ci
@@ -44,6 +50,7 @@ jobs:
           bash -n ./tests/g2ray_behavior_tests.sh
           python3 ./tests/xray_upload_queue_validation.py --help >/dev/null
           python3 ./tests/xray_authenticated_transport_check.py --help >/dev/null
+          python3 ./tests/xray_client_failure_validation.py --help >/dev/null
 
       - name: Syntax check Worker
         working-directory: worker/codespace-waker
@@ -61,6 +68,11 @@ jobs:
 
       - name: Run deterministic benchmark budgets
         run: bash ./g2ray.sh bench --json --mock
+
+      - name: Validate retained HTTP/2 diagnostic without Internet traffic
+        run: |
+          go test -race ./tests/xray_retained_http_check.go ./tests/xray_retained_http_check_test.go
+          python3 tests/xray_authenticated_transport_check_test.py
 
   xray-core-tests:
     runs-on: ubuntu-latest
@@ -86,6 +98,7 @@ jobs:
           unzip -q "$tmp/release.zip" -d "$tmp/core"
           chmod +x "$tmp/core/xray"
           python3 tests/xray_upload_queue_validation.py "$tmp/core/xray"
+          python3 tests/xray_client_failure_validation.py "$tmp/core/xray"
           bash tests/g2ray_config_validation.sh "$tmp/core/xray"
 
   extended-tests:

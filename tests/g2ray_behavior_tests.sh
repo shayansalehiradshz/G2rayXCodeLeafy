@@ -115,6 +115,7 @@ reset_runtime_paths() {
     ROUTE_DEGRADED_TRIGGER_COUNT=2
     ROUTE_DEGRADED_REFRESH_COOLDOWN_SEC=300
     unset G2RAY_XHTTP_LINK_TUNING
+    unset G2RAY_TCP_FAST_OPEN
     unset G2RAY_LOW_OVERHEAD G2RAY_LATENCY_FOCUS G2RAY_PERFORMANCE_PROFILE G2RAY_EXPORT_DOMAIN_LINK G2RAY_XHTTP_EXTRA_JSON G2RAY_XHTTP_MODE G2RAY_ENABLE_WS_FALLBACK G2RAY_WS_PORT G2RAY_WS_MAX_FALLBACK_LINKS G2RAY_BENCH_MOCK G2RAY_BENCH_ISOLATED G2RAY_PORT_FORWARDING_DOMAIN GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN
 }
 
@@ -136,6 +137,58 @@ source "$SCRIPT"
 ORIGINAL_RUN_GH="$(declare -f run_gh)"
 ORIGINAL_XRAY_RUNNING="$(declare -f xray_running)"
 reset_runtime_paths
+
+test_tcp_fast_open_requires_explicit_opt_in() {
+    (
+        reset_runtime_paths
+        local mock_tfo_kernel=3
+        cat() {
+            if [[ "${1:-}" == /proc/sys/net/ipv4/tcp_fastopen ]]; then
+                printf '%s\n' "$mock_tfo_kernel"
+            else
+                command cat "$@"
+            fi
+        }
+        if tcp_fast_open_outbound_enabled; then
+            fail 'kernel capability alone enabled origin TFO by default'
+        fi
+        G2RAY_TCP_FAST_OPEN=auto tcp_fast_open_outbound_enabled \
+            || fail 'explicit auto did not honor supported client TFO'
+        mock_tfo_kernel=2
+        if G2RAY_TCP_FAST_OPEN=auto tcp_fast_open_outbound_enabled; then
+            fail 'explicit auto enabled TFO on a server-only kernel'
+        fi
+        G2RAY_TCP_FAST_OPEN=1 tcp_fast_open_outbound_enabled \
+            || fail 'explicit force-on stopped working'
+        mock_tfo_kernel=3
+        if G2RAY_TCP_FAST_OPEN=invalid tcp_fast_open_outbound_enabled; then
+            fail 'invalid TFO setting fell back to unsafe enablement'
+        fi
+        pass 'origin TFO is off by default, with explicit kernel-gated auto and force-on'
+    )
+}
+
+test_existing_config_upgrade_disables_unrequested_origin_tfo() {
+    (
+        reset_runtime_paths
+        write_test_vless_config
+        jq '.outbounds = [{"protocol":"freedom","tag":"direct","streamSettings":{"sockopt":{"tcpFastOpen":true,"tcpKeepAliveIdle":30,"tcpKeepAliveInterval":15}}},
+                          {"protocol":"freedom","tag":"custom","streamSettings":{"sockopt":{"tcpFastOpen":true}}}]' \
+            "$CONFIG_FILE" > "$TMP_ROOT/tfo-fixture.json"
+        mv "$TMP_ROOT/tfo-fixture.json" "$CONFIG_FILE"
+        upgrade_config_dns
+        jq -e '.outbounds[0].streamSettings.sockopt.tcpFastOpen == false and
+               .outbounds[0].streamSettings.sockopt.tcpKeepAliveIdle == 30 and
+               .outbounds[0].streamSettings.sockopt.tcpKeepAliveInterval == 15 and
+               .outbounds[1].streamSettings.sockopt.tcpFastOpen == true and
+               .inbounds[0].settings.clients[0].id == "11111111-2222-4333-8444-555555555555"' \
+            "$CONFIG_FILE" >/dev/null || fail 'TFO migration changed identity/socket settings or retained unsafe default'
+        G2RAY_TCP_FAST_OPEN=1 upgrade_config_dns
+        jq -e '.outbounds[0].streamSettings.sockopt.tcpFastOpen == true' "$CONFIG_FILE" >/dev/null \
+            || fail 'migration ignored an explicit TFO override'
+        pass 'TFO migration preserves UUID, keepalive, custom outbounds, and explicit overrides'
+    )
+}
 
 test_probe_variation_tracks_successes_and_preserves_legacy_rows() {
     reset_runtime_paths
@@ -2084,6 +2137,25 @@ JSON
     [[ "$(jq -r '.inbounds[0].sniffing.routeOnly' "$CONFIG_FILE")" == "true" ]] \
         || fail "existing XHTTP migration still allows sniffing to rewrite explicit destinations"
     pass "existing XHTTP config accepts all supported client modes without changing identity"
+}
+
+test_start_xray_preserves_engine_when_config_migration_fails() {
+    (
+        reset_runtime_paths
+        write_test_vless_config
+        cp "$CONFIG_FILE" "$TMP_ROOT/before-migration.json"
+        upgrade_config_dns() { return 1; }
+        xray_validate_config() { fail 'failed migration must not be treated as successful preflight'; }
+        stop_xray() { fail 'failed migration must not stop the existing engine'; }
+        if start_xray >/dev/null 2>&1; then
+            fail 'start_xray ignored a config migration failure'
+        fi
+        cmp -s "$CONFIG_FILE" "$TMP_ROOT/before-migration.json" \
+            || fail 'failed migration did not preserve the previous config'
+        grep -Fq 'config_migration_failed' "$LOG_FILE" \
+            || fail 'migration failure was not logged separately'
+    )
+    pass 'startup preserves current engine and config when migration fails'
 }
 
 test_start_xray_restores_config_when_migrated_config_is_invalid() {
@@ -4791,6 +4863,8 @@ test_deadline_stops_term_resistant_writers
 test_deadline_fails_closed_without_temp_storage
 test_deadline_rejects_unverified_process_group
 test_post_start_propagates_silent_start_failure
+test_tcp_fast_open_requires_explicit_opt_in
+test_existing_config_upgrade_disables_unrequested_origin_tfo
 test_generate_config_respects_runtime_lock_for_entire_transaction
 test_generate_config_failed_start_restores_previous_running_engine
 test_generate_config_preserves_old_engine_when_replacement_never_launches
@@ -4822,6 +4896,7 @@ test_generated_and_upgraded_configs_do_not_block_page_assets_as_ads
 test_existing_config_upgrade_preserves_uuid_and_safe_handshake_floor
 test_existing_xhttp_config_upgrade_accepts_all_client_modes
 test_start_xray_restores_config_when_migrated_config_is_invalid
+test_start_xray_preserves_engine_when_config_migration_fails
 test_start_xray_restores_config_when_previous_engine_cannot_stop
 test_start_xray_cleans_up_when_pid_state_cannot_be_committed
 test_session_uptime_recovers_from_corrupt_state

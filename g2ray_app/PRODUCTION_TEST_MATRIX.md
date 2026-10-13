@@ -20,6 +20,62 @@ The packaged-core device smoke test must also start and stop a three-outbound
 least-ping config; compiling its JSON alone is not enough to validate the JNI
 and pinned Xray runtime boundary.
 
+Source startup regressions must distinguish config-loader rejection from a
+temporary port/resource failure. A rejected selected config must not loop
+through packet engines, restarts, or wake requests. A malformed backup must
+not prevent trying a valid subsequent backup or overwrite the original
+route's transient retry policy.
+
+## Isolated Linux retained-flow diagnosis
+
+This opt-in check uses the private current bundle and a separate loopback
+Xray process. It does not restart the real server or test Android TUN/Doze.
+It distinguishes real HTTP/2 connection reuse from a replacement socket and
+keeps the same two-of-three-within-six-seconds response gate.
+The diagnostic needs Go on the build machine, not the running server. Go is
+not installed in every Codespace. Alternatively cross-compile this standalone
+helper for Linux/amd64 on a machine with Go (`GOOS=linux GOARCH=amd64 CGO_ENABLED=0`)
+and transfer that helper privately; it is not an app/server runtime dependency.
+
+```bash
+go build -o /tmp/g2ray-retained-http-probe tests/xray_retained_http_check.go
+python3 tests/xray_authenticated_transport_check.py /usr/local/bin/xray \
+  g2ray-codespace-bundle.json --live --transport xhttp \
+  --retained-probe /tmp/g2ray-retained-http-probe --idle-seconds 70
+```
+
+Run `--transport ws` separately so an XHTTP failure does not hide WebSocket
+results. Compare with the same host's direct baseline, without any proxy:
+
+```bash
+/tmp/g2ray-retained-http-probe --direct-baseline --idle-seconds 70
+```
+
+Isolate the running server's origin socket settings without using VLESS or the
+public edge. The helper copies only its `direct` freedom outbound and DNS into
+its own temporary core; it does not modify the server config:
+
+```bash
+python3 tests/xray_authenticated_transport_check.py /usr/local/bin/xray \
+  --origin-config data/config.json --live \
+  --retained-probe /tmp/g2ray-retained-http-probe --idle-seconds 70
+```
+
+Repeat with `--origin-disable-fast-open` as a one-factor experiment, and with
+`--loopback-baseline` to isolate forwarding from Internet egress. For an
+independent HTTP/2 client, replace `--retained-probe ... --idle-seconds ...`
+with `--retained-curl` (requires curl with HTTP/2, `%{json}`, and `--rate`).
+`--runtime-log-dir /private/test/logs` saves debug logs; never publish them.
+
+Fast Open is off by default for both new configs and existing-config startup
+migration. Kernel capability alone is not enough to enable it. Explicit opt-in
+must pass retained-flow and transfer acceptance on the actual network path.
+
+These commands contact real HTTPS endpoints. Do not publish the private bundle
+or raw runtime configs. The [13 October investigation](../PERFORMANCE_INVESTIGATION_2026-10-13.md)
+records failures as well as passes; a passing direct or SOCKS check cannot
+certify the phone's mobile-data path, six-hour sessions, or video playback.
+
 ## Opt-in live device regressions
 
 Save a working profile, grant VPN permission, and install both debug APKs

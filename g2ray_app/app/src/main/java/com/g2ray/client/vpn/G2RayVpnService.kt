@@ -1073,7 +1073,7 @@ class G2RayVpnService : VpnService() {
                     ) {
                         route = verifyRouteAfterTransition()
                     }
-                    if (!route.success) {
+                    if (!route.success && route.retryAllowed) {
                         markTunnelUnverified("${route.error ?: "Tunnel route check failed"} Recovering...")
                         route = recoverRouteWithWorker(
                             profile,
@@ -1655,6 +1655,7 @@ class G2RayVpnService : VpnService() {
         val firstResult = startEngineAndVerify(profile, tun, selectedEngine, lifecycleToken)
         if (
             firstResult.success ||
+            !firstResult.retryAllowed ||
             !VpnEngineSelector.shouldFallbackToNative(
                 mode = requestedEngineMode,
                 active = selectedEngine,
@@ -1706,7 +1707,7 @@ class G2RayVpnService : VpnService() {
             return RunningRouteResult(false, "VPN lifecycle changed while Xray was starting")
         }
         if (core.state.value != TunnelCoreState.Connected) {
-            return RunningRouteResult(false, core.lastError.value ?: "Xray failed to start")
+            return core.startupFailureResult()
         }
 
         if (engine == ActiveVpnEngine.Hev) {
@@ -1983,6 +1984,9 @@ class G2RayVpnService : VpnService() {
             val parsed = VlessUriParser.parse(stored.rawUri).getOrNull() ?: continue
             markTunnelUnverified("Trying backup route ${stored.displayName}...")
             val route = restartRouteOnce(parsed, tun, lifecycleToken)
+            // A malformed backup must not overwrite the original route's
+            // retry policy or prevent trying the next compatible profile.
+            if (!route.retryAllowed) continue
             if (route.success) {
                 activeProfile = parsed
                 rememberLastProfileContext(stored.rawUri, accountId)
@@ -2017,7 +2021,7 @@ class G2RayVpnService : VpnService() {
             } else {
                 diagnoseVpnRoute(resetConnections = true)
             }
-            if (route.success) return route
+            if (route.success || !route.retryAllowed) return route
             lastError = route.error ?: lastError
             delay(DIRECT_ROUTE_PROBE_INTERVAL_MS)
         }
@@ -2100,7 +2104,7 @@ class G2RayVpnService : VpnService() {
                 return RunningRouteResult(false, "VPN lifecycle changed while waiting for an underlying network")
             }
             val route = restartRouteOnce(profile, tun, lifecycleToken)
-            if (route.success) return route
+            if (route.success || !route.retryAllowed) return route
             lastError = route.error ?: lastError
             if (route.failureScope == RouteFailureScope.DialerBinding) {
                 return route
@@ -2183,7 +2187,7 @@ class G2RayVpnService : VpnService() {
                 return RunningRouteResult(false, "VPN lifecycle changed while waiting for an underlying network")
             }
             val route = restartRouteOnce(profile, tun, lifecycleToken)
-            if (route.success) return route
+            if (route.success || !route.retryAllowed) return route
             lastError = route.error ?: lastError
             if (attempt + 1 < MAX_LOCAL_ROUTE_RECOVERY_ATTEMPTS) delay(1_500)
         }

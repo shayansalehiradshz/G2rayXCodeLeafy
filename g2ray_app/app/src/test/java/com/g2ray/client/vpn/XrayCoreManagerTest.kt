@@ -163,6 +163,89 @@ class XrayCoreManagerTest {
     }
 
     @Test
+    fun startupFailure_configRejectedByCoreIsNotRetryable() = runTest {
+        val error = "infra/conf/serial: failed to decode config > json: cannot unmarshal string into Go struct field XmuxConfig.maxConnections of type int32"
+        val bridge = FakeXrayBridge(available = true).apply {
+            runResults += XrayCallResult(false, error)
+        }
+        val manager = readyCore(bridge)
+
+        manager.start(sampleProfile(), tunFd = 42, datDir = "/tmp") { true }
+
+        assertEquals(TunnelCoreState.Error, manager.state.value)
+        assertEquals(error, manager.startupFailureResult().error)
+        assertFalse(manager.startupFailureResult().retryAllowed)
+        assertEquals(RouteFailureScope.Configuration, manager.startupFailureResult().failureScope)
+        assertTrue(bridge.stopCalled)
+    }
+
+    @Test
+    fun startupFailure_missingCoreRequiresRebuildRatherThanNetworkRetry() = runTest {
+        val manager = readyCore(FakeXrayBridge(available = false))
+
+        manager.start(sampleProfile(), tunFd = 42, datDir = "/tmp") { true }
+
+        assertFalse(manager.startupFailureResult().retryAllowed)
+    }
+
+    @Test
+    fun startupFailure_malformedProfileExtraRequiresConfigurationChange() = runTest {
+        val bridge = FakeXrayBridge(available = true)
+        val manager = readyCore(bridge)
+
+        manager.start(sampleProfile().copy(xhttpExtraJson = "{"), tunFd = 42, datDir = "/tmp") { true }
+
+        assertEquals(TunnelCoreState.Error, manager.state.value)
+        assertFalse(bridge.runCalled)
+        assertFalse(manager.startupFailureResult().retryAllowed)
+    }
+
+    @Test
+    fun startupFailure_transientNativeErrorKeepsAutomaticRecoveryEnabled() = runTest {
+        val bridge = FakeXrayBridge(available = true).apply {
+            runResults += XrayCallResult(false, "socket: too many open files")
+        }
+        val manager = readyCore(bridge)
+
+        manager.start(sampleProfile(), tunFd = 42, datDir = "/tmp") { true }
+
+        assertTrue(manager.startupFailureResult().retryAllowed)
+    }
+
+    @Test
+    fun startupFailure_addressCollisionsRemainRetryableAfterPortBudget() = runTest {
+        val bridge = FakeXrayBridge(available = true).apply {
+            repeat(3) { runResults += XrayCallResult(false, "bind: address already in use") }
+        }
+        val manager = readyCore(bridge)
+
+        manager.start(sampleProfile(), tunFd = 42, datDir = "/tmp") { true }
+
+        assertEquals(TunnelCoreState.Error, manager.state.value)
+        assertTrue(manager.startupFailureResult().retryAllowed)
+        assertTrue(bridge.runResults.isEmpty())
+    }
+
+    @Test
+    fun startupFailure_configurationRejectionDoesNotPoisonLaterStartup() = runTest {
+        val bridge = FakeXrayBridge(available = true).apply {
+            runResults += XrayCallResult(false, "infra/conf: Failed to build transport config")
+            runResults += XrayCallResult(true, null)
+        }
+        val manager = readyCore(bridge)
+        manager.start(sampleProfile(), tunFd = 42, datDir = "/tmp") { true }
+        assertFalse(manager.startupFailureResult().retryAllowed)
+
+        manager.start(sampleProfile(), tunFd = 42, datDir = "/tmp") { true }
+
+        assertEquals(TunnelCoreState.Connected, manager.state.value)
+        assertEquals(null, manager.lastError.value)
+        bridge.nativeRunning = false
+        assertFalse(manager.refreshRunningState())
+        assertTrue(manager.startupFailureResult().retryAllowed)
+    }
+
+    @Test
     fun start_realDelayFailure_doesNotBlockCoreStartup() = runTest {
         val bridge = FakeXrayBridge(available = true).apply {
             pingResult = XrayPingResult(success = false, delayMs = null, error = "timeout")
