@@ -375,8 +375,15 @@ test_generated_config_uses_resilient_dns_fallback() {
         || fail 'script does not provide an in-place DNS migration for existing configs'
     grep_fixed '.dns = {' "$SCRIPT" \
         || fail 'existing config DNS migration does not replace the dns object'
-    grep_fixed 'upgrade_config_dns >/dev/null 2>&1 || true' "$SCRIPT" \
-        || fail 'start path does not apply DNS migration before launching Xray'
+    grep_fixed 'if ! upgrade_config_dns >/dev/null 2>&1; then' "$SCRIPT" \
+        || fail 'start path does not guard config migration before launching Xray'
+    grep_fixed 'restore_prestart_config_backup "$config_backup" "config_migration_failed"' "$SCRIPT" \
+        || fail 'failed config migration does not restore the preflight backup'
+    if grep_fixed 'upgrade_config_dns >/dev/null 2>&1 || true' "$SCRIPT"; then
+        fail 'startup still hides a config migration failure'
+    fi
+    grep_fixed 'test_start_xray_preserves_engine_when_config_migration_fails()' "$BEHAVIOR_TESTS" \
+        || fail 'migration failure has no engine/config preservation regression'
     grep_fixed 'config_dns refreshed' "$SCRIPT" \
         || fail 'DNS migration does not log when it refreshes an existing config'
     if grep_fixed '"domains": ["geosite:geolocation-!cn"]' "$SCRIPT"; then

@@ -160,6 +160,14 @@ with the actual pinned core accepted all ten generated/migrated combinations
 Go vet and six non-race fixtures passed; the Linux race result remains a
 separate hosted-CI gate.
 
+[Android CI for runtime source commit 95fd2a1](https://github.com/z2roozsh/G2rayXCodeLeafy/actions/runs/38402946237)
+passed source/unit/lint/instrumentation compilation and the Linux HEV payload,
+EOF, and restart fixtures. The first Static workflow caught a stale assertion
+that required ignoring migration failure; the assertion now requires the
+stricter guarded migration, backup restore, and preservation regression.
+The unchanged final local static suite passed after that correction. The
+corresponding final hosted Static workflow must be checked separately.
+
 No new phone installation or acceptance test was performed: the user chose to
 continue without device tests. The earlier installed-device record remains
 [separate](DEVICE_RECOVERY_FOLLOWUP_2026-10-13.md). The newly built local debug
