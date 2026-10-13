@@ -44,6 +44,7 @@ import com.g2ray.client.network.CodespaceWakeOutcome
 import com.g2ray.client.network.CodespaceWakeRequest
 import com.g2ray.client.network.GitHubCodespaceCoordinator
 import com.g2ray.client.network.GitHubNetwork
+import com.g2ray.client.network.MAX_WAKE_RETRY_DELAY_MS
 import com.g2ray.client.network.WakeBackendSelector
 import com.g2ray.client.network.WakeControlBackend
 import com.g2ray.client.network.WorkerNetwork
@@ -276,6 +277,9 @@ class G2RayVpnService : VpnService() {
 
         internal fun reconnectBackoffMs(attempt: Int): Long =
             minOf(60_000L, 5_000L * (1L shl attempt.coerceIn(0, 4)))
+
+        internal fun reconnectDelayMs(attempt: Int, retryAfterMs: Long?): Long =
+            maxOf(reconnectBackoffMs(attempt), retryAfterMs?.coerceIn(0L, MAX_WAKE_RETRY_DELAY_MS) ?: 0L)
 
         internal fun routeHealthFailureRequiresRecovery(failures: Int, payloadAdvancing: Boolean): Boolean =
             failures >= if (payloadAdvancing) ROUTE_HEALTH_PAYLOAD_GRACE_FAILURES else ROUTE_HEALTH_FAILURES_BEFORE_RECOVERY
@@ -1086,7 +1090,7 @@ class G2RayVpnService : VpnService() {
                             markTunnelVerified("VPN connected and route verified")
                         } else {
                             if (route.retryAllowed) {
-                                schedulePersistentReconnect(route.error ?: core.lastError.value ?: "Tunnel route check failed")
+                                schedulePersistentReconnect(route.error ?: core.lastError.value ?: "Tunnel route check failed", route.retryAfterMs)
                             } else failAndStop(route.error ?: "VPN needs configuration changes")
                         }
                     }
@@ -2051,7 +2055,7 @@ class G2RayVpnService : VpnService() {
                 initialError = recoveryError,
                 initialFailureScope = initialFailureScope
             )
-            if (route.success) return route
+            if (route.success || !route.retryAllowed || route.retryAfterMs != null) return route
             if (
                 !shouldRetryAfterNetworkChange(
                     recoveryNetworkGeneration = recoveryNetworkGeneration,
@@ -2138,11 +2142,17 @@ class G2RayVpnService : VpnService() {
             }
             is CodespaceWakeOutcome.Failed -> {
                 if (outcome.controlPlaneUnavailable) {
-                    return tryAlternativeStoredProfiles(profile, tun, lifecycleToken)
+                    val alternative = tryAlternativeStoredProfiles(profile, tun, lifecycleToken)
                         ?: RunningRouteResult(false, outcome.message)
+                    return if (alternative.success) alternative else alternative.copy(
+                        retryAllowed = alternative.retryAllowed && outcome.retryAllowed,
+                        retryAfterMs = listOfNotNull(alternative.retryAfterMs, outcome.retryAfterMs).maxOrNull()
+                    )
                 }
-                return RunningRouteResult(false, outcome.message,
-                    retryAllowed = outcome.httpCode !in setOf(400, 401, 402, 403, 404))
+                return RunningRouteResult(
+                    false, outcome.message,
+                    retryAllowed = outcome.retryAllowed, retryAfterMs = outcome.retryAfterMs
+                )
             }
             is CodespaceWakeOutcome.TimedOut -> {
                 return tryAlternativeStoredProfiles(profile, tun, lifecycleToken)
@@ -2226,11 +2236,12 @@ class G2RayVpnService : VpnService() {
                         if (isTunnelCurrent(lifecycleToken, tun)) {
                             if (route.success) {
                                 markTunnelVerified("VPN reconnected and route verified")
+                            } else if (!route.retryAllowed) {
+                                failAndStop(route.error ?: "VPN needs configuration changes")
                             } else if (waitingForUnderlyingNetwork) {
                                 markTunnelUnverified("No underlying network. Waiting to reconnect...")
                             } else {
-                                if (route.retryAllowed) schedulePersistentReconnect(route.error ?: "Tunnel recovery failed")
-                                else failAndStop(route.error ?: "VPN needs configuration changes")
+                                schedulePersistentReconnect(route.error ?: "Tunnel recovery failed", route.retryAfterMs)
                             }
                         }
                     }
@@ -2249,7 +2260,7 @@ class G2RayVpnService : VpnService() {
         }
     }
 
-    private fun schedulePersistentReconnect(reason: String) {
+    private fun schedulePersistentReconnect(reason: String, retryAfterMs: Long? = null) {
         if (!desiredConnected || reconnectRetryJob?.isActive == true) return
         val token = activeLifecycleToken
         val tun = vpnInterface ?: return
@@ -2259,10 +2270,14 @@ class G2RayVpnService : VpnService() {
         markTunnelUnverified("$reason Retrying automatically...")
         reconnectRetryJob = scope.launch {
             var attempt = 0
+            var retryWaitMs = retryAfterMs
+            var retryReason = reason
             while (isActive && desiredConnected && isTunnelCurrent(token, tun)) {
                 val backoff = reconnectBackoffMs(attempt)
+                val retryDelay = reconnectDelayMs(attempt, retryWaitMs)
                 attempt = (attempt + 1).coerceAtMost(4)
-                delay(backoff + Random.nextLong(0L, backoff / 5L + 1L))
+                markTunnelUnverified("$retryReason Retrying automatically in ${(retryDelay + 999L) / 1000L}s...")
+                delay(retryDelay + Random.nextLong(0L, backoff / 5L + 1L))
                 if (!desiredConnected || !isTunnelCurrent(token, tun)) break
                 lifecycleOperationMutex.withLock {
                     val profile = activeProfile ?: return@withLock
@@ -2273,6 +2288,8 @@ class G2RayVpnService : VpnService() {
                     } catch (error: Exception) {
                         RunningRouteResult(false, error.localizedMessage ?: "Recovery temporarily unavailable")
                     }
+                    retryWaitMs = route.retryAfterMs
+                    retryReason = route.error ?: reason
                     withContext(Dispatchers.Main) {
                         if (!desiredConnected || !isTunnelCurrent(token, tun)) return@withContext
                         if (route.success) {

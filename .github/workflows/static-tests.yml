@@ -42,6 +42,8 @@ jobs:
           bash -n ./scripts/post-start.sh
           bash -n ./tests/g2ray_static_tests.sh
           bash -n ./tests/g2ray_behavior_tests.sh
+          python3 ./tests/xray_upload_queue_validation.py --help >/dev/null
+          python3 ./tests/xray_authenticated_transport_check.py --help >/dev/null
 
       - name: Syntax check Worker
         working-directory: worker/codespace-waker
@@ -59,6 +61,32 @@ jobs:
 
       - name: Run deterministic benchmark budgets
         run: bash ./g2ray.sh bench --json --mock
+
+  xray-core-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Validate the pinned core and saturated upload expiry
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -nE 's/^ARG XRAY_VERSION=(v[0-9]+\.[0-9]+\.[0-9]+)$/\1/p' .devcontainer/Dockerfile)
+          [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          curl --fail --location --retry 2 --max-time 180 --silent --show-error \
+            "https://github.com/XTLS/Xray-core/releases/download/${version}/Xray-linux-64.zip" -o "$tmp/release.zip"
+          curl --fail --location --retry 2 --max-time 60 --silent --show-error \
+            "https://github.com/XTLS/Xray-core/releases/download/${version}/Xray-linux-64.zip.dgst" -o "$tmp/release.zip.dgst"
+          hash=$(awk -F'= ' '/^SHA2-256=/{print $2}' "$tmp/release.zip.dgst")
+          [[ "$hash" =~ ^[0-9a-fA-F]{64}$ ]]
+          printf '%s  %s\n' "$hash" "$tmp/release.zip" | sha256sum -c -
+          unzip -q "$tmp/release.zip" -d "$tmp/core"
+          chmod +x "$tmp/core/xray"
+          python3 tests/xray_upload_queue_validation.py "$tmp/core/xray"
+          bash tests/g2ray_config_validation.sh "$tmp/core/xray"
 
   extended-tests:
     runs-on: ubuntu-latest

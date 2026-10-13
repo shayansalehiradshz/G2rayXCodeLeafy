@@ -14,6 +14,15 @@ import org.robolectric.RobolectricTestRunner
 @RunWith(RobolectricTestRunner::class)
 class G2RayVpnServiceTest {
     @Test
+    fun automaticReconnectHonorsServerWaitWithoutRemovingLocalBackoff() {
+        assertEquals(180_000L, G2RayVpnService.reconnectDelayMs(0, 180_000L))
+        assertEquals(60_000L, G2RayVpnService.reconnectDelayMs(4, 10_000L))
+        assertEquals(5_000L, G2RayVpnService.reconnectDelayMs(0, -1L))
+        assertEquals(com.g2ray.client.network.MAX_WAKE_RETRY_DELAY_MS,
+            G2RayVpnService.reconnectDelayMs(0, Long.MAX_VALUE))
+    }
+
+    @Test
     fun repeatedProbeFailuresEventuallyRecoverEvenWithBackgroundPayload() {
         assertFalse(G2RayVpnService.routeHealthFailureRequiresRecovery(2, false))
         assertTrue(G2RayVpnService.routeHealthFailureRequiresRecovery(3, false))

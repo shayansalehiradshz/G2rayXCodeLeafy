@@ -566,7 +566,9 @@ function normalizePriority(value) {
 
 function selectCodespaceEntry(registry, requestedId) {
   const id = String(requestedId || registry.defaultCodespaceId || "").trim();
-  return registry.entries.find((entry) => (entry.id === id || entry.name === id) && entry.enabled) || null;
+  const explicit = registry.entries.find((entry) => entry.id === id);
+  if (explicit) return explicit.enabled ? explicit : null;
+  return registry.entries.find((entry) => entry.name === id && entry.enabled) || null;
 }
 
 function addCodespaceIdentity(data, context) {
@@ -996,14 +998,15 @@ function shouldPollRouteResponse(data) {
 
 function retryHeaders(data) {
   let retryAfter = data && Number.parseInt(String(data.retry_after_seconds || ""), 10);
-  if ((!Number.isFinite(retryAfter) || retryAfter <= 0) && data && data.retry_after_epoch) {
+  if (data && data.retry_after_epoch &&
+      (data.github_rate_limit_remaining == null || data.github_rate_limit_remaining === 0)) {
     const epoch = Number.parseInt(String(data.retry_after_epoch), 10);
     if (Number.isFinite(epoch)) {
-      retryAfter = Math.ceil((epoch * 1000 - Date.now()) / 1000);
+      retryAfter = Math.max(Number.isFinite(retryAfter) ? retryAfter : 0, Math.ceil((epoch * 1000 - Date.now()) / 1000));
     }
   }
   if (!Number.isFinite(retryAfter) || retryAfter <= 0) return {};
-  return { "retry-after": String(retryAfter) };
+  return { "retry-after": String(Math.min(retryAfter, 86400)) };
 }
 
 function withSurvivalFields(data, env) {

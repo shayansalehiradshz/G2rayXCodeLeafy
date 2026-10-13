@@ -52,7 +52,9 @@ sealed interface WorkerRouteOutcome {
         val message: String,
         val controlPlaneUnavailable: Boolean = false,
         val httpCode: Int? = null,
-        val response: WorkerWakeResponse? = null
+        val response: WorkerWakeResponse? = null,
+        val retryAllowed: Boolean = wakeHttpFailureRetryAllowed(httpCode),
+        val retryAfterMs: Long? = null
     ) : WorkerRouteOutcome
 
     data class TimedOut(val message: String) : WorkerRouteOutcome
@@ -219,7 +221,8 @@ internal class VpnBypassSocketFactory(
 class WorkerRouteCoordinator(
     private val apiService: WorkerApiService,
     private val nowMs: () -> Long = { android.os.SystemClock.elapsedRealtime() },
-    private val sleep: suspend (Long) -> Unit = { delay(it) }
+    private val sleep: suspend (Long) -> Unit = { delay(it) },
+    private val nowEpochMs: () -> Long = System::currentTimeMillis
 ) {
     private data class WorkerCall(
         val response: Response<WorkerWakeResponse>,
@@ -245,10 +248,10 @@ class WorkerRouteCoordinator(
             .mapNotNull { runCatching { WorkerUrlNormalizer.baseUrl(it) }.getOrNull() }
             .distinct()
         if (normalizedBases.isEmpty()) {
-            return WorkerRouteOutcome.Failed("No valid Worker URL is configured.")
+            return WorkerRouteOutcome.Failed("No valid Worker URL is configured.", retryAllowed = false)
         }
         if (secret.isBlank()) {
-            return WorkerRouteOutcome.Failed("The active wake key is empty.")
+            return WorkerRouteOutcome.Failed("The active wake key is empty.", retryAllowed = false)
         }
 
         var orderedBases = normalizedBases
@@ -289,11 +292,19 @@ class WorkerRouteCoordinator(
             ) {
                 return WorkerRouteOutcome.Failed(
                     "Worker responded for a different or unidentified Codespace. Check this account's Worker selection.",
-                    response = body
+                    response = body,
+                    retryAllowed = false
                 )
             }
 
             if (response.isSuccessful) {
+                if (permanentWakeFailure(body)) {
+                    return WorkerRouteOutcome.Failed(
+                        body?.next_action ?: body?.message ?: "Codespace wake needs configuration changes.",
+                        response = body,
+                        retryAllowed = false
+                    )
+                }
                 if (body?.route_ready == true) {
                     return WorkerRouteOutcome.Ready(call.workerBaseUrl, body)
                 }
@@ -335,11 +346,26 @@ class WorkerRouteCoordinator(
                     else -> "Worker failed with HTTP ${response.code()}."
                 }
             val requestId = response.headers()["x-g2ray-request-id"]?.takeIf { it.isNotBlank() }
+            val retryAfterSeconds = listOfNotNull(
+                response.headers()["Retry-After"]?.trim()?.toLongOrNull()?.takeIf { it >= 0L },
+                body?.retry_after_seconds?.toLong()?.takeIf { it >= 0L }
+            ).maxOrNull()?.toString()
+            val resetEpochSeconds = body?.retry_after_epoch?.takeIf {
+                body.github_rate_limit_remaining == 0
+            }?.toString()
+            val rateLimited = response.code() == 429 ||
+                (response.code() == 403 && body?.reason in setOf("github_rate_limited", "github_secondary_rate_limited"))
+            val retryAllowed = !permanentWakeFailure(body) &&
+                (rateLimited || wakeHttpFailureRetryAllowed(response.code()))
             return WorkerRouteOutcome.Failed(
                 message = if (requestId == null) message else "$message Request ID: $requestId",
                 controlPlaneUnavailable = response.code() in 500..599,
                 httpCode = response.code(),
-                response = body
+                response = body,
+                retryAllowed = retryAllowed,
+                retryAfterMs = if (retryAllowed && (rateLimited || retryAfterSeconds != null || resetEpochSeconds != null)) {
+                    rateLimitRetryAfterMs(retryAfterSeconds, resetEpochSeconds, nowEpochMs())
+                } else null
             )
         }
 
@@ -388,8 +414,13 @@ class WorkerRouteCoordinator(
     }
 
     companion object {
+        private fun permanentWakeFailure(body: WorkerWakeResponse?): Boolean =
+            body?.quota_blocked == true ||
+                body?.state?.lowercase() in setOf("deleted", "archived", "failed") ||
+                body?.error in setOf("missing_wake_secret", "missing_codespace_name", "missing_github_token_binding")
+
         fun shouldPoll(httpCode: Int, body: WorkerWakeResponse?): Boolean {
-            if (body?.quota_blocked == true) return false
+            if (permanentWakeFailure(body)) return false
             return httpCode == 202 ||
                 body?.route_ready == false ||
                 body?.start_accepted == true ||

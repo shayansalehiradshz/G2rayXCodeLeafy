@@ -185,6 +185,33 @@ Do not advertise always-on/lockdown as production-tested until every case passes
 - Verify invalid token, missing permission, quota (`402`), missing Codespace (`404`), and API rate-limit responses are shown as configuration/service errors rather than route failures.
 - Verify `Available` is not displayed as a healthy tunnel until the selected VLESS profile passes the real route probe.
 - Disable or remove the Worker and confirm **GitHub** mode still wakes the Codespace; restore the Worker and confirm **Auto** prefers it.
+- Return a rate-limited GitHub 403/429 with a future reset or retry delay.
+  Desired-connected intent must stay enabled, and automatic retry must not run
+  before the later server/local boundary. Repeat through the Worker with both
+  header and body/reset hints, and with a hinted 503 followed by direct-backend
+  failure. Explicit Stop during that wait must stop future attempts.
+- Return a permission 403, invalid-request 422, wrong Codespace identity,
+  missing dashboard token binding, or deleted host state. The app must show a
+  configuration/service error rather than an endless automatic retry. Repeat
+  while the underlying network disappears or changes.
+
+## Pinned server core acceptance
+
+Verify the installed/running core, not only the Dockerfile or repository pin.
+A Git pull does not replace an already installed binary.
+
+```bash
+python3 tests/xray_upload_queue_validation.py /path/to/verified/xray
+bash tests/g2ray_config_validation.sh /path/to/verified/xray
+python3 tests/xray_authenticated_transport_check.py /usr/local/bin/xray g2ray-codespace-bundle.json --live
+```
+
+Run from the server repository root. The first test binds loopback only and
+requires a saturated incomplete upload session to release its pending POST at
+expiry. The last uses private current links and performs real authenticated
+Internet requests; do not publish the bundle. Preserve UUID/config and an old
+binary rollback copy during any approved upgrade. Passing these checks does
+not close phone idle-resume acceptance or the aggregate resource-budget gap.
 
 ## v2rayNG A/B comparison
 

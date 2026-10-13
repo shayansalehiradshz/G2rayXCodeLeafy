@@ -710,18 +710,24 @@ run_with_deadline() {
         set +m
         set +e
         "$@"
-        printf '%s\n' "$?" > "$status_file" 2>/dev/null || true
+        status=$?
+        printf '%s\n' "$status" > "$status_file" 2>/dev/null || true
+        exit "$status"
     ) &
     pid=$!
     [[ "$monitor_was_enabled" == true ]] || set +m
-    if [[ ! -s "$status_file" ]] && ! kill -0 -- "-$pid" 2>/dev/null; then
+    # A finished child may already have no group; a live wrapper still needs
+    # verified isolation even if its command has published a status.
+    if ! kill -0 -- "-$pid" 2>/dev/null && kill -0 "$pid" 2>/dev/null; then
         kill -KILL "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
         rm -f "$status_file" 2>/dev/null || true
         log_event ERROR "deadline_group_init_failed command=${command_name}"
         return 125
     fi
-    while [[ ! -s "$status_file" ]]; do
+    # Reporting the command's status does not finish the wrapper: EXIT traps
+    # and cleanup may still be running. Keep its entire lifetime bounded.
+    while [[ ! -s "$status_file" ]] || kill -0 "$pid" 2>/dev/null; do
         if (( waited_ticks >= max_ticks )); then
             kill -TERM -- "-$pid" 2>/dev/null || true
             sleep 0.2
@@ -740,7 +746,7 @@ run_with_deadline() {
         waited_ticks=$((waited_ticks + 1))
     done
     status=$(cat "$status_file" 2>/dev/null || printf '1')
-    wait "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || status=$?
     rm -f "$status_file" 2>/dev/null || true
     [[ "$status" =~ ^[0-9]+$ ]] || status=1
     return "$status"

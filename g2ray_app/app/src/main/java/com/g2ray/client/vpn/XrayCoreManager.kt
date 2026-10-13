@@ -35,7 +35,8 @@ data class RunningRouteResult(
     val error: String? = null,
     val latencyMs: Long? = null,
     val failureScope: RouteFailureScope = if (success) RouteFailureScope.None else RouteFailureScope.Unknown,
-    val retryAllowed: Boolean = true
+    val retryAllowed: Boolean = true,
+    val retryAfterMs: Long? = null
 )
 
 enum class RouteFailureScope {

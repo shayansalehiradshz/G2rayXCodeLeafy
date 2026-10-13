@@ -106,7 +106,9 @@ sealed interface GitHubCodespaceOutcome {
         val message: String,
         val controlPlaneUnavailable: Boolean = false,
         val httpCode: Int? = null,
-        val response: GitHubCodespaceResponse? = null
+        val response: GitHubCodespaceResponse? = null,
+        val retryAllowed: Boolean = wakeHttpFailureRetryAllowed(httpCode),
+        val retryAfterMs: Long? = null
     ) : GitHubCodespaceOutcome
 
     data class TimedOut(val message: String) : GitHubCodespaceOutcome
@@ -115,7 +117,8 @@ sealed interface GitHubCodespaceOutcome {
 class GitHubCodespaceCoordinator(
     private val apiService: GitHubCodespacesApiService,
     private val nowMs: () -> Long = { android.os.SystemClock.elapsedRealtime() },
-    private val sleep: suspend (Long) -> Unit = { delay(it) }
+    private val sleep: suspend (Long) -> Unit = { delay(it) },
+    private val nowEpochMs: () -> Long = System::currentTimeMillis
 ) {
     private val errorAdapter = Moshi.Builder()
         .add(KotlinJsonAdapterFactory())
@@ -132,10 +135,10 @@ class GitHubCodespaceCoordinator(
         val normalizedName = codespaceName.trim()
         val normalizedToken = token.trim()
         if (normalizedName.isEmpty()) {
-            return GitHubCodespaceOutcome.Failed("GitHub Codespace name is empty.")
+            return GitHubCodespaceOutcome.Failed("GitHub Codespace name is empty.", retryAllowed = false)
         }
         if (normalizedToken.isEmpty()) {
-            return GitHubCodespaceOutcome.Failed("GitHub token is empty.")
+            return GitHubCodespaceOutcome.Failed("GitHub token is empty.", retryAllowed = false)
         }
 
         val authorization = "Bearer $normalizedToken"
@@ -171,7 +174,7 @@ class GitHubCodespaceCoordinator(
             if (!statusResponse.isSuccessful) {
                 if (statusResponse.code() in 500..599) {
                     consecutiveServerErrors++
-                    if (consecutiveServerErrors >= 3) {
+                    if (consecutiveServerErrors >= 3 || statusResponse.headers()["Retry-After"] != null) {
                         return failureFrom(statusResponse, controlPlaneUnavailable = true)
                     }
                     sleep((consecutiveServerErrors * 1_000L).coerceAtMost(3_000L))
@@ -193,7 +196,8 @@ class GitHubCodespaceCoordinator(
                 "deleted", "archived", "failed" -> {
                     return GitHubCodespaceOutcome.Failed(
                         message = "Codespace state is ${codespace.state}; GitHub cannot start it.",
-                        response = codespace
+                        response = codespace,
+                        retryAllowed = false
                     )
                 }
                 "shutdown", "stopped" -> {
@@ -229,7 +233,7 @@ class GitHubCodespaceCoordinator(
                             startServerErrors = 0
                         } else if (startResponse.code() in 500..599) {
                             startServerErrors++
-                            if (startServerErrors >= 3) {
+                            if (startServerErrors >= 3 || startResponse.headers()["Retry-After"] != null) {
                                 return failureFrom(startResponse, controlPlaneUnavailable = true)
                             }
                             sleep((startServerErrors * 1_000L).coerceAtMost(3_000L))
@@ -256,6 +260,12 @@ class GitHubCodespaceCoordinator(
         val bodyMessage = runCatching {
             response.errorBody()?.string()?.let(errorAdapter::fromJson)?.message
         }.getOrNull()?.takeIf { it.isNotBlank() }
+        val rateLimited = response.code() == 429 || (response.code() == 403 && (
+                response.headers()["X-RateLimit-Remaining"] == "0" ||
+                bodyMessage?.contains("secondary rate limit", ignoreCase = true) == true ||
+                bodyMessage?.contains("abuse detection", ignoreCase = true) == true ||
+                response.headers()["Retry-After"] != null
+            ))
         val message = when (response.code()) {
             400 -> "GitHub rejected the Codespace lifecycle request."
             401 -> "GitHub token is invalid or expired."
@@ -263,11 +273,7 @@ class GitHubCodespaceCoordinator(
             403 -> if (response.headers()["X-RateLimit-Remaining"] == "0") {
                 val reset = response.headers()["X-RateLimit-Reset"]
                 "GitHub API rate limit is exhausted${reset?.let { " until Unix time $it" }.orEmpty()}."
-            } else if (
-                bodyMessage?.contains("secondary rate limit", ignoreCase = true) == true ||
-                bodyMessage?.contains("abuse detection", ignoreCase = true) == true ||
-                response.headers()["Retry-After"] != null
-            ) {
+            } else if (rateLimited) {
                 "GitHub temporarily limited this request. Wait and retry instead of changing the token."
             } else {
                 "GitHub token needs Codespaces read and Codespaces lifecycle admin write permission."
@@ -285,7 +291,19 @@ class GitHubCodespaceCoordinator(
                 "$message GitHub: $bodyMessage"
             },
             controlPlaneUnavailable = controlPlaneUnavailable || response.code() in 500..599,
-            httpCode = response.code()
+            httpCode = response.code(),
+            retryAllowed = rateLimited || wakeHttpFailureRetryAllowed(response.code()),
+            retryAfterMs = if (rateLimited ||
+                (wakeHttpFailureRetryAllowed(response.code()) && response.headers()["Retry-After"] != null)
+            ) {
+                rateLimitRetryAfterMs(
+                    response.headers()["Retry-After"],
+                    response.headers()["X-RateLimit-Reset"].takeIf {
+                        response.headers()["X-RateLimit-Remaining"] == "0"
+                    },
+                    nowEpochMs = nowEpochMs()
+                )
+            } else null
         )
     }
 

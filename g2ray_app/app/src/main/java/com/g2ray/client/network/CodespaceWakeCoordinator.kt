@@ -49,7 +49,9 @@ sealed interface CodespaceWakeOutcome {
         val controlPlaneUnavailable: Boolean = false,
         val httpCode: Int? = null,
         val workerResponse: WorkerWakeResponse? = null,
-        val githubResponse: GitHubCodespaceResponse? = null
+        val githubResponse: GitHubCodespaceResponse? = null,
+        val retryAllowed: Boolean = wakeHttpFailureRetryAllowed(httpCode),
+        val retryAfterMs: Long? = null
     ) : CodespaceWakeOutcome
 
     data class TimedOut(
@@ -156,9 +158,10 @@ class CodespaceWakeCoordinator internal constructor(
             githubDirectConfigured = request.githubDirectConfigured
         )
         if (order.isEmpty()) {
-            return CodespaceWakeOutcome.Failed(missingConfigurationMessage(request.mode))
+            return CodespaceWakeOutcome.Failed(missingConfigurationMessage(request.mode), retryAllowed = false)
         }
 
+        var fallbackRetryAfterMs: Long? = null
         for (backend in order) {
             when (backend) {
                 WakeControlBackend.WORKER -> {
@@ -199,6 +202,7 @@ class CodespaceWakeCoordinator internal constructor(
                                 request.githubDirectConfigured &&
                                 outcome.controlPlaneUnavailable
                             if (directFallbackAvailable) {
+                                fallbackRetryAfterMs = listOfNotNull(fallbackRetryAfterMs, outcome.retryAfterMs).maxOrNull()
                                 onProgress(
                                     CodespaceWakeProgress(
                                         backend = WakeControlBackend.GITHUB_DIRECT,
@@ -214,7 +218,9 @@ class CodespaceWakeCoordinator internal constructor(
                                 backend = backend,
                                 controlPlaneUnavailable = outcome.controlPlaneUnavailable,
                                 httpCode = outcome.httpCode,
-                                workerResponse = outcome.response
+                                workerResponse = outcome.response,
+                                retryAllowed = outcome.retryAllowed,
+                                retryAfterMs = outcome.retryAfterMs
                             )
                         }
                     }
@@ -255,14 +261,16 @@ class CodespaceWakeCoordinator internal constructor(
                             backend = backend,
                             controlPlaneUnavailable = outcome.controlPlaneUnavailable,
                             httpCode = outcome.httpCode,
-                            githubResponse = outcome.response
+                            githubResponse = outcome.response,
+                            retryAllowed = outcome.retryAllowed,
+                            retryAfterMs = listOfNotNull(fallbackRetryAfterMs, outcome.retryAfterMs).maxOrNull()
                         )
                     }
                 }
             }
         }
 
-        return CodespaceWakeOutcome.Failed("No configured Codespace wake method succeeded.")
+        return CodespaceWakeOutcome.Failed("No configured Codespace wake method succeeded.", retryAllowed = false)
     }
 
     private fun missingConfigurationMessage(mode: CodespaceWakeMode): String = when (mode) {

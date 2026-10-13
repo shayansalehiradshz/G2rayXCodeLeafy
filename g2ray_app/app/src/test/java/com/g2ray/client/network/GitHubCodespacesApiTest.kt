@@ -10,6 +10,96 @@ import org.junit.Test
 import retrofit2.Response
 
 class GitHubCodespacesApiTest {
+    @Test
+    fun deletedArchivedAndFailedCodespacesDoNotRetryForever() = runTest {
+        for (state in listOf("Deleted", "Archived", "Failed")) {
+            val api = FakeGitHubApi(ArrayDeque(listOf(Response.success(GitHubCodespaceResponse(state = state)))))
+            val result = GitHubCodespaceCoordinator(api, nowMs = { 0L }).ensureAvailable("demo", "token")
+                as GitHubCodespaceOutcome.Failed
+            assertEquals(state, false, result.retryAllowed)
+            assertEquals(1, api.getCalls)
+            assertEquals(0, api.startCalls)
+        }
+    }
+
+    @Test
+    fun retryAfterOnStatusServerFailureIsNotBypassedByInternalPolling() = runTest {
+        val api = FakeGitHubApi(ArrayDeque(listOf(error(503, "Try later", mapOf("Retry-After" to "180")))))
+        val result = GitHubCodespaceCoordinator(api, nowMs = { 0L })
+            .ensureAvailable("demo", "token") as GitHubCodespaceOutcome.Failed
+        assertTrue(result.retryAllowed)
+        assertEquals(180_000L, result.retryAfterMs)
+        assertEquals(1, api.getCalls)
+        assertEquals(0, api.startCalls)
+    }
+
+    @Test
+    fun retryAfterOnStartServerFailureIsNotBypassedByInternalPolling() = runTest {
+        val api = FakeGitHubApi(
+            ArrayDeque(listOf(Response.success(GitHubCodespaceResponse(state = "Shutdown")))),
+            ArrayDeque(listOf(error(503, "Try later", mapOf("Retry-After" to "180"))))
+        )
+        val result = GitHubCodespaceCoordinator(api, nowMs = { 0L })
+            .ensureAvailable("demo", "token") as GitHubCodespaceOutcome.Failed
+        assertTrue(result.retryAllowed)
+        assertEquals(180_000L, result.retryAfterMs)
+        assertEquals(1, api.getCalls)
+        assertEquals(1, api.startCalls)
+    }
+
+    @Test
+    fun secondaryRateLimitPreservesAutomaticVpnRetryThroughDirectWake() = runTest {
+        val api = FakeGitHubApi(ArrayDeque(listOf(error(403, "You have exceeded a secondary rate limit"))))
+        val coordinator = CodespaceWakeCoordinator(
+            workerWake = { _, _ -> error("Worker must not be used in direct mode") },
+            githubWake = { _, _ -> GitHubCodespaceCoordinator(api, nowMs = { 0L }).ensureAvailable("demo", "token") }
+        )
+        val outcome = coordinator.ensureReady(CodespaceWakeRequest(
+            CodespaceWakeMode.GITHUB_DIRECT, "demo", githubToken = "token"
+        )) as CodespaceWakeOutcome.Failed
+        assertEquals(403, outcome.httpCode)
+        assertTrue(outcome.retryAllowed)
+        assertEquals(60_000L, outcome.retryAfterMs)
+        assertEquals(1, api.getCalls)
+        assertEquals(0, api.startCalls)
+    }
+
+    @Test
+    fun primaryRateLimitUsesEpochResetAndKeepsRetryEnabled() = runTest {
+        val api = FakeGitHubApi(ArrayDeque(listOf(error(403, "API rate limit exceeded", mapOf(
+            "X-RateLimit-Remaining" to "0", "X-RateLimit-Reset" to "1600"
+        )))))
+        val result = GitHubCodespaceCoordinator(api, nowMs = { 0L }, nowEpochMs = { 1_000_000L })
+            .ensureAvailable("demo", "token") as GitHubCodespaceOutcome.Failed
+        assertTrue(result.retryAllowed)
+        assertEquals(600_000L, result.retryAfterMs)
+        assertEquals(0, api.startCalls)
+    }
+
+    @Test
+    fun overlappingRateLimitsWaitForBothRetryAfterAndPrimaryReset() = runTest {
+        val api = FakeGitHubApi(ArrayDeque(listOf(error(403, "API rate limit exceeded", mapOf(
+            "X-RateLimit-Remaining" to "0", "X-RateLimit-Reset" to "1600", "Retry-After" to "120"
+        )))))
+        val result = GitHubCodespaceCoordinator(api, nowMs = { 0L }, nowEpochMs = { 1_000_000L })
+            .ensureAvailable("demo", "token") as GitHubCodespaceOutcome.Failed
+        assertTrue(result.retryAllowed)
+        assertEquals(600_000L, result.retryAfterMs)
+    }
+
+    @Test
+    fun permissionAuthQuotaAndMissingCodespaceErrorsRemainTerminal() = runTest {
+        for (code in listOf(400, 401, 402, 403, 404, 405, 410, 415, 422)) {
+            val api = FakeGitHubApi(ArrayDeque(listOf(error(code, "Request rejected"))))
+            val result = GitHubCodespaceCoordinator(api, nowMs = { 0L })
+                .ensureAvailable("demo", "token") as GitHubCodespaceOutcome.Failed
+            assertEquals("HTTP $code", false, result.retryAllowed)
+            assertEquals(null, result.retryAfterMs)
+            assertEquals(1, api.getCalls)
+            assertEquals(0, api.startCalls)
+        }
+    }
+
     private class FakeGitHubApi(
         private val getResponses: ArrayDeque<Response<GitHubCodespaceResponse>>,
         private val startResponses: ArrayDeque<Response<GitHubCodespaceResponse>> = ArrayDeque()
@@ -304,10 +394,17 @@ class GitHubCodespacesApiTest {
     }
 
     private companion object {
-        fun error(code: Int, message: String): Response<GitHubCodespaceResponse> {
+        fun error(code: Int, message: String, headers: Map<String, String> = emptyMap()): Response<GitHubCodespaceResponse> {
             val body = "{\"message\":\"$message\"}"
                 .toResponseBody("application/json".toMediaType())
-            return Response.error(code, body)
+            val response = okhttp3.Response.Builder()
+                .request(okhttp3.Request.Builder().url("https://api.github.com/user/codespaces/demo").build())
+                .protocol(okhttp3.Protocol.HTTP_1_1)
+                .code(code)
+                .message("API response")
+                .apply { headers.forEach { (name, value) -> header(name, value) } }
+                .build()
+            return Response.error(body, response)
         }
     }
 }

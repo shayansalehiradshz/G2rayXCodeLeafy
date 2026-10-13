@@ -4138,6 +4138,50 @@ test_deadline_fails_closed_without_temp_storage() {
     pass 'deadline initialization failure never runs an unbounded task'
 }
 
+test_deadline_includes_exit_cleanup() {
+    (
+        reset_runtime_paths
+        deadline_exit_cleanup() {
+            trap 'sleep 3' EXIT
+            return 0
+        }
+        local rc=0
+        run_with_deadline 1 deadline_exit_cleanup || rc=$?
+        [[ "$rc" == 124 ]] || fail "deadline reported $rc while exit cleanup exceeded its budget"
+        grep -Fq 'deadline_exceeded' "$LOG_FILE" || fail 'exit cleanup timeout was not reported'
+        run_with_deadline 1 true || fail 'a completed deadline task lost its success status'
+        rc=0
+        run_with_deadline 1 bash -c 'exit 37' || rc=$?
+        [[ "$rc" == 37 ]] || fail "a completed deadline task lost its failure status: $rc"
+        deadline_failed_exit_cleanup() {
+            trap 'exit 39' EXIT
+            return 0
+        }
+        rc=0
+        run_with_deadline 1 deadline_failed_exit_cleanup || rc=$?
+        [[ "$rc" == 39 ]] || fail "failed exit cleanup was masked by command status: $rc"
+    )
+    pass 'deadline bounds exit cleanup and preserves completed task statuses'
+}
+
+test_deadline_preserves_status_without_a_status_write() {
+    (
+        reset_runtime_paths
+        printf() {
+            [[ "${1:-}" != '%s\n' ]] || return 1
+            builtin printf "$@"
+        }
+        local rc=0 attempt
+        for attempt in {1..25}; do
+            rc=0
+            run_with_deadline 1 bash -c 'exit 37' || rc=$?
+            [[ "$rc" == 37 ]] || fail "a failed status write hid the command failure: $rc"
+            run_with_deadline 1 true || fail 'a failed status write invented a command failure'
+        done
+    )
+    pass 'deadline preserves command exit status when its status write fails'
+}
+
 test_deadline_rejects_unverified_process_group() {
     (
         reset_runtime_paths
@@ -4676,6 +4720,8 @@ test_runtime_diagnostics_report_deployed_versions_and_policy() {
     pass "runtime diagnostics distinguish installed core, image pin, configured policy, and kernel state"
 }
 
+test_deadline_includes_exit_cleanup
+test_deadline_preserves_status_without_a_status_write
 test_degraded_probe_keeps_healthy_baseline_at_threshold
 test_optional_legacy_bundle_failure_preserves_current_exports
 test_codespace_bundle_rejects_missing_or_empty_links

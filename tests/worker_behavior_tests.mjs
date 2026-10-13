@@ -273,6 +273,29 @@ async function testGithubRateLimitClassification() {
   console.log("PASS: Worker classifies GitHub primary rate limits");
 }
 
+async function testOverlappingGithubLimitsRespectTheLaterReset() {
+  const resetEpoch = Math.ceil(Date.now() / 1000) + 600;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return new Response(JSON.stringify({ message: "API rate limit exceeded" }), {
+      status: 403,
+      headers: {
+        "content-type": "application/json", "retry-after": "120",
+        "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(resetEpoch)
+      }
+    });
+  };
+  const response = await worker.fetch(makeRequest("/api/health"), baseEnv(), {});
+  const body = await responseJson(response);
+  assert.equal(response.status, 429);
+  assert.equal(body.retry_after_seconds, 120);
+  assert.equal(body.retry_after_epoch, resetEpoch);
+  assert.equal(calls, 1);
+  assert.ok(Number(response.headers.get("retry-after")) >= 599);
+  console.log("PASS: overlapping GitHub rate limits cannot shorten the primary reset boundary");
+}
+
 async function testGithubScopeFailureClassification() {
   globalThis.fetch = async (input) => {
     const url = String(input);
@@ -2364,6 +2387,40 @@ async function testStalledKvRegistryCannotSelectAnotherCodespace() {
   }
 }
 
+async function testExplicitRegistryIdWinsOverAnotherNodesName() {
+  const kv = makeKv();
+  const entries = [
+    { id: "main", name: "alpha-space", token_binding: "GITHUB_TOKEN", enabled: true },
+    { id: "alpha-space", name: "beta-space", token_binding: "GITHUB_TOKEN_BETA", enabled: true }
+  ];
+  await kv.put("codespace-registry:v1", JSON.stringify({ default_codespace_id: "main", codespaces: entries }));
+  const calls = [];
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    calls.push({ url, authorization: new Headers(init.headers).get("authorization") });
+    return new Response(JSON.stringify({ name: url.endsWith("beta-space") ? "beta-space" : "alpha-space", state: "Available" }), {
+      status: 200, headers: { "content-type": "application/json" }
+    });
+  };
+  const env = baseEnv({ WAKER_KV: kv, GITHUB_TOKEN_BETA: "beta-token" });
+  const response = await worker.fetch(makeRequest("/api/health?route=false", "secret", { codespace_id: "alpha-space" }), env, {});
+  const body = await responseJson(response);
+  assert.equal(response.status, 200);
+  assert.equal(body.codespace_id, "alpha-space");
+  assert.equal(body.codespace, "beta-space");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url.endsWith("/beta-space"), true);
+  assert.equal(calls[0].authorization, "Bearer beta-token");
+
+  entries[1].enabled = false;
+  await kv.put("codespace-registry:v1", JSON.stringify({ default_codespace_id: "main", codespaces: entries }));
+  calls.length = 0;
+  const disabled = await worker.fetch(makeRequest("/api/health?route=false", "secret", { codespace_id: "alpha-space" }), env, {});
+  assert.equal(disabled.status, 404);
+  assert.equal(calls.length, 0);
+  console.log("PASS: explicit registry IDs take precedence over name aliases, including disabled IDs");
+}
+
 async function testDashboardRegistryBypassesOptionalKv() {
   let registryReads = 0;
   const kv = {
@@ -2404,6 +2461,8 @@ async function testStalledOptionalHistoryCannotHoldAHealthyResponse() {
 }
 
 try {
+  await testExplicitRegistryIdWinsOverAnotherNodesName();
+  await testOverlappingGithubLimitsRespectTheLaterReset();
   await testStalledKvRegistryCannotSelectAnotherCodespace();
   await testDashboardRegistryBypassesOptionalKv();
   await testStalledOptionalHistoryCannotHoldAHealthyResponse();
