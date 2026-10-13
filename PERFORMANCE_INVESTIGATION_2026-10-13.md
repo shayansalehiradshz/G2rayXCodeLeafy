@@ -335,11 +335,17 @@ pending approval; local parser success does not clear the idle-flow gate.
 
 ## Still Required
 
-1. Roll out the verified origin setting with an approved controlled restart,
-   then repeat both public transports against the unchanged idle gate. Preserve
-   every failing run and a rollback config; do not regenerate credentials.
-2. Verify the same fix on the phone, including Native and HEV, without weakening
-   the idle gate or converting connection replacement into claimed reuse.
+The [14 October follow-up](DEVICE_TFO_ROLLOUT_2026-10-14.md) now records the
+explicitly approved live TFO-off rollout, both public-route retained checks,
+and completed short and five-minute physical-device cases. The earlier
+pending-approval statement above describes this investigation's original
+state, not the current rollout. Negative evidence remains preserved.
+
+1. Extend the completed public/phone cases to longer retained sessions and
+   repeated resumes, preserving the response gate, every failing run, and
+   rollback config. Do not describe socket replacement as original reuse.
+2. Test bootstrap DNS alternatives and actual physical-network transitions on
+   device; source regression checks alone do not certify ISP behavior.
 3. Test long video/social-media/AI sessions, uploads, actual network handoff,
    unplugged standby, and multiple OEM devices. Small probes are not those tests.
 4. Verify address-family and UDP/QUIC compatibility rather than describing

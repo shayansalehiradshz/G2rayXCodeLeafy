@@ -2,6 +2,8 @@ package com.g2ray.client.vpn
 
 import android.os.SystemClock
 import android.util.Base64
+import android.util.Log
+import com.g2ray.client.BuildConfig
 import com.g2ray.client.model.ActiveVpnEngine
 import com.g2ray.client.model.G2RayProfile
 import kotlinx.coroutines.CancellationException
@@ -551,13 +553,15 @@ class XrayCoreManager : TunnelCore {
         testUrl: String = DEFAULT_PREFLIGHT_URLS.first(),
         retryTestUrl: String? = DEFAULT_PREFLIGHT_URLS.getOrNull(1),
         finalTestUrl: String? = DEFAULT_PREFLIGHT_URLS.getOrNull(2),
-        dpiCompatibilityEnabled: Boolean = false
+        dpiCompatibilityEnabled: Boolean = false,
+        checkActive: () -> Unit = {}
     ): List<XrayDelaySummary>? {
+        checkActive()
         val lease = nativeRuntime.tryAcquireProbe() ?: return profiles.map {
             XrayDelaySummary(false, null, null, null, 0, 0, "VPN owns the native runtime; batch test deferred")
         }
         return lease.use {
-            measureDelayQuickBatchOwned(profiles, datDir, timeoutSeconds, testUrl, retryTestUrl, finalTestUrl, dpiCompatibilityEnabled)
+            measureDelayQuickBatchOwned(profiles, datDir, timeoutSeconds, testUrl, retryTestUrl, finalTestUrl, dpiCompatibilityEnabled, checkActive)
         }
     }
 
@@ -568,8 +572,16 @@ class XrayCoreManager : TunnelCore {
         testUrl: String = DEFAULT_PREFLIGHT_URLS.first(),
         retryTestUrl: String? = DEFAULT_PREFLIGHT_URLS.getOrNull(1),
         finalTestUrl: String? = DEFAULT_PREFLIGHT_URLS.getOrNull(2),
-        dpiCompatibilityEnabled: Boolean = false
+        dpiCompatibilityEnabled: Boolean = false,
+        checkActive: () -> Unit = {}
     ): List<XrayDelaySummary>? {
+        fun checkProbeActive() {
+            checkActive()
+            if (nativeRuntime.hasWaitingVpnStart()) {
+                throw CancellationException("VPN startup superseded optional delay probing")
+            }
+        }
+        checkProbeActive()
         if (profiles.isEmpty()) return emptyList()
         if (profiles.size > 5) return null
         val capabilities = bridge.capabilities()
@@ -599,11 +611,13 @@ class XrayCoreManager : TunnelCore {
                 )
             }
 
+            checkProbeActive()
             val batch = bridge.pingBatch(
                 configs = configs,
                 timeoutSeconds = timeoutSeconds.coerceIn(2, 4),
                 testUrl = testUrl
             )
+            checkProbeActive()
             if (!batch.success || batch.results.size != profiles.size) {
                 return null
             }
@@ -625,11 +639,13 @@ class XrayCoreManager : TunnelCore {
                     !resultIsUsable(mergedResults[index])
                 }
                 if (retryIndexes.isEmpty()) return
+                checkProbeActive()
                 val retryBatch = bridge.pingBatch(
                     configs = retryIndexes.map(configs::get),
                     timeoutSeconds = timeoutSeconds.coerceIn(2, 4),
                     testUrl = retryUrl
                 )
+                checkProbeActive()
                 if (retryBatch.success && retryBatch.results.size == retryIndexes.size) {
                     retryIndexes.forEachIndexed { retryIndex, originalIndex ->
                         val retryResult = retryBatch.results[retryIndex]
@@ -797,7 +813,9 @@ class XrayCoreManager : TunnelCore {
                 return
             }
         }
+        val leaseStartedAt = SystemClock.elapsedRealtime()
         nativeLease = withTimeoutOrNull(20_000L) { nativeRuntime.acquireVpn() }
+        logCoreStartupPhase("core_lease", engine, leaseStartedAt, nativeLease != null)
         if (nativeLease == null) {
             _lastError.value = "Native runtime is still busy; retrying must wait for its owner to stop"
             _state.value = TunnelCoreState.Error
@@ -808,12 +826,14 @@ class XrayCoreManager : TunnelCore {
         _state.value = TunnelCoreState.Starting
         healthSocksPort = null
         try {
+            val setupStartedAt = SystemClock.elapsedRealtime()
             runningRouteProbe.reset()
             bridge.registerDialerController(protectSocket)
             bridge.registerListenerController(protectListenerSocket)
             // HEV owns the Android TUN FD and forwards it to this loopback
             // SOCKS inbound. Xray receives the FD only for native TUN mode.
             bridge.setTunFd(if (engine == ActiveVpnEngine.XrayNative) tunFd else 0)
+            logCoreStartupPhase("core_setup", engine, setupStartedAt, true)
 
             var lastStartupError = "Xray failed to start"
             for (attempt in 0 until START_PORT_ATTEMPTS) {
@@ -830,8 +850,13 @@ class XrayCoreManager : TunnelCore {
                     fallbackProfiles = fallbackProfiles
                 )
                 val request = bridge.newRunFromJsonRequest(datDir, configJson)
+                val nativeStartedAt = SystemClock.elapsedRealtime()
                 val result = bridge.runFromJson(request)
-                if (result.success && localSocksListenerProbe.awaitReady(allocatedHealthSocksPort)) {
+                logCoreStartupPhase("core_native_start", engine, nativeStartedAt, result.success)
+                val listenerStartedAt = SystemClock.elapsedRealtime()
+                val listenerReady = result.success && localSocksListenerProbe.awaitReady(allocatedHealthSocksPort)
+                logCoreStartupPhase("core_listener", engine, listenerStartedAt, listenerReady)
+                if (listenerReady) {
                     healthSocksPort = allocatedHealthSocksPort
                     consecutiveStateQueryFailures = 0
                     _state.value = TunnelCoreState.Connected
@@ -876,6 +901,13 @@ class XrayCoreManager : TunnelCore {
     }
 
     fun activeSocksPort(): Int? = healthSocksPort
+
+    private fun logCoreStartupPhase(phase: String, engine: ActiveVpnEngine, startedAt: Long, success: Boolean) {
+        if (BuildConfig.DEBUG) {
+            Log.i("G2RayVpnService", "startup_phase=$phase engine=$engine " +
+                "elapsed_ms=${(SystemClock.elapsedRealtime() - startedAt).coerceAtLeast(0L)} success=$success")
+        }
+    }
 
     internal fun startupFailureResult(): RunningRouteResult = RunningRouteResult(
         success = false,

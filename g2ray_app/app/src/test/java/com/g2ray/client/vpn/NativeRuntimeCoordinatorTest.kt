@@ -15,9 +15,11 @@ class NativeRuntimeCoordinatorTest {
         val waiting = async { runtime.acquireVpn() }
         runCurrent()
         assertFalse(waiting.isCompleted)
+        assertTrue(runtime.hasWaitingVpnStart())
         assertNull(runtime.tryAcquireProbe())
         probe.close()
         val vpn = waiting.await()
+        assertFalse(runtime.hasWaitingVpnStart())
         assertNull(runtime.tryAcquireProbe())
         vpn.close()
         vpn.close()
@@ -32,6 +34,7 @@ class NativeRuntimeCoordinatorTest {
         runCurrent()
         waiting.cancel()
         runCurrent()
+        assertFalse(runtime.hasWaitingVpnStart())
         probe.close()
         assertNotNull(runtime.tryAcquireProbe()?.also { it.close() })
     }

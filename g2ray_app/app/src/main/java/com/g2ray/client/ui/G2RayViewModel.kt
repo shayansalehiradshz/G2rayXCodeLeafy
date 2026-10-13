@@ -36,6 +36,7 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -1931,7 +1932,8 @@ class G2RayViewModel(application: Application) : AndroidViewModel(application) {
                         manager.measureDelayQuickBatch(
                             profiles = chunk,
                             datDir = datDir,
-                            dpiCompatibilityEnabled = dpiCompatibilityEnabled.value
+                            dpiCompatibilityEnabled = dpiCompatibilityEnabled.value,
+                            checkActive = { coroutineContext.ensureActive() }
                         )
                     }
                 } catch (cancelled: CancellationException) {

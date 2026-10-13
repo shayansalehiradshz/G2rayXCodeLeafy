@@ -6,11 +6,14 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.Bundle
+import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelStore
+import androidx.lifecycle.ViewModelStoreOwner
 import androidx.test.core.app.ActivityScenario
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -64,6 +67,71 @@ import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class LiveVpnDeviceTest {
+    @Test
+    fun selectedCodespacePingAllCompletesWithVisibleResults() = runBlocking {
+        val args = InstrumentationRegistry.getArguments()
+        assumeTrue("Real delay scans require -e livePing true", args.getString("livePing") == "true")
+        val context = ApplicationProvider.getApplicationContext<G2RayApplication>()
+        val connectivity = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        assertTrue("Stop VPN before refreshing real delays",
+            connectivity.getNetworkCapabilities(connectivity.activeNetwork)
+                ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) != true)
+        assertTrue("Saved data failed to load", context.accountRepository.loadError.value == null)
+        val selection = context.accountRepository.activeSelection.value
+        val owner = object : ViewModelStoreOwner {
+            override val viewModelStore = ViewModelStore()
+        }
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        lateinit var viewModel: G2RayViewModel
+        instrumentation.runOnMainSync {
+            viewModel = ViewModelProvider(
+                owner, ViewModelProvider.AndroidViewModelFactory(context)
+            )[G2RayViewModel::class.java]
+        }
+        try {
+            val candidates = withTimeout(15_000L) {
+                viewModel.activeCodespaceProfiles.first { it.isNotEmpty() }
+            }
+            val ids = candidates.map { it.id }
+            val startedAt = SystemClock.elapsedRealtime()
+            // Exercise the Home action without an activity's automatic optimizer
+            // starting a second scan and changing selection during this check.
+            instrumentation.runOnMainSync {
+                viewModel.refreshActiveCodespaceDelays()
+                assertTrue("Ping all did not enter testing state for every config",
+                    ids.all { viewModel.profileDelayStates.value[it]?.testing == true })
+            }
+            val budgetMs = (ids.size * 12_000L + 15_000L).coerceIn(60_000L, 300_000L)
+            val results = withTimeout(budgetMs) {
+                viewModel.profileDelayStates.first { states ->
+                    ids.all { id ->
+                        val state = states[id]
+                        state != null && !state.testing && state.testedAt != null &&
+                            (state.delayMs != null || !state.error.isNullOrBlank())
+                    }
+                }
+            }
+            val storedById = context.accountRepository.profiles.value.associateBy { it.id }
+            ids.forEach { id ->
+                val state = results.getValue(id)
+                if (state.delayMs != null) {
+                    assertTrue("A successful ping has no real sample",
+                        state.delayMs in 1L..9_999L && state.successfulSamples > 0 && state.sampleCount > 0)
+                }
+                assertEquals("Visible ping result was not persisted", state.delayMs, storedById[id]?.lastDelayMs)
+            }
+            val successful = ids.count { results.getValue(it).delayMs != null }
+            assertTrue("No saved config passed a real delay check", successful > 0)
+            assertEquals("Ping all changed the selected account/profile/key", selection,
+                context.accountRepository.activeSelection.value)
+            assertTrue("The delay scan left the native core running", !ReflectionXrayBridge().getState())
+            report("event=ping_all_finished total=${ids.size} successful=$successful " +
+                "failed=${ids.size - successful} elapsed_ms=${SystemClock.elapsedRealtime() - startedAt}")
+        } finally {
+            instrumentation.runOnMainSync { owner.viewModelStore.clear() }
+        }
+    }
+
     @Test
     fun selectedAccountWakesOnPhysicalNetwork() = runBlocking {
         val args = InstrumentationRegistry.getArguments()
@@ -176,6 +244,11 @@ class LiveVpnDeviceTest {
         }
         val idleSeconds = (args.getString("idleSeconds")?.toLongOrNull() ?: 60L).coerceIn(60L, 600L)
         val resumeVpnActivity = args.getString("resumeVpnActivity") != "false"
+        val smallProbesOnly = args.getString("smallProbesOnly") == "true"
+        val screenOff = args.getString("screenOff") == "true"
+        require(!screenOff || !resumeVpnActivity) {
+            "Controlled screen-off tests require -e resumeVpnActivity false"
+        }
         val client = OkHttpClient.Builder()
             // No SOCKS proxy, socket protection, or underlying-network binding:
             // these requests must traverse Android's default full-device VPN.
@@ -240,11 +313,16 @@ class LiveVpnDeviceTest {
                     ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
             )
             assertResponsiveQuorum(probeHttpsQuorum(client, "initial"), "initial")
-            transferSample(client)
+            if (smallProbesOnly) {
+                report("transfer_sample_skipped=true small_probes_only=true")
+            } else {
+                transferSample(client)
+            }
             if (expectedEngine == ActiveVpnEngine.Hev) {
+                val minimumRxBytes = if (smallProbesOnly) 1L else DOWNLOAD_BYTES.toLong()
                 val counters = withTimeout(15_000L) {
                     VpnStateRepository.state.first {
-                        it.tunnelTrafficSource == TunnelTrafficSource.HevTun && it.totalRxBytes >= DOWNLOAD_BYTES
+                        it.tunnelTrafficSource == TunnelTrafficSource.HevTun && it.totalRxBytes >= minimumRxBytes
                     }
                 }
                 assertTrue("Real TUN upload counters did not advance", counters.totalTxBytes > 0L)
@@ -262,11 +340,23 @@ class LiveVpnDeviceTest {
                 return@runBlocking
             }
 
-            val idleStartedAt = SystemClock.elapsedRealtime()
             scenario.moveToState(Lifecycle.State.CREATED)
             val power = context.getSystemService(Context.POWER_SERVICE) as PowerManager
-            report("background_idle_seconds=$idleSeconds device_interactive=${power.isInteractive}")
-            waitForBackgroundIdle(idleSeconds * 1_000L)
+            if (screenOff) {
+                ParcelFileDescriptor.AutoCloseInputStream(
+                    InstrumentationRegistry.getInstrumentation().uiAutomation
+                        .executeShellCommand("input keyevent KEYCODE_SLEEP")
+                ).use { output ->
+                    while (output.read() != -1) { /* Drain the completed shell command. */ }
+                }
+                withTimeout(5_000L) {
+                    while (power.isInteractive) delay(50L)
+                }
+            }
+            val idleStartedAt = SystemClock.elapsedRealtime()
+            report("background_idle_seconds=$idleSeconds device_interactive=${power.isInteractive} " +
+                "controlled_screen_off=$screenOff")
+            waitForBackgroundIdle(idleSeconds * 1_000L, power.takeIf { screenOff })
             val afterIdle = VpnStateRepository.state.value
             assertEquals("Service lost the VPN during background idle", TunnelState.Connected, afterIdle.tunnelState)
             // Reopen through Android's normal activity launch path. Trying to
@@ -396,11 +486,12 @@ class LiveVpnDeviceTest {
             }
         }
 
-    private suspend fun waitForBackgroundIdle(durationMs: Long) {
+    private suspend fun waitForBackgroundIdle(durationMs: Long, screenOffPower: PowerManager? = null) {
         // Coroutine timer delays exclude deep sleep on Android. Measure idle
         // with elapsedRealtime so screen-off time counts without a wake lock.
         val deadline = SystemClock.elapsedRealtime() + durationMs
         while (true) {
+            assertTrue("Screen woke during the controlled screen-off interval", screenOffPower?.isInteractive != true)
             val remainingMs = deadline - SystemClock.elapsedRealtime()
             if (remainingMs <= 0L) return
             delay(minOf(remainingMs, 1_000L))

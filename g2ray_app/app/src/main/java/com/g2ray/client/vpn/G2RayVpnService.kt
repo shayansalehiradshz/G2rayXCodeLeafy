@@ -495,22 +495,43 @@ class G2RayVpnService : VpnService() {
 
         internal fun resolveRuntimeProfiles(
             profiles: List<G2RayProfile>,
-            resolve: (String) -> String
+            maxProfiles: Int = MAX_LIVE_ROUTE_PROFILES,
+            resolve: (String) -> List<String>
         ): List<G2RayProfile> {
             require(profiles.isNotEmpty()) { "A selected VPN profile is required" }
-            return profiles.mapIndexedNotNull { index, profile ->
+            val limit = maxProfiles.coerceIn(1, MAX_LIVE_ROUTE_PROFILES)
+            val template = VlessUriParser.transportTemplateKey(profiles.first())
+            var primaryError: Exception? = null
+            val groups = profiles.take(MAX_LIVE_ROUTE_PROFILES).mapIndexedNotNull { index, profile ->
+                if (index > 0 && VlessUriParser.transportTemplateKey(profile) != template) {
+                    return@mapIndexedNotNull null
+                }
                 try {
-                    profile.copy(address = resolve(profile.address))
+                    val addresses = resolve(profile.address).filter(String::isNotBlank).distinct().take(limit)
+                    if (addresses.isEmpty()) throw java.net.UnknownHostException("No usable address found for ${profile.address}")
+                    addresses.map { profile.copy(address = it) }
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (error: Exception) {
-                    // An optional backup can lose DNS on a mobile handoff even
-                    // while the selected IP route works. Only the primary is
-                    // required for startup; future recoveries retry backups.
-                    if (index == 0) throw error
+                    if (index == 0) primaryError = error
                     null
                 }
-            }.distinctBy { "${it.address.lowercase()}:${it.port}" }
+            }
+            if (groups.isEmpty()) {
+                throw primaryError ?: java.net.UnknownHostException("No compatible endpoint could be resolved")
+            }
+            // Keep the first answer from each verified route before filling
+            // spare slots with DNS alternatives from the same hostname.
+            val endpoints = hashSetOf<String>()
+            return buildList(limit) {
+                fun addEndpoint(profile: G2RayProfile) {
+                    if (size < limit && endpoints.add("${profile.address.lowercase()}:${profile.port}")) {
+                        add(profile)
+                    }
+                }
+                groups.forEach { addEndpoint(it.first()) }
+                groups.forEach { group -> group.drop(1).forEach { addEndpoint(it) } }
+            }
         }
 
         internal fun persistedRouteScore(profile: StoredG2RayProfile): Long {
@@ -1656,6 +1677,7 @@ class G2RayVpnService : VpnService() {
         if (
             firstResult.success ||
             !firstResult.retryAllowed ||
+            firstResult.failureScope == RouteFailureScope.DialerBinding ||
             !VpnEngineSelector.shouldFallbackToNative(
                 mode = requestedEngineMode,
                 active = selectedEngine,
@@ -1688,9 +1710,25 @@ class G2RayVpnService : VpnService() {
         }
         activeEngine = engine
         hevTunnelRunning = false
-        val runtimeProfiles = resolveRuntimeProfiles(liveRouteProfilesFor(profile), SocketProtector::resolveTunnelEndpoint)
+        val resolutionStartedAt = SystemClock.elapsedRealtime()
+        val resolutionNetworkGeneration = underlyingNetworkGeneration.get()
+        val runtimeProfiles = resolveRuntimeProfiles(
+            liveRouteProfilesFor(profile),
+            maxProfiles = if (seamlessFailoverEnabled) MAX_LIVE_ROUTE_PROFILES else 1
+        ) { address -> SocketProtector.resolveTunnelEndpoints(address, MAX_LIVE_ROUTE_PROFILES) }
+        logStartupPhase("endpoint_resolution", engine, resolutionStartedAt, true)
+        if (!isTunnelCurrent(lifecycleToken, tun)) {
+            return RunningRouteResult(false, "VPN lifecycle changed during endpoint resolution")
+        }
+        if (resolutionNetworkGeneration != underlyingNetworkGeneration.get()) {
+            return RunningRouteResult(
+                false, "Physical network changed during endpoint resolution",
+                failureScope = RouteFailureScope.DialerBinding
+            )
+        }
         val runtimeProfile = runtimeProfiles.first()
         SocketProtector.clearDialerFailure()
+        val coreStartedAt = SystemClock.elapsedRealtime()
         core.start(
             profile = runtimeProfile,
             tunFd = tun.fd,
@@ -1703,6 +1741,7 @@ class G2RayVpnService : VpnService() {
             dpiCompatibilityEnabled = dpiCompatibilityEnabled,
             fallbackProfiles = runtimeProfiles.drop(1)
         )
+        logStartupPhase("core_start", engine, coreStartedAt, core.state.value == TunnelCoreState.Connected)
         if (!isTunnelCurrent(lifecycleToken, tun)) {
             return RunningRouteResult(false, "VPN lifecycle changed while Xray was starting")
         }
@@ -1711,6 +1750,7 @@ class G2RayVpnService : VpnService() {
         }
 
         if (engine == ActiveVpnEngine.Hev) {
+            val attachStartedAt = SystemClock.elapsedRealtime()
             val socksPort = core.activeSocksPort()
                 ?: return RunningRouteResult(false, "HEV SOCKS listener was not initialized")
             try {
@@ -1732,6 +1772,7 @@ class G2RayVpnService : VpnService() {
                     stopActivePacketEngine()
                     return RunningRouteResult(false, "HEV TUN started but did not expose a healthy native statistics channel")
                 }
+                logStartupPhase("packet_attach", engine, attachStartedAt, true)
             } catch (e: CancellationException) {
                 stopActivePacketEngine()
                 throw e
@@ -1744,13 +1785,17 @@ class G2RayVpnService : VpnService() {
             }
         }
 
+        val probeResetStartedAt = SystemClock.elapsedRealtime()
         fullVpnDataPathProbe.reset()
+        logStartupPhase("probe_reset", engine, probeResetStartedAt, true)
+        val fullPathStartedAt = SystemClock.elapsedRealtime()
         var fullPath = fullVpnDataPathProbe.probe()
         if (!fullPath.success && engine == ActiveVpnEngine.Hev) {
             delay(400)
             fullVpnDataPathProbe.reset()
             fullPath = fullVpnDataPathProbe.probe()
         }
+        logStartupPhase("full_path", engine, fullPathStartedAt, fullPath.success)
         if (fullPath.success) return fullPath
         // A successful TUN proof already includes SOCKS/core/remote transport.
         // Probe SOCKS separately only to diagnose a failed full-device path.
@@ -1764,6 +1809,13 @@ class G2RayVpnService : VpnService() {
             stopActivePacketEngine()
         }
         return diagnosed
+    }
+
+    private fun logStartupPhase(phase: String, engine: ActiveVpnEngine?, startedAt: Long, success: Boolean) {
+        if (BuildConfig.DEBUG) {
+            Log.i("G2RayVpnService", "startup_phase=$phase engine=$engine " +
+                "elapsed_ms=${(SystemClock.elapsedRealtime() - startedAt).coerceAtLeast(0L)} success=$success")
+        }
     }
 
     private fun liveRouteProfilesFor(selected: G2RayProfile): List<G2RayProfile> {
@@ -2199,6 +2251,7 @@ class G2RayVpnService : VpnService() {
         lifecycleToken: Long,
         tun: ParcelFileDescriptor
     ): Boolean {
+        val startedAt = SystemClock.elapsedRealtime()
         var announced = false
         while (waitingForUnderlyingNetwork && isTunnelCurrent(lifecycleToken, tun)) {
             if (!announced) {
@@ -2207,7 +2260,9 @@ class G2RayVpnService : VpnService() {
             }
             delay(500)
         }
-        return isTunnelCurrent(lifecycleToken, tun)
+        val current = isTunnelCurrent(lifecycleToken, tun)
+        logStartupPhase("underlying_network", activeEngine, startedAt, current)
+        return current
     }
 
     private fun scheduleRouteRecovery(

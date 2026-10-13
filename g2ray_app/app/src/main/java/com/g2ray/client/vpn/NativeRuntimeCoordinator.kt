@@ -9,6 +9,8 @@ internal class NativeRuntimeCoordinator {
     private val gate = Mutex()
     private val waitingVpnStarts = AtomicInteger()
 
+    fun hasWaitingVpnStart(): Boolean = waitingVpnStarts.get() > 0
+
     class Lease internal constructor(private val release: () -> Unit) : AutoCloseable {
         private val closed = AtomicBoolean()
         override fun close() {

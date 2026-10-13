@@ -1,6 +1,7 @@
 package com.g2ray.client.vpn
 
 import android.os.Build
+import android.net.Network
 import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import com.g2ray.client.data.AccountRepository
@@ -14,6 +15,7 @@ import com.g2ray.client.network.WakeRetryCooldown
 import com.g2ray.client.network.CodespaceWakeCoordinator
 import com.g2ray.client.parser.VlessUriParser
 import java.lang.reflect.InvocationTargetException
+import java.net.InetAddress
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED
 import kotlin.coroutines.resume
@@ -30,11 +32,90 @@ import org.junit.runner.RunWith
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import org.robolectric.annotation.Implementation
+import org.robolectric.annotation.Implements
+import org.robolectric.shadow.api.Shadow
 import org.json.JSONObject
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [Build.VERSION_CODES.S])
+@Config(sdk = [Build.VERSION_CODES.S], shadows = [G2RayVpnServiceStartupTest.EndpointNetworkShadow::class])
 class G2RayVpnServiceStartupTest {
+    @Test
+    fun lifecycleChangedDuringEndpointDnsNeverStartsTheCore() = runTest {
+        withRejectedConfigService { service, tun, bridge ->
+            SocketProtector.vpnService = service
+            SocketProtector.updateUnderlyingNetwork(Shadow.newInstanceOf(Network::class.java))
+            endpointLookupAction = { setField(service, "vpnInterface", null) }
+            try {
+                val result = invokeRoute(
+                    service, "startEngineAndVerify", profile("front.example"), tun,
+                    ActiveVpnEngine.XrayNative, 0L
+                )
+                assertFalse(result.success)
+                assertEquals("A stale DNS completion started an obsolete core", 0, bridge.starts)
+            } finally {
+                endpointLookupAction = null
+                SocketProtector.vpnService = null
+                SocketProtector.updateUnderlyingNetwork(null)
+            }
+        }
+    }
+
+    @Test
+    fun networkChangedDuringEndpointDnsNeverStartsTheOldNetworkCore() = runTest {
+        withRejectedConfigService { service, tun, bridge ->
+            SocketProtector.vpnService = service
+            SocketProtector.updateUnderlyingNetwork(Shadow.newInstanceOf(Network::class.java))
+            val generation = G2RayVpnService::class.java.getDeclaredField("underlyingNetworkGeneration")
+                .apply { isAccessible = true }.get(service) as java.util.concurrent.atomic.AtomicLong
+            endpointLookupAction = { generation.incrementAndGet() }
+            try {
+                val result = invokeRoute(
+                    service, "startEngineAndVerify", profile("front.example"), tun,
+                    ActiveVpnEngine.XrayNative, 0L
+                )
+                assertFalse(result.success)
+                assertEquals(RouteFailureScope.DialerBinding, result.failureScope)
+                assertEquals(0, bridge.starts)
+            } finally {
+                endpointLookupAction = null
+                SocketProtector.vpnService = null
+                SocketProtector.updateUnderlyingNetwork(null)
+            }
+        }
+    }
+
+    @Test
+    fun endpointDnsNetworkChangeDoesNotTriggerAutoPacketEngineFallback() = runTest {
+        withRejectedConfigService { service, tun, bridge ->
+            SocketProtector.vpnService = service
+            SocketProtector.updateUnderlyingNetwork(Shadow.newInstanceOf(Network::class.java))
+            setField(service, "requestedEngineMode", VpnEngineMode.Auto)
+            val generation = G2RayVpnService::class.java.getDeclaredField("underlyingNetworkGeneration")
+                .apply { isAccessible = true }.get(service) as java.util.concurrent.atomic.AtomicLong
+            var lookups = 0
+            endpointLookupAction = {
+                lookups++
+                generation.incrementAndGet()
+            }
+            try {
+                val result = invokeRoute(
+                    service, "startBestEngineAndVerify", profile("front.example"), tun,
+                    0L, ActiveVpnEngine.Hev
+                )
+                assertFalse(result.success)
+                assertTrue("A network change must remain retryable", result.retryAllowed)
+                assertEquals(RouteFailureScope.DialerBinding, result.failureScope)
+                assertEquals("Physical-network changes are not packet-engine failures", 1, lookups)
+                assertEquals(0, bridge.starts)
+            } finally {
+                endpointLookupAction = null
+                SocketProtector.vpnService = null
+                SocketProtector.updateUnderlyingNetwork(null)
+            }
+        }
+    }
+
     @Test
     fun rejectedCoreConfigDoesNotTryTheOtherPacketEngine() = runTest {
         withRejectedConfigService { service, tun, bridge ->
@@ -203,5 +284,18 @@ class G2RayVpnServiceStartupTest {
             return XrayCallResult(true, null)
         }
         override fun getState() = running
+    }
+
+    @Implements(Network::class)
+    class EndpointNetworkShadow {
+        @Implementation
+        fun getAllByName(host: String): Array<InetAddress> {
+            endpointLookupAction?.invoke()
+            return arrayOf(InetAddress.getByAddress(byteArrayOf(203.toByte(), 0, 113, 1)))
+        }
+    }
+
+    private companion object {
+        var endpointLookupAction: (() -> Unit)? = null
     }
 }

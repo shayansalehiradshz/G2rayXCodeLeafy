@@ -37,9 +37,79 @@ class G2RayVpnServiceTest {
         val workingBackup = liveProfile("203.0.113.2")
         val result = G2RayVpnService.resolveRuntimeProfiles(listOf(selected, backup, workingBackup)) {
             if (it == backup.address) throw java.net.UnknownHostException("DNS unavailable")
-            it
+            listOf(it)
         }
         assertEquals(listOf(selected, workingBackup), result)
+    }
+
+    @Test
+    fun selectedEndpointDnsFailureKeepsACompatibleIpBackup() {
+        val selected = liveProfile("selected.example")
+        val backup = liveProfile("203.0.113.2")
+        val result = G2RayVpnService.resolveRuntimeProfiles(listOf(selected, backup)) {
+            if (it == selected.address) throw java.net.UnknownHostException("DNS unavailable")
+            listOf(it)
+        }
+        assertEquals(listOf(backup), result)
+    }
+
+    @Test
+    fun bootstrapDnsAlternativesPreserveTheCompleteTransportTemplate() {
+        val selected = liveProfile("front.example").copy(
+            xhttpExtraJson = "{\"scMaxEachPostBytes\":60000}",
+            finalMaskJson = "{\"tcp\":[]}",
+            cipherSuites = "TLS_AES_128_GCM_SHA256"
+        )
+        val addresses = listOf("203.0.113.1", "203.0.113.2", "203.0.113.3", "203.0.113.4")
+        val result = G2RayVpnService.resolveRuntimeProfiles(listOf(selected)) { addresses }
+        assertEquals(addresses.take(3).map { selected.copy(address = it) }, result)
+    }
+
+    @Test
+    fun bootstrapAlternativesDoNotConsumeSlotsReservedForVerifiedBackups() {
+        val selected = liveProfile("front.example")
+        val backups = listOf(liveProfile("203.0.113.2"), liveProfile("203.0.113.3"))
+        val result = G2RayVpnService.resolveRuntimeProfiles(listOf(selected) + backups) {
+            if (it == selected.address) listOf("203.0.113.1", "203.0.113.4", "203.0.113.5") else listOf(it)
+        }
+        assertEquals(listOf("203.0.113.1", "203.0.113.2", "203.0.113.3"), result.map { it.address })
+    }
+
+    @Test
+    fun bootstrapAddressesAreDeduplicatedBoundedAndHonorSingleRouteMode() {
+        val selected = liveProfile("front.example")
+        val answers = listOf("", "203.0.113.1", "203.0.113.1", "203.0.113.2", "203.0.113.3", "203.0.113.4")
+        val result = G2RayVpnService.resolveRuntimeProfiles(listOf(selected)) { answers }
+        assertEquals(listOf("203.0.113.1", "203.0.113.2", "203.0.113.3"), result.map { it.address })
+        val single = G2RayVpnService.resolveRuntimeProfiles(listOf(selected), maxProfiles = 1) { answers }
+        assertEquals(listOf(selected.copy(address = "203.0.113.1")), single)
+    }
+
+    @Test
+    fun primaryDnsFailureCannotPromoteAnUnrelatedProfile() {
+        val selected = liveProfile("front.example")
+        val unrelated = liveProfile("203.0.113.2").copy(uuid = "00000000-0000-4000-8000-000000000002")
+        var unrelatedResolved = false
+        val error = runCatching {
+            G2RayVpnService.resolveRuntimeProfiles(listOf(selected, unrelated)) {
+                if (it == selected.address) throw java.net.UnknownHostException("Primary DNS failed")
+                unrelatedResolved = true
+                listOf(it)
+            }
+        }.exceptionOrNull()
+        assertTrue(error is java.net.UnknownHostException)
+        assertEquals("Primary DNS failed", error?.message)
+        assertFalse(unrelatedResolved)
+    }
+
+    @Test
+    fun emptyPrimaryDnsAnswersCanUseACompatibleIpBackup() {
+        val selected = liveProfile("front.example")
+        val backup = liveProfile("203.0.113.2")
+        val result = G2RayVpnService.resolveRuntimeProfiles(listOf(selected, backup)) {
+            if (it == selected.address) emptyList() else listOf(it)
+        }
+        assertEquals(listOf(backup), result)
     }
 
     @Test(expected = java.net.UnknownHostException::class)
@@ -53,7 +123,7 @@ class G2RayVpnServiceTest {
     fun resolvingAnAliasDoesNotDuplicateTheSameLiveEndpoint() {
         val selected = liveProfile("203.0.113.1")
         val result = G2RayVpnService.resolveRuntimeProfiles(listOf(selected, liveProfile("alias.example"))) {
-            "203.0.113.1"
+            listOf("203.0.113.1")
         }
         assertEquals(listOf(selected), result)
     }
@@ -62,7 +132,7 @@ class G2RayVpnServiceTest {
     fun backupEndpointResolutionPreservesCancellation() {
         G2RayVpnService.resolveRuntimeProfiles(listOf(liveProfile("203.0.113.1"), liveProfile("backup.example"))) {
             if (it == "backup.example") throw kotlinx.coroutines.CancellationException("VPN stopped")
-            it
+            listOf(it)
         }
     }
 

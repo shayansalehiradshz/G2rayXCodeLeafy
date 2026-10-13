@@ -26,6 +26,16 @@ through packet engines, restarts, or wake requests. A malformed backup must
 not prevent trying a valid subsequent backup or overwrite the original
 route's transient retry policy.
 
+Endpoint bootstrap regressions must preserve a compatible IP fallback when
+the selected hostname's DNS fails, bound distinct physical-network DNS
+answers to three, and preserve the complete transport template. A stale DNS
+completion after Stop or network replacement must not start an obsolete core.
+A physical-network DNS race is retryable recovery, not an Auto packet-engine
+fallback. Disabling seamless failover must retain the single-route behavior.
+Native batch scans must observe cancellation and queued VPN ownership between
+completed calls, skip optional retries, and release the lease and tempfiles.
+Never force-stop an in-flight JNI call to make VPN startup appear faster.
+
 ## Isolated Linux retained-flow diagnosis
 
 This opt-in check uses the private current bundle and a separate loopback
@@ -117,6 +127,13 @@ Save a working profile, grant VPN permission, and install both debug APKs
 before starting. Do not replace APKs during instrumentation. These tests start
 and stop the VPN and transfer real traffic; ordinary source CI skips them.
 
+For a limited mobile-data budget, add `-e smallProbesOnly true`. This skips
+the 2 MiB download / 64 KiB upload sample; it does not change the independent
+HTTPS quorum, retained/fresh response deadline, lifecycle, or recovery gates.
+HEV counters must still advance after verified upstream requests, but this
+mode is not a throughput or transferred-byte accuracy check. The ordinary
+transfer/counter checks remain enabled by default.
+
 From an Android SDK terminal, run the idle test separately for each engine:
 
 ```powershell
@@ -133,6 +150,27 @@ even when fresh sockets work.
 Repeat with `-e resumeVpnActivity false` so the data requests resume while the
 VPN activity remains stopped. This models returning to a different app rather
 than opening the VPN UI and triggering its foreground re-verification.
+
+Add `-e screenOff true -e resumeVpnActivity false` for controlled screen-off.
+The harness sends the sleep key through
+[UiAutomation.executeShellCommand](https://developer.android.com/reference/android/app/UiAutomation#executeShellCommand(java.lang.String)),
+closes its returned descriptor, and starts the idle timer only after the device
+is noninteractive. It asserts screen-off throughout the elapsed interval.
+Do not touch or wake the phone during this test. USB-powered standby is not
+unplugged deep Doze; those are separate acceptance cases.
+
+With the VPN stopped, check the real Home ping-all action independently:
+
+```powershell
+adb shell am instrument -w -r -e class 'com.g2ray.client.vpn.LiveVpnDeviceTest#selectedCodespacePingAllCompletesWithVisibleResults' -e livePing true com.g2ray.client.test/androidx.test.runner.AndroidJUnitRunner
+```
+
+This invokes the actual ViewModel method without an activity optimizer
+starting a competing scan. Every config must enter testing and finish with
+a persisted real delay or explicit error; selection must remain unchanged and
+the native core must stop. A visible failure is a valid completed result, but
+the test requires at least one working route. This is not a rendered UI-click
+test. It uses small native health requests, not a sustained throughput benchmark.
 
 Test the ordinary Start VPN path separately with the Codespace stopped:
 
@@ -151,6 +189,16 @@ the production protected socket and real recovery API while VPN is active.
 The optional `-e wakeBackend WORKER` or `GITHUB_DIRECT` selects a test backend
 without changing saved account settings. These opt-in calls can start a host.
 No keys, raw profile links, or backend error bodies are printed.
+
+Debug builds also log `startup_phase`, engine, elapsed milliseconds, and success
+for underlying-network wait, endpoint resolution, native startup, HEV attach,
+probe reset, and full-path verification, plus core lease/setup/native/listener
+stages. Use those timings before changing
+timeouts or attributing slow startup to a component. Release builds do not emit
+these phase records, and the records include no endpoints, URIs, or credentials.
+If device logging suppresses the tag, temporarily enable only
+`log.tag.G2RayVpnService=I` and restore its previous value after capture; do not
+change global logging or infer stage durations from missing records.
 
 Run core-failure recovery independently, again with both engines:
 

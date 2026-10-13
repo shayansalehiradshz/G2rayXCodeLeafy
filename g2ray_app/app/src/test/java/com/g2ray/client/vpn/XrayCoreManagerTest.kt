@@ -4,6 +4,8 @@ import com.g2ray.client.model.G2RayProfile
 import com.g2ray.client.model.ActiveVpnEngine
 import com.g2ray.client.model.Transport
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.async
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
@@ -673,6 +675,75 @@ class XrayCoreManagerTest {
     }
 
     @Test
+    fun measureDelayQuickBatch_yieldsBeforeRetriesWhenVpnStartIsWaiting() = runTest {
+        val bridge = FakeXrayBridge(available = true).apply {
+            invokeAvailable = true
+            batchResult = XrayPingBatchResult(true, listOf(XrayPingResult(false, null, "timeout")), null)
+        }
+        val manager = XrayCoreManager(bridge)
+        val runtime = XrayCoreManager::class.java.getDeclaredMethod("getNativeRuntime")
+            .apply { isAccessible = true }.invoke(manager) as NativeRuntimeCoordinator
+        var waiting: kotlinx.coroutines.Deferred<NativeRuntimeCoordinator.Lease>? = null
+        bridge.onBatch = {
+            if (waiting == null) {
+                waiting = async(start = CoroutineStart.UNDISPATCHED) { runtime.acquireVpn() }
+            }
+        }
+        try {
+            val failure = runCatching {
+                manager.measureDelayQuickBatch(
+                    listOf(sampleProfile()), System.getProperty("java.io.tmpdir") ?: ".",
+                    testUrl = "https://one.example", retryTestUrl = "https://two.example",
+                    finalTestUrl = "https://three.example"
+                )
+            }.exceptionOrNull()
+            assertTrue("A pending VPN startup must supersede optional native retries", failure is CancellationException)
+            assertEquals(1, bridge.batchRequests.size)
+            assertTrue(bridge.batchConfigs.all { !java.io.File(it.configPath).exists() })
+        } finally {
+            waiting?.await()?.close()
+        }
+        assertTrue("Cancelled probing leaked the native runtime lease", runtime.tryAcquireProbe()?.also { it.close() } != null)
+    }
+
+    @Test
+    fun measureDelayQuickBatch_cancellationAfterNativeCallSkipsEveryRetryAndCleansFiles() {
+        val bridge = FakeXrayBridge(available = true).apply {
+            invokeAvailable = true
+            batchResult = XrayPingBatchResult(true, listOf(XrayPingResult(false, null, "timeout")), null)
+        }
+        var cancelled = false
+        bridge.onBatch = { cancelled = true }
+        val manager = XrayCoreManager(bridge)
+        val failure = runCatching {
+            manager.measureDelayQuickBatch(
+                listOf(sampleProfile()), System.getProperty("java.io.tmpdir") ?: ".",
+                checkActive = { if (cancelled) throw CancellationException("Scan cancelled for Start VPN") }
+            )
+        }.exceptionOrNull()
+        assertTrue(failure is CancellationException)
+        assertEquals(1, bridge.batchRequests.size)
+        assertTrue(bridge.batchConfigs.all { !java.io.File(it.configPath).exists() })
+        assertTrue(manager.measureDelayQuickBatch(
+            listOf(sampleProfile()), System.getProperty("java.io.tmpdir") ?: ".",
+            retryTestUrl = null, finalTestUrl = null
+        ) != null)
+    }
+
+    @Test
+    fun measureDelayQuickBatch_alreadyCancelledNeverInvokesNativeCode() {
+        val bridge = FakeXrayBridge(available = true).apply { invokeAvailable = true }
+        val failure = runCatching {
+            XrayCoreManager(bridge).measureDelayQuickBatch(
+                listOf(sampleProfile()), System.getProperty("java.io.tmpdir") ?: ".",
+                checkActive = { throw CancellationException("Scan already cancelled") }
+            )
+        }.exceptionOrNull()
+        assertTrue(failure is CancellationException)
+        assertTrue(bridge.batchRequests.isEmpty())
+    }
+
+    @Test
     fun measureRoutePerformance_usesTemporaryProxyAndAlwaysStopsIt() = runTest {
         val bridge = FakeXrayBridge(available = true)
         val performanceProbe = FakeRoutePerformanceProbe(
@@ -794,6 +865,7 @@ class XrayCoreManagerTest {
         var batchResults = mutableListOf<XrayPingBatchResult>()
         var batchRequests = mutableListOf<Pair<List<XrayPingBatchConfig>, String>>()
         var batchFailure: RuntimeException? = null
+        var onBatch: (() -> Unit)? = null
         var runResults = mutableListOf<XrayCallResult>()
         var nativeRunning = true
         var stopLeavesCoreRunning = false
@@ -870,6 +942,7 @@ class XrayCoreManagerTest {
             batchFailure?.let { throw it }
             batchConfigs = configs
             batchRequests += configs to testUrl
+            onBatch?.invoke()
             return if (batchResults.isNotEmpty()) {
                 batchResults.removeAt(0)
             } else {

@@ -112,12 +112,16 @@ object SocketProtector {
      * circular lookup through the new TUN while preserving the original
      * SNI/Host fields for Codespaces routing.
      */
-    fun resolveTunnelEndpoint(address: String): String {
+    fun resolveTunnelEndpoints(address: String, maxCandidates: Int): List<String> {
         if (isNumericAddress(address)) {
-            return address
+            return listOf(address)
         }
         val addresses = lookupControlPlane(address)
-        return (addresses.firstOrNull { it is Inet4Address } ?: addresses.first()).hostAddress
+        val preferred = addresses.filterIsInstance<Inet4Address>().ifEmpty { addresses }
+        return preferred.mapNotNull { it.hostAddress?.takeIf(String::isNotBlank) }
+            .distinct()
+            .take(maxCandidates.coerceIn(1, 3))
+            .takeIf { it.isNotEmpty() }
             ?: throw UnknownHostException("No usable address found for $address")
     }
 

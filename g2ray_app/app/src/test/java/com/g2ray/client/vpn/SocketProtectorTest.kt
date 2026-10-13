@@ -6,6 +6,8 @@ import android.os.Build
 import java.io.IOException
 import java.net.Socket
 import java.net.SocketException
+import java.net.InetAddress
+import java.net.UnknownHostException
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -30,6 +32,7 @@ class SocketProtectorTest {
         events.clear()
         protectionAllowed = true
         bindingFails = false
+        resolvedAddresses = emptyArray()
         SocketProtector.vpnService = G2RayVpnService()
         SocketProtector.updateUnderlyingNetwork(Shadow.newInstanceOf(Network::class.java))
     }
@@ -92,6 +95,41 @@ class SocketProtectorTest {
         }
     }
 
+    @Test
+    fun bootstrapRetainsBoundedDistinctIpv4AnswersOnTheSelectedNetwork() {
+        resolvedAddresses = arrayOf(
+            InetAddress.getByName("2001:db8::1"),
+            InetAddress.getByName("203.0.113.1"),
+            InetAddress.getByName("203.0.113.1"),
+            InetAddress.getByName("203.0.113.2"),
+            InetAddress.getByName("203.0.113.3"),
+            InetAddress.getByName("203.0.113.4")
+        )
+        assertEquals(listOf("203.0.113.1", "203.0.113.2", "203.0.113.3"),
+            SocketProtector.resolveTunnelEndpoints("front.example", 100))
+        assertEquals(listOf("lookup"), events)
+        assertEquals(listOf("203.0.113.1"), SocketProtector.resolveTunnelEndpoints("front.example", 1))
+    }
+
+    @Test
+    fun ipv6OnlyBootstrapKeepsTheExistingAddressFamilyFallback() {
+        resolvedAddresses = arrayOf(InetAddress.getByName("2001:db8::1"), InetAddress.getByName("2001:db8::2"))
+        assertEquals(resolvedAddresses.map { it.hostAddress },
+            SocketProtector.resolveTunnelEndpoints("front.example", 3))
+    }
+
+    @Test
+    fun numericEndpointsNeverInvokeBootstrapDns() {
+        assertEquals(listOf("203.0.113.1"), SocketProtector.resolveTunnelEndpoints("203.0.113.1", 3))
+        assertEquals(listOf("2001:db8::1"), SocketProtector.resolveTunnelEndpoints("2001:db8::1", 3))
+        assertTrue(events.isEmpty())
+    }
+
+    @Test(expected = UnknownHostException::class)
+    fun emptyBootstrapResponseFailsInsteadOfCreatingAnEmptyDialAddress() {
+        SocketProtector.resolveTunnelEndpoints("front.example", 3)
+    }
+
     private class TrackingSocket : Socket() {
         var initialized = false
 
@@ -115,6 +153,12 @@ class SocketProtectorTest {
     @Implements(Network::class)
     class BindingShadow {
         @Implementation
+        fun getAllByName(host: String): Array<InetAddress> {
+            events += "lookup"
+            return resolvedAddresses
+        }
+
+        @Implementation
         fun bindSocket(socket: Socket) {
             events += "bind"
             check((socket as TrackingSocket).initialized)
@@ -126,5 +170,6 @@ class SocketProtectorTest {
         val events = mutableListOf<String>()
         var protectionAllowed = true
         var bindingFails = false
+        var resolvedAddresses = emptyArray<InetAddress>()
     }
 }
