@@ -285,7 +285,7 @@ This is a regression ceiling, not a latency guarantee. It consumes mobile data.
 
 ```powershell
 .\gradlew.bat :app:connectedDebugAndroidTest `
-  "-Pandroid.testInstrumentationRunnerArguments.class=com.g2ray.client.vpn.LiveVpnDeviceTest" `
+  "-Pandroid.testInstrumentationRunnerArguments.class=com.g2ray.client.vpn.LiveVpnDeviceTest#selectedProfileCarriesTrafficAndRecoversAfterBackgroundIdle" `
   "-Pandroid.testInstrumentationRunnerArguments.liveVpn=true" `
   "-Pandroid.testInstrumentationRunnerArguments.engine=hev" `
   "-Pandroid.testInstrumentationRunnerArguments.idleSeconds=300"
@@ -300,6 +300,12 @@ already-saved profile on the same edge and account, without changing the saved
 selection. It fails if no matching profile exists. Sanitized connection IDs and
 HTTP protocol names distinguish retained connections from new ones. Wake the
 phone before an awake baseline; the test reports whether the device is interactive.
+
+Use `resumeVpnActivity=false` to resume traffic without reopening the VPN UI.
+Separate opt-in checks exercise the real Start VPN action, direct wake, and
+protected recovery while VPN is active; see [the test matrix](PRODUCTION_TEST_MATRIX.md).
+The [13 October device follow-up](../DEVICE_RECOVERY_FOLLOWUP_2026-10-13.md)
+records the verified recovery-socket fix and the still-failing retained-flow cases.
 
 ## Notes
 
