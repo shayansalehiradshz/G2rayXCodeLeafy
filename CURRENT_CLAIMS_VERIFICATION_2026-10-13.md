@@ -106,10 +106,18 @@ The initial candidate's 319-test pass did not expose the new suppression case;
 that additional regression is included in the final 320-test run. A nullable-body
 compile error in its guard was corrected before final validation/publication.
 
-Linux server behavior, mock budgets, error-level ShellCheck, pinned-core queue
-and generated-config tests, and native payload/restart fixtures are rerun by
-the existing hosted CI on the committed source. Hosted results must be checked,
-not inferred from a successful push or the earlier revision's checks.
+## Hosted Verification
+
+Both workflows completed successfully on the fix commit
+`5a98092285eaa27d493ce218e61d8a7252c69912`:
+
+- [Static Tests](https://github.com/z2roozsh/G2rayXCodeLeafy/actions/runs/38372592959): 66 static, 193 server behavior, and 65 Worker checks; deterministic mock budgets; error-level ShellCheck; and Worker packaging dry-run.
+- The same run verified the official pinned-core download checksum, saturated upload queue expiry at 30 s, and real-Xray validation of all ten generated/migrated profile and WS combinations.
+- [Android Tests](https://github.com/z2roozsh/G2rayXCodeLeafy/actions/runs/38372592758): unit tests, lint, instrumentation compilation, and native build-contract gates; actual Linux HEV fixtures distinguish a local 44-byte SYN-ACK from upstream payload and verify half-open/established-session restart cleanup.
+
+These are hosted Linux/source/fixture results, not live Codespaces-edge or
+physical-phone acceptance. CI's source-only Android job does not package the
+functional APK; that build succeeded locally with the matching AAR.
 
 ## Installation and Checks
 
@@ -127,6 +135,8 @@ From `g2ray_app`, with JDK 21 and the matching core AAR:
 For server/Worker checks, use the existing CI and commands in
 [`PRODUCTION_TEST_MATRIX.md`](g2ray_app/PRODUCTION_TEST_MATRIX.md).
 The functional debug APK is at `g2ray_app/app/build/outputs/apk/debug/app-debug.apk`.
+Its SHA-256 is
+`f0b14855acb63ef360da3a6075acf88fda38681604d83a9ce2ab9b16e08abc82`.
 No APK installation or new phone acceptance was performed: the user explicitly
 requested continuing without device tests.
 
