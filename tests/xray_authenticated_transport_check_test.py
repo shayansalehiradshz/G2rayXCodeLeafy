@@ -3,11 +3,12 @@
 import json
 from pathlib import Path
 import tempfile
+import subprocess
 import unittest
 from unittest.mock import patch
 from urllib.parse import urlencode
 
-from xray_authenticated_transport_check import outbound, build_channels, check_retained_curl
+from xray_authenticated_transport_check import outbound, build_channels, check_retained_curl, running_core, with_fixture_ca
 
 
 def link(transport="xhttp", **overrides):
@@ -97,6 +98,61 @@ class AuthenticatedTransportCheckTest(unittest.TestCase):
                 self.assertEqual("1/m", command[command.index("--rate") + 1])
                 self.assertEqual(2, command.count("https://www.gstatic.com/generate_204"))
                 self.assertNotIn("--insecure", command)
+
+    def test_fixture_ca_preserves_strict_tls_and_does_not_mutate_original(self):
+        original = outbound(link().replace("@203.0.113.1:", "@127.0.0.1:"))
+        result = with_fixture_ca(original, Path("fixture-ca.pem"))
+        tls = result["streamSettings"]["tlsSettings"]
+        self.assertFalse(tls["allowInsecure"])
+        self.assertEqual("verify", tls["certificates"][0]["usage"])
+        self.assertEqual("chrome", tls["fingerprint"])
+        self.assertNotIn("certificates", original["streamSettings"]["tlsSettings"])
+
+    def test_fixture_ca_cannot_modify_real_or_non_tls_destinations(self):
+        with self.assertRaises(ValueError):
+            with_fixture_ca(outbound(link()), Path("fixture-ca.pem"))
+        candidate = outbound(link().replace("@203.0.113.1:", "@127.0.0.1:"))
+        candidate["streamSettings"]["security"] = "none"
+        with self.assertRaises(ValueError):
+            with_fixture_ca(candidate, Path("fixture-ca.pem"))
+
+    def test_owned_core_cleans_up_when_probe_body_fails(self):
+        with patch("xray_authenticated_transport_check.subprocess.Popen") as popen, \
+             patch("xray_authenticated_transport_check.socket.create_connection"):
+            process = popen.return_value
+            process.pid = 42
+            process.poll.return_value = None
+            with self.assertRaisesRegex(RuntimeError, "probe failed"):
+                with running_core(Path("xray"), Path("fixture.json"), (12345,), None):
+                    raise RuntimeError("probe failed")
+            process.terminate.assert_called_once()
+            process.wait.assert_called_once_with(timeout=5)
+
+    def test_owned_core_reaps_startup_failure_and_term_resistant_process(self):
+        with patch("xray_authenticated_transport_check.subprocess.Popen") as popen:
+            process = popen.return_value
+            process.poll.return_value = 1
+            process.wait.side_effect = [subprocess.TimeoutExpired("fixture", 5), 0]
+            with self.assertRaisesRegex(RuntimeError, "failed to start"):
+                with running_core(Path("xray"), Path("fixture.json"), (12345,), None):
+                    self.fail("Exited core was accepted")
+            process.terminate.assert_called_once()
+            process.kill.assert_called_once()
+            self.assertEqual(2, process.wait.call_count)
+
+    def test_owned_core_requires_ports_and_bounds_socket_readiness(self):
+        with patch("xray_authenticated_transport_check.subprocess.Popen") as popen:
+            with self.assertRaises(ValueError):
+                with running_core(Path("xray"), Path("fixture.json"), (), None):
+                    self.fail("Empty readiness was accepted")
+            popen.assert_not_called()
+        with patch("xray_authenticated_transport_check.subprocess.Popen") as popen, \
+             patch("xray_authenticated_transport_check.time.monotonic", side_effect=[0, 5]):
+            popen.return_value.poll.return_value = None
+            with self.assertRaisesRegex(RuntimeError, "did not open"):
+                with running_core(Path("xray"), Path("fixture.json"), (12345,), None):
+                    self.fail("Expired readiness was accepted")
+            popen.return_value.terminate.assert_called_once()
 
 
 if __name__ == "__main__":

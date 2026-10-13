@@ -122,6 +122,46 @@ measured priority here is avoiding the reproducible retained-response stall.
 It is not a claim of increased sustained throughput or universal compatibility.
 The running server remains unchanged until a controlled rollout is approved.
 
+## Generated Server/Client Pair Follow-Up
+
+The corrected integration harness exported the real `low_latency` server
+configuration and schema-2 links. A separate pinned server and client used
+strict local TLS termination, the exported XHTTP packet-up tuning, the WS
+HTTP/1.1 variant, and the new default origin TFO-off policy. The original
+server config, forwarding listeners, and credentials were not modified.
+
+| Transport | Measured idle gap | Retained-pool requests | Actual connection reuse | Fresh requests |
+| --- | --- | --- | --- | --- |
+| XHTTP | 310,006 ms | 17-67 ms; all three valid HTTP/2 responses | Cloudflare 17 ms and example.com 20 ms reused original IDs; gstatic used a replacement at 67 ms. | 29-60 ms; all three passed. |
+| WS HTTP/1.1 | 310,006 ms | 17-19 ms; all three valid HTTP/2 responses | Cloudflare 17 ms and example.com 19 ms reused original IDs; gstatic used a replacement at 17 ms. | 18-44 ms; all three passed. |
+
+Both retained-pool and fresh-request gates passed without weakening their
+two-of-three/six-second boundary. The replacement socket is explicitly not
+counted as proof that all three original connections survived. Earlier
+scheduled 310-second tests had no completion record after a Codespace restart
+and are excluded, not reported as passes. The repeat recorded outputs locally.
+
+These numbers measure the Codespace's origin path through an isolated
+server/client pair. They are not the phone's latency, a public-edge rollout,
+Android standby acceptance, sustained throughput, or media rebuffering results.
+The public-route and phone gates remain open, and the rating is unchanged.
+
+The CI-only owned-origin fixture initially failed because the generated
+`geoip:private` rule correctly rejected its loopback destinations. The
+fixture now prepends a TCP exception for exactly three owned origin ports on
+`127.0.0.1/32`, retaining every original routing rule. The pinned core also
+independently blocks private addresses inside its freedom outbound; a second
+failed run and private debug logs identified that check. The fixture adds the
+same exact allow rule to freedom's `finalRules`, preserving existing rules
+and the default block for other destinations. Both exceptions are confined to
+a temporary fixture; no production rule is removed or relaxed. Internet pair
+checks use neither exception. Go tests reject invalid/duplicate port lists
+and verify that a failed origin bind reaps already-started listeners.
+The corrected owned-origin pair passed for XHTTP and WS: all initial,
+retained-pool, and fresh responses were valid HTTP/2, and all three retained
+connections kept their original IDs. This was a zero-idle startup/protocol
+check, not additional idle acceptance.
+
 The pinned HEV fixture also delivered every upstream response byte and passed
 upstream EOF to the app as a TCP FIN within its bounded test window. Local
 SYN-ACK traffic still produced zero upstream-payload progress, and restart
@@ -136,14 +176,27 @@ stream or long-session stability.
   to test and cross-compile the isolated Linux helper. No Go dependency is
   added to the app or server runtime.
 - `tests/xray_retained_http_check_test.go`: local HTTP/2 fixtures, no Internet.
-  Six Windows non-race tests passed. Windows race compilation failed because its
-  configured C compiler failed; hosted Linux runs the race gate separately.
+  Eight Windows non-race tests passed. Windows race compilation failed because its
+  configured C compiler failed. The previous six-fixture hosted Linux race
+  gate passed; the updated eight-fixture gate needs its own source-commit result.
 - `tests/xray_authenticated_transport_check.py`: starts/stops only its own
   temporary client and keeps the existing default fresh-request check. The
   retained helper and single-transport choice are explicitly opt-in. Origin,
-  loopback, and independent curl baselines isolate different layers. Eight
-  no-network Python tests verify URI fidelity, origin-copy isolation, and the
-  independent curl gate. Debug logs are private and must not be published.
+  loopback, and independent curl baselines isolate different layers. Thirteen
+  no-network Python tests verify URI fidelity, origin-copy isolation, the
+  independent curl gate, strict loopback fixture TLS, and owned-process cleanup.
+  Debug logs are private and must not be published.
+- `tests/xray_isolated_server_pair_check.py`: generates the actual server
+  profile and its schema-2 XHTTP/WS links, preserves policy and origin socket
+  settings, and starts a separate server/client pair on loopback ports. A
+  one-day private test CA replaces edge TLS termination without disabling
+  certificate verification. The links retain UUID, SNI/Host, path, ALPN, and
+  XHTTP extra; only their dial address/port changes. Seven no-network tests cover
+  fixture isolation, link fidelity, and rejection of missing transports,
+  duplicate transports, mismatched credentials, an unexpected origin TFO
+  policy, and an overbroad owned-origin exception. An opt-in loopback-only
+  variant exercises both generated transports without Internet test traffic.
+  This is not GitHub public-edge or Android acceptance.
 - `g2ray_app/scripts/test-hev-payload.py`: strengthened to check exact payload
   delivery and app-facing FIN, not merely counter increments.
 - Static CI includes real pinned-core rejection and Go race fixtures. Android
@@ -154,11 +207,21 @@ Final local verification also passed all 66 static and 196 behavior checks,
 65 Worker checks, Worker syntax and packaging dry-run, and the deterministic
 mock benchmark budgets. The final behavior run used an unchanged test file;
 an earlier in-progress run was invalidated by editing that file and was rerun,
-not treated as a project regression or a passing suite. Linux integration
-with the actual pinned core accepted all ten generated/migrated combinations
-(five performance profiles, WS on/off), including the TFO policy migration.
-Go vet and six non-race fixtures passed; the Linux race result remains a
-separate hosted-CI gate.
+not treated as a project regression or a passing suite. Go vet and eight
+non-race fixtures passed.
+
+**Correction to the earlier profile/WS coverage claim:** the old integration
+loop wrote the preference file without updating the in-memory profile and
+used empty marker files that did not enable WebSocket. Its ten labeled cases
+therefore did not prove five distinct profiles or WS-on acceptance. This was
+a verification-harness defect, not evidence of a production profile defect.
+The strengthened assertions failed on the old profile selection; the new
+pair preflight also exposed the missing WS listener. The harness now uses the
+real profile setter and WS toggles and asserts the generated policy values,
+log level, and actual listener presence before and after migration. The pinned
+Linux core accepted all **12** corrected cases: six profiles, including
+`unstable_mobile`, each with WS enabled and disabled. These are configuration
+checks, not twelve sustained-transfer tests.
 
 [Android CI for runtime source commit 95fd2a1](https://github.com/z2roozsh/G2rayXCodeLeafy/actions/runs/38402946237)
 passed source/unit/lint/instrumentation compilation and the Linux HEV payload,
@@ -166,7 +229,11 @@ EOF, and restart fixtures. The first Static workflow caught a stale assertion
 that required ignoring migration failure; the assertion now requires the
 stricter guarded migration, backup restore, and preservation regression.
 The unchanged final local static suite passed after that correction. The
-corresponding final hosted Static workflow must be checked separately.
+[Final Static CI for commit 1b5c017](https://github.com/z2roozsh/G2rayXCodeLeafy/actions/runs/38403589634)
+passed, including the Linux Go race gate, pinned-core rejection/upload-expiry
+fixtures, shell/Worker regressions, ShellCheck, and Worker packaging. Its old
+profile matrix is superseded by the coverage correction above; the new
+harness and pair-contract tests require their own source-commit CI result.
 
 No new phone installation or acceptance test was performed: the user chose to
 continue without device tests. The earlier installed-device record remains

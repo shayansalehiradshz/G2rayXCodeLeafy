@@ -71,6 +71,41 @@ Fast Open is off by default for both new configs and existing-config startup
 migration. Kernel capability alone is not enough to enable it. Explicit opt-in
 must pass retained-flow and transfer acceptance on the actual network path.
 
+Check the generated server and its actual exported tuning in a separate,
+loopback-only server/client pair before changing the live server:
+
+```bash
+python3 tests/xray_isolated_server_pair_check.py /usr/local/bin/xray \
+  /tmp/g2ray-retained-http-probe --live --transport xhttp --idle-seconds 310
+```
+
+Repeat with `--transport ws` independently. Run from the repository root; the
+check requires Bash, jq, OpenSSL, curl, and the compiled retained helper. Its
+configuration preflight covers six actual profiles with WS on and off and
+asserts policy values and listener presence, rather than trusting case labels.
+The data test uses `low_latency` unless `--profile` selects another profile.
+It preserves generated UUID, Host/SNI, path, ALPN, and XHTTP extra, changing
+only the dial address/port to owned loopback listeners. A private fixture CA
+models TLS termination with strict certificate verification; WS uses the
+exported HTTP/1.1 variant. It does not model GitHub's buffering/proxy behavior,
+Android TUN, the phone's ISP, Doze, or other WS ALPN variants. An interrupted
+run is incomplete, not a pass; record the actual idle gap and connection IDs.
+
+CI can exercise the same pair with only three owned loopback HTTPS origins:
+
+```bash
+python3 tests/xray_isolated_server_pair_check.py /usr/local/bin/xray \
+  /tmp/g2ray-retained-http-probe --loopback-baseline --idle-seconds 0
+```
+
+This fixture adds a TCP routing exception only for its three selected
+`127.0.0.1` origin ports; the generated private-IP block and other routing rules
+remain intact. The pinned freedom outbound requires the same narrow exception
+in its `finalRules`; other private destinations retain their default block.
+Neither exception is used for Internet pair tests or written to the live
+config. A zero-idle CI pass verifies startup and protocol plumbing, not idle
+recovery; the separate 310-second acceptance remains required.
+
 These commands contact real HTTPS endpoints. Do not publish the private bundle
 or raw runtime configs. The [13 October investigation](../PERFORMANCE_INVESTIGATION_2026-10-13.md)
 records failures as well as passes; a passing direct or SOCKS check cannot

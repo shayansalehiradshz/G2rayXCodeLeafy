@@ -2,6 +2,8 @@ package main
 
 import (
 	"crypto/tls"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -104,7 +106,10 @@ func TestDirectBaselineDoesNotUseAnEnvironmentOrSocksProxy(t *testing.T) {
 }
 
 func TestLoopbackBaselineVerifiesItsOwnTLSWithoutInternet(t *testing.T) {
-	targets, roots, cleanup := loopbackTargets()
+	targets, roots, cleanup, err := loopbackTargets(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer cleanup()
 	transport := newTransport("")
 	transport.TLSClientConfig = &tls.Config{RootCAs: roots}
@@ -121,4 +126,41 @@ func TestLoopbackBaselineVerifiesItsOwnTLSWithoutInternet(t *testing.T) {
 			t.Fatalf("Loopback TLS/reuse fixture failed: %+v / %+v", first, second)
 		}
 	}
+}
+
+func TestLoopbackPortListRejectsDuplicatesAndInvalidDestinations(t *testing.T) {
+	for _, value := range []string{"12345", "12345,12346", "12345,12345,12347", "443,12346,12347", "12345,no,12347", "12345,12346,65536"} {
+		if _, err := parseLoopbackPorts(value); err == nil {
+			t.Fatalf("Accepted invalid owned ports %q", value)
+		}
+	}
+	ports, err := parseLoopbackPorts("12345,12346,12347")
+	if err != nil || len(ports) != 3 || ports[2] != 12347 {
+		t.Fatalf("Rejected valid owned ports: %v / %v", ports, err)
+	}
+}
+
+func TestLoopbackOriginBindFailureReapsPreviouslyStartedOrigins(t *testing.T) {
+	var listeners []net.Listener
+	var ports []int
+	for range 3 {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { listener.Close() })
+		listeners = append(listeners, listener)
+		ports = append(ports, listener.Addr().(*net.TCPAddr).Port)
+	}
+	listeners[0].Close()
+	_, _, cleanup, err := loopbackTargets(ports)
+	defer cleanup()
+	if err == nil {
+		t.Fatal("Accepted an occupied fixture origin port")
+	}
+	listener, bindError := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", ports[0]))
+	if bindError != nil {
+		t.Fatalf("A previously started owned origin leaked its listener: %v", bindError)
+	}
+	listener.Close()
 }

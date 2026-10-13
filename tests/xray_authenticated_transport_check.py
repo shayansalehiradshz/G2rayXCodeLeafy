@@ -2,6 +2,8 @@
 """Opt-in Linux acceptance: private bundle -> loopback SOCKS -> Codespaces edge."""
 
 import argparse
+from contextlib import contextmanager
+import copy
 import json
 import os
 from pathlib import Path
@@ -116,12 +118,64 @@ def check_retained_curl(port):
     print(f"Independent curl second request reused_connection={results[1].get('num_connects') == 0}", flush=True)
 
 
+def with_fixture_ca(proxy_outbound, certificate):
+    targets = proxy_outbound.get("settings", {}).get("vnext", [])
+    stream = proxy_outbound.get("streamSettings", {})
+    if proxy_outbound.get("protocol") != "vless" or len(targets) != 1 or \
+       targets[0].get("address") != "127.0.0.1" or stream.get("security") != "tls":
+        raise ValueError("Fixture CA is allowed only for a single TLS/VLESS loopback destination")
+    result = copy.deepcopy(proxy_outbound)
+    tls = result["streamSettings"].setdefault("tlsSettings", {})
+    if tls.get("allowInsecure"):
+        raise ValueError("Fixture TLS must verify its certificate")
+    tls["allowInsecure"] = False
+    tls["certificates"] = [{"certificateFile": str(certificate), "usage": "verify", "oneTimeLoading": True}]
+    return result
+
+
+@contextmanager
+def running_core(core, config_path, ports, log):
+    ports = tuple(ports)
+    if not ports or any(not isinstance(port, int) or not 1 <= port <= 65535 for port in ports):
+        raise ValueError("Owned test core requires valid loopback listener ports")
+    process = subprocess.Popen([str(core), "run", "-format", "json", "-c", str(config_path)],
+                               stdout=log, stderr=subprocess.STDOUT)
+    print(f"Owned test core pid={process.pid} listener_ports={list(ports)}", flush=True)
+    try:
+        deadline = time.monotonic() + 5
+        for port in ports:
+            while True:
+                if process.poll() is not None:
+                    raise RuntimeError("Owned test core failed to start")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("Owned test listener did not open")
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=min(1, remaining)):
+                        break
+                except OSError:
+                    pass
+                time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+        if process.poll() is not None:
+            raise RuntimeError("Owned test core exited during readiness")
+        yield process
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+
 def validate(core, bundle_path, retained_probe=None, idle_seconds=70, transports=("xhttp", "ws"), origin_config=None,
              origin_keepalive_idle=None, runtime_log_dir=None, retained_curl=False, origin_disable_fast_open=False,
-             loopback_baseline=False):
+             loopback_baseline=False, fixture_ca=None, loopback_origin_ports=None):
     for transport, proxy_outbound, dns in build_channels(
         bundle_path, transports, origin_config, origin_keepalive_idle, origin_disable_fast_open
     ):
+        if fixture_ca is not None:
+            proxy_outbound = with_fixture_ca(proxy_outbound, fixture_ca)
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
@@ -146,64 +200,40 @@ def validate(core, bundle_path, retained_probe=None, idle_seconds=70, transports
                 log = tempfile.NamedTemporaryFile(prefix=f"{transport}-", suffix=".log",
                                                   dir=runtime_log_dir, mode="wb", delete=False)
                 print(f"Private runtime log: {log.name}; do not publish raw logs", flush=True)
-            with log:
-                process = subprocess.Popen([str(core), "run", "-format", "json", "-c", str(config_path)],
-                                           stdout=log, stderr=subprocess.STDOUT)
-                print(f"Test core pid={process.pid} socks_port={port}", flush=True)
-                try:
-                    deadline = time.monotonic() + 5
-                    while True:
-                        if process.poll() is not None:
-                            raise RuntimeError(f"{transport} test core failed to start")
-                        try:
-                            with socket.create_connection(("127.0.0.1", port), timeout=1):
-                                break
-                        except OSError:
-                            pass
-                        if time.monotonic() >= deadline:
-                            raise RuntimeError(f"{transport} test listener did not open")
-                        time.sleep(0.05)
-                    fresh_targets = () if loopback_baseline else (
-                        ("https://www.gstatic.com/generate_204", "204"),
-                        ("https://cp.cloudflare.com/generate_204", "204"),
-                        ("https://example.com/", "200")
-                    )
-                    for url, expected_status in fresh_targets:
-                        body_path = root / "response.body"
-                        started = time.monotonic()
-                        response = subprocess.run([
-                            "curl", "--silent", "--show-error", "--noproxy", "",
-                            "--socks5-hostname", f"127.0.0.1:{port}",
-                            "--connect-timeout", "10", "--max-time", "25", "--header", "Cache-Control: no-store",
-                            "--output", str(body_path), "--write-out", "%{http_code}", url
-                        ], capture_output=True, text=True, timeout=30)
-                        if response.returncode != 0 or response.stdout != expected_status:
-                            raise RuntimeError(f"{transport} HTTPS failed at {urlsplit(url).hostname}")
-                        if expected_status == "200" and b"Example Domain" not in body_path.read_bytes():
-                            raise RuntimeError(f"{transport} HTTPS returned unexpected content")
-                        elapsed_ms = round((time.monotonic() - started) * 1000)
-                        print(f"PASS: authenticated {transport} {urlsplit(url).hostname} HTTP {expected_status}, {elapsed_ms}ms",
-                              flush=True)
-                    if retained_probe is not None:
-                        print(f"Retained HTTP/2 check: transport={transport}; SOCKS only, not Android TUN", flush=True)
-                        command = [str(retained_probe), "--socks-port", str(port), "--idle-seconds", str(idle_seconds)]
-                        if loopback_baseline:
-                            command.append("--loopback-baseline")
-                        response = subprocess.run(
-                            command,
-                            timeout=idle_seconds + 300
-                        )
-                        if response.returncode != 0:
-                            raise RuntimeError(f"{transport} retained HTTP/2 acceptance failed")
-                    if retained_curl:
-                        check_retained_curl(port)
-                finally:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait(timeout=5)
+            with log, running_core(core, config_path, (port,), log):
+                fresh_targets = () if loopback_baseline else (
+                    ("https://www.gstatic.com/generate_204", "204"),
+                    ("https://cp.cloudflare.com/generate_204", "204"),
+                    ("https://example.com/", "200")
+                )
+                for url, expected_status in fresh_targets:
+                    body_path = root / "response.body"
+                    started = time.monotonic()
+                    response = subprocess.run([
+                        "curl", "--silent", "--show-error", "--noproxy", "",
+                        "--socks5-hostname", f"127.0.0.1:{port}",
+                        "--connect-timeout", "10", "--max-time", "25", "--header", "Cache-Control: no-store",
+                        "--output", str(body_path), "--write-out", "%{http_code}", url
+                    ], capture_output=True, text=True, timeout=30)
+                    if response.returncode != 0 or response.stdout != expected_status:
+                        raise RuntimeError(f"{transport} HTTPS failed at {urlsplit(url).hostname}")
+                    if expected_status == "200" and b"Example Domain" not in body_path.read_bytes():
+                        raise RuntimeError(f"{transport} HTTPS returned unexpected content")
+                    elapsed_ms = round((time.monotonic() - started) * 1000)
+                    print(f"PASS: authenticated {transport} {urlsplit(url).hostname} HTTP {expected_status}, {elapsed_ms}ms",
+                          flush=True)
+                if retained_probe is not None:
+                    print(f"Retained HTTP/2 check: transport={transport}; SOCKS only, not Android TUN", flush=True)
+                    command = [str(retained_probe), "--socks-port", str(port), "--idle-seconds", str(idle_seconds)]
+                    if loopback_baseline:
+                        command.append("--loopback-baseline")
+                        if loopback_origin_ports:
+                            command.extend(["--loopback-origin-ports", ",".join(map(str, loopback_origin_ports))])
+                    response = subprocess.run(command, timeout=idle_seconds + 300)
+                    if response.returncode != 0:
+                        raise RuntimeError(f"{transport} retained HTTP/2 acceptance failed")
+                if retained_curl:
+                    check_retained_curl(port)
 
 
 def main():
@@ -227,6 +257,8 @@ def main():
                         help="Use owned HTTP/2 loopback destinations instead of Internet endpoints; requires origin and retained probe")
     parser.add_argument("--runtime-log-dir", type=Path,
                         help="Save private isolated-core debug logs for failure investigation; never publish them")
+    parser.add_argument("--fixture-ca", type=Path,
+                        help="Trust a private test CA only for loopback VLESS/TLS fixture destinations")
     arguments = parser.parse_args()
     if not arguments.live:
         parser.error("This test requires --live and a running private server")
@@ -237,8 +269,8 @@ def main():
     ):
         parser.error("--loopback-baseline requires --origin-config and --retained-probe, without --retained-curl")
     if arguments.origin_config is not None:
-        if arguments.bundle is not None or arguments.transport != "all":
-            parser.error("--origin-config cannot be combined with a bundle or transport override")
+        if arguments.bundle is not None or arguments.transport != "all" or arguments.fixture_ca is not None:
+            parser.error("--origin-config cannot be combined with a bundle, transport override, or fixture CA")
         if arguments.origin_keepalive_idle is not None and not 1 <= arguments.origin_keepalive_idle <= 600:
             parser.error("--origin-keepalive-idle must be from 1 to 600")
     elif arguments.bundle is None:
@@ -251,11 +283,12 @@ def main():
         bundle = arguments.bundle.resolve(strict=True) if arguments.bundle else None
         origin = arguments.origin_config.resolve(strict=True) if arguments.origin_config else None
         runtime_log_dir = arguments.runtime_log_dir.resolve() if arguments.runtime_log_dir else None
+        fixture_ca = arguments.fixture_ca.resolve(strict=True) if arguments.fixture_ca else None
         validate(arguments.xray.resolve(strict=True), bundle, retained_probe=retained_probe,
                  idle_seconds=arguments.idle_seconds, transports=transports, origin_config=origin,
                  origin_keepalive_idle=arguments.origin_keepalive_idle, runtime_log_dir=runtime_log_dir,
                  retained_curl=arguments.retained_curl, origin_disable_fast_open=arguments.origin_disable_fast_open,
-                 loopback_baseline=arguments.loopback_baseline)
+                 loopback_baseline=arguments.loopback_baseline, fixture_ca=fixture_ca)
     except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
         parser.exit(1, f"FAIL: {error}\n")
 

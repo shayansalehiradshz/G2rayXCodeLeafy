@@ -14,6 +14,7 @@ import (
 	"net/http/httptrace"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -137,28 +138,62 @@ func responsiveQuorum(results []probeResult) bool {
 	return successes >= 2
 }
 
-func loopbackTargets() ([]endpoint, *x509.CertPool, func()) {
+func parseLoopbackPorts(value string) ([]int, error) {
+	if value == "" {
+		return nil, nil
+	}
+	parts := strings.Split(value, ",")
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("owned loopback fixture requires exactly three ports")
+	}
+	var ports []int
+	seen := make(map[int]bool)
+	for _, part := range parts {
+		port, err := strconv.Atoi(part)
+		if err != nil || port < 1024 || port > 65535 || seen[port] {
+			return nil, fmt.Errorf("owned loopback fixture requires distinct non-privileged ports")
+		}
+		ports = append(ports, port)
+		seen[port] = true
+	}
+	return ports, nil
+}
+
+func loopbackTargets(ports []int) ([]endpoint, *x509.CertPool, func(), error) {
 	roots := x509.NewCertPool()
 	var servers []*httptest.Server
 	var targets []endpoint
-	for range 3 {
+	cleanup := func() {
+		for _, server := range servers {
+			server.Close()
+		}
+	}
+	if len(ports) != 0 && len(ports) != 3 {
+		return nil, nil, cleanup, fmt.Errorf("owned loopback fixture requires three ports")
+	}
+	for index := range 3 {
 		server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 			writer.WriteHeader(http.StatusNoContent)
 		}))
+		if len(ports) != 0 {
+			server.Listener.Close()
+			listener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", fmt.Sprint(ports[index])))
+			if err != nil {
+				cleanup()
+				return nil, nil, cleanup, fmt.Errorf("owned loopback origin did not bind: %w", err)
+			}
+			server.Listener = listener
+		}
 		server.EnableHTTP2 = true
 		server.StartTLS()
 		servers = append(servers, server)
 		roots.AddCert(server.Certificate())
 		targets = append(targets, endpoint{server.URL, http.StatusNoContent, ""})
 	}
-	return targets, roots, func() {
-		for _, server := range servers {
-			server.Close()
-		}
-	}
+	return targets, roots, cleanup, nil
 }
 
-func run(socksAddress string, idle time.Duration, loopbackBaseline bool) error {
+func run(socksAddress string, idle time.Duration, loopbackBaseline bool, originPorts []int) error {
 	targets := []endpoint{
 		{"https://www.gstatic.com/generate_204", http.StatusNoContent, ""},
 		{"https://cp.cloudflare.com/generate_204", http.StatusNoContent, ""},
@@ -167,7 +202,11 @@ func run(socksAddress string, idle time.Duration, loopbackBaseline bool) error {
 	var roots *x509.CertPool
 	if loopbackBaseline {
 		var cleanup func()
-		targets, roots, cleanup = loopbackTargets()
+		var err error
+		targets, roots, cleanup, err = loopbackTargets(originPorts)
+		if err != nil {
+			return err
+		}
 		defer cleanup()
 		fmt.Println("fixture_scope=loopback_only; not Internet or public-edge acceptance")
 	}
@@ -211,10 +250,13 @@ func main() {
 	port := flag.Int("socks-port", 0, "Port of the separately started loopback Xray SOCKS listener")
 	direct := flag.Bool("direct-baseline", false, "Diagnostic baseline on this host, without Xray, SOCKS, or an environment proxy")
 	loopback := flag.Bool("loopback-baseline", false, "Use three owned TLS/HTTP2 loopback servers to isolate forwarding from Internet egress")
+	loopbackPortList := flag.String("loopback-origin-ports", "", "Three owned origin ports for a loopback-only server/client fixture")
 	idleSeconds := flag.Int("idle-seconds", 70, "Idle interval between initial and retained requests (0-600)")
 	flag.Parse()
+	originPorts, portError := parseLoopbackPorts(*loopbackPortList)
 	if (!*direct && (*port < 1 || *port > 65535)) || (*direct && *port != 0) ||
-		*idleSeconds < 0 || *idleSeconds > 600 || flag.NArg() != 0 {
+		*idleSeconds < 0 || *idleSeconds > 600 || flag.NArg() != 0 || portError != nil ||
+		(*loopbackPortList != "" && !*loopback) {
 		fmt.Fprintln(os.Stderr, "Use a valid --socks-port and --idle-seconds from 0 to 600")
 		os.Exit(2)
 	}
@@ -222,7 +264,7 @@ func main() {
 	if *direct {
 		address = ""
 	}
-	if err := run(address, time.Duration(*idleSeconds)*time.Second, *loopback); err != nil {
+	if err := run(address, time.Duration(*idleSeconds)*time.Second, *loopback, originPorts); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
