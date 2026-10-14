@@ -348,6 +348,49 @@ acceptance; they are not declared passed merely because unit tests pass.
 Coreless tests do not prove VPN functionality and must never be reported as a
 packaged-core smoke test.
 
+## Saved settings failure and recovery
+
+Exercise read/open/write failures with the injected unit-test stores. Do not
+delete a real Keystore alias, truncate encrypted preferences, or clear user
+data to manufacture these failures on a phone.
+
+1. Fail the secure-store open or a VPN-preference read during app startup.
+   The UI must show an unavailable-settings state instead of crashing. It
+   must not save presentation defaults, start a tunnel, or launch probes with
+   unknown settings. The original encryption scheme/file/key alias must stay
+   unchanged; no plaintext fallback or automatic reset is allowed.
+2. Fail a legacy migration read/write and shared-Worker migration write.
+   Preserve the original records, report failure, and reject ordinary writes
+   until a full reload succeeds. Retry must retain profile/account/key IDs
+   after a confirmed migration, without duplicating records on replay.
+3. Fail parsing after an earlier JSON field has parsed successfully. A reload
+   must retain the complete last-good in-memory snapshot, not publish a
+   mixture of old and partially loaded records. Do not overwrite malformed
+   source data or include its contents in error messages.
+4. Import a valid legacy profile with no Worker or wake key. It must migrate
+   without inventing a blank wake key. An unsupported legacy profile must be
+   preserved and copyable; its advisory must not block manual profile import.
+5. Simulate a commit that changes memory but fails its acknowledgement, then
+   repeat with a failed rollback. Restore only touched keys and block affected
+   reads/all new writes while restoration is unconfirmed. Unrelated VPN
+   settings must remain readable after an optional scan-history write fails.
+   A checked storage exception must also roll back the repository's published
+   snapshot. Service profile/intent reads and writes must use the Application's
+   same guarded store, not construct a fresh instance to bypass restoration.
+6. Repeat Reload while a reload is in flight. It must not create a spurious
+   preferences error. Completion requires the public ready/error state to
+   settle, not merely a finished job or an idle spinner.
+7. With a previously verified tunnel running, fail a new UI preference read.
+   The UI must not invalidate or stop that tunnel. Stop must remain usable.
+   Reloading settings requires stopping the VPN/finishing active operations;
+   no background reload may rewrite the active session's configuration.
+
+Unit tests verify simulated failures, default Application/ViewModel wiring,
+and Stop-intent dispatch. They do not prove physical Keystore fault recovery,
+rendered UI behavior, actual native shutdown, or real device fault tolerance.
+Repeat normal upgrade/relaunch, legacy-config copying, and Stop/reload on the
+target phone without destructive fault injection before release acceptance.
+
 ## Always-on and lockdown
 
 Run this section on Android 8.1 or newer after saving a working profile.

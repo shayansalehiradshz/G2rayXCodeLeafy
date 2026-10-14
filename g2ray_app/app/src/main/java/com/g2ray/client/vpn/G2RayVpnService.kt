@@ -26,7 +26,6 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import com.g2ray.client.BuildConfig
 import com.g2ray.client.G2RayApplication
-import com.g2ray.client.data.EncryptedPrefsStore
 import com.g2ray.client.MainActivity
 import com.g2ray.client.model.AppConnectionState
 import com.g2ray.client.model.ActiveVpnEngine
@@ -198,7 +197,8 @@ class G2RayVpnService : VpnService() {
     }
     private val core = XrayCoreManager()
     private val fullVpnDataPathProbe: VpnDataPathProbe = OkHttpVpnDataPathProbe()
-    private val vpnPreferences by lazy { VpnEnginePreferences(this) }
+    private val secureStore by lazy { (application as G2RayApplication).secureStore }
+    private val vpnPreferences by lazy { VpnEnginePreferences(secureStore) }
     private val accountRepository by lazy { (application as G2RayApplication).accountRepository }
     private val workerCoordinator by lazy {
         WorkerRouteCoordinator(
@@ -1058,7 +1058,7 @@ class G2RayVpnService : VpnService() {
                         ?: throw IllegalStateException(
                             "No valid active VLESS profile. Import and select a profile first."
                         )
-                    if (intent == null && EncryptedPrefsStore(this@G2RayVpnService)
+                    if (intent == null && secureStore
                             .getString(PREF_DESIRED_CONNECTED, "true") == "false"
                     ) {
                         withContext(Dispatchers.Main) { stopTunnel() }
@@ -1302,7 +1302,7 @@ class G2RayVpnService : VpnService() {
         cleanupJob = scope.launch {
             lifecycleOperationMutex.withLock {
                 if (!desiredConnected) {
-                    runCatching { EncryptedPrefsStore(this@G2RayVpnService).putString(PREF_DESIRED_CONNECTED, "false") }
+                    runCatching { secureStore.putString(PREF_DESIRED_CONNECTED, "false") }
                 }
                 runCatching { fullVpnDataPathProbe.reset() }
                 runCatching { stopActivePacketEngine() }
@@ -2708,7 +2708,7 @@ class G2RayVpnService : VpnService() {
 
     private fun rememberLastProfileContext(rawProfile: String, accountId: String?) {
         runCatching {
-            EncryptedPrefsStore(this).putStrings(
+            secureStore.putStrings(
                 mapOf(
                     PREF_LAST_RAW_PROFILE_URI to rawProfile,
                     PREF_LAST_ACCOUNT_ID to accountId,
@@ -2720,19 +2720,19 @@ class G2RayVpnService : VpnService() {
 
     private fun restoreLastRawProfile(): String? {
         return runCatching {
-            EncryptedPrefsStore(this).getString(PREF_LAST_RAW_PROFILE_URI, null)
+            secureStore.getString(PREF_LAST_RAW_PROFILE_URI, null)
         }.getOrNull()
     }
 
     private fun restoreLastAccountId(): String? {
         return runCatching {
-            EncryptedPrefsStore(this).getString(PREF_LAST_ACCOUNT_ID, null)
+            secureStore.getString(PREF_LAST_ACCOUNT_ID, null)
         }.getOrNull()
     }
 
     private fun clearLastRawProfile() {
         runCatching {
-            EncryptedPrefsStore(this).remove(PREF_LAST_RAW_PROFILE_URI, PREF_LAST_ACCOUNT_ID)
+            secureStore.remove(PREF_LAST_RAW_PROFILE_URI, PREF_LAST_ACCOUNT_ID)
         }
     }
 

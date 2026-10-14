@@ -6,9 +6,10 @@ import com.g2ray.client.data.EncryptedPrefsStore
 import com.g2ray.client.network.RouteMeasurementContext
 
 class G2RayApplication : Application() {
+    internal val secureStore by lazy(LazyThreadSafetyMode.SYNCHRONIZED) { EncryptedPrefsStore(this) }
     val routeMeasurementContext by lazy(LazyThreadSafetyMode.SYNCHRONIZED) { RouteMeasurementContext(this) }
 
     val accountRepository: AccountRepository by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
-        AccountRepository(EncryptedPrefsStore(this))
+        AccountRepository(secureStore)
     }
 }

@@ -1,5 +1,6 @@
 package com.g2ray.client.ui
 
+import android.widget.Toast
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -50,6 +51,40 @@ fun SettingsScreen(
     viewModel: G2RayViewModel,
     onNavigateBack: () -> Unit
 ) {
+    val savedDataReady by viewModel.savedDataReady.collectAsState()
+    val savedDataError by viewModel.repositoryLoadError.collectAsState()
+    val isReloading by viewModel.isReloadingSavedData.collectAsState()
+    val originalConfig by viewModel.legacyProfileForRecovery.collectAsState()
+    val vpnState by VpnStateRepository.state.collectAsState()
+    val context = LocalContext.current
+    if (!savedDataReady) {
+        Scaffold(topBar = {
+            TopAppBar(
+                title = { Text("Saved Settings") },
+                navigationIcon = {
+                    IconButton(onClick = onNavigateBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                }
+            )
+        }) { padding ->
+            Column(Modifier.fillMaxSize().padding(padding).padding(16.dp).verticalScroll(rememberScrollState())) {
+                SavedDataNotice(
+                    message = savedDataError ?: "Reloading saved settings...",
+                    reloading = isReloading,
+                    retryEnabled = vpnState.tunnelState in setOf(TunnelState.Disabled, TunnelState.Disconnected, TunnelState.Error),
+                    onRetry = viewModel::reloadSavedData,
+                    onCopyOriginal = originalConfig?.let { raw ->
+                        {
+                            val copied = copyConfigLinkToClipboard(context, raw)
+                            Toast.makeText(context, if (copied) "Original config copied" else "Clipboard unavailable", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                )
+            }
+        }
+        return
+    }
     val backstack = remember { mutableStateListOf<SettingsDest>(SettingsDest.Accounts) }
     val currentDest = backstack.last()
 

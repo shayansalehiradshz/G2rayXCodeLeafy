@@ -30,6 +30,7 @@ import com.g2ray.client.vpn.G2RayVpnService
 import com.g2ray.client.vpn.SocketProtector
 import com.g2ray.client.vpn.RoutePerformanceSummary
 import com.g2ray.client.vpn.VpnEnginePreferences
+import com.g2ray.client.vpn.VpnSettingsSnapshot
 import com.g2ray.client.vpn.XrayDelaySummary
 import com.g2ray.client.vpn.XrayCoreManager
 import kotlinx.coroutines.CancellationException
@@ -80,7 +81,11 @@ class G2RayViewModel internal constructor(
     private val routeProbeManagerFactory: () -> XrayCoreManager,
     private val vpnEnginePreferences: VpnEnginePreferences
 ) : AndroidViewModel(application) {
-    constructor(application: Application) : this(application, { XrayCoreManager() }, VpnEnginePreferences(application))
+    constructor(application: Application) : this(
+        application,
+        { XrayCoreManager() },
+        VpnEnginePreferences((application as G2RayApplication).secureStore)
+    )
 
     enum class VpnStartPlan {
         DirectProbeThenWake,
@@ -94,6 +99,15 @@ class G2RayViewModel internal constructor(
     }
 
     val repository = (application as G2RayApplication).accountRepository
+    private val _preferenceLoadError = MutableStateFlow<String?>(null)
+    private val initialSettings = try {
+        vpnEnginePreferences.readSettings()
+    } catch (e: Exception) {
+        _preferenceLoadError.value = preferenceReadError(e)
+        // Presentation defaults only; unreadable settings block startup and
+        // probes until a complete read succeeds. Never persist these defaults.
+        VpnSettingsSnapshot()
+    }
     private val measurementContext = (application as G2RayApplication).routeMeasurementContext
     val measurementNetworkKey = measurementContext.changes()
         .stateIn(viewModelScope, SharingStarted.Eagerly, null)
@@ -102,7 +116,15 @@ class G2RayViewModel internal constructor(
     val apiKeys: StateFlow<List<G2RayApiKey>> = repository.apiKeys
     val profiles: StateFlow<List<StoredG2RayProfile>> = repository.profiles
     val activeSelection: StateFlow<ActiveSelection> = repository.activeSelection
-    val repositoryLoadError: StateFlow<String?> = repository.loadError
+    val repositoryLoadError: StateFlow<String?> = combine(repository.loadError, _preferenceLoadError) { data, settings ->
+        savedDataMessage(data, settings)
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, savedDataMessage(repository.loadError.value, _preferenceLoadError.value))
+    val savedDataReady: StateFlow<Boolean> = combine(repository.savedDataReady, _preferenceLoadError) { dataReady, settingsError ->
+        dataReady && settingsError == null
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, repository.savedDataReady.value && _preferenceLoadError.value == null)
+    val legacyProfileForRecovery = repository.legacyProfileForRecovery
+    private val _isReloadingSavedData = MutableStateFlow(false)
+    val isReloadingSavedData = _isReloadingSavedData.asStateFlow()
     val workerControlPlane = repository.workerControlPlane
 
     val activeAccount: StateFlow<G2RayAccount?> = accounts.combine(activeSelection) { accs, sel ->
@@ -151,25 +173,25 @@ class G2RayViewModel internal constructor(
     private val _profileDelayStates = MutableStateFlow<Map<String, ProfileDelayState>>(emptyMap())
     val profileDelayStates: StateFlow<Map<String, ProfileDelayState>> = _profileDelayStates.asStateFlow()
 
-    private val _vpnEngineMode = MutableStateFlow(vpnEnginePreferences.getMode())
+    private val _vpnEngineMode = MutableStateFlow(initialSettings.mode)
     val vpnEngineMode: StateFlow<VpnEngineMode> = _vpnEngineMode.asStateFlow()
 
-    private val _fastDnsEnabled = MutableStateFlow(vpnEnginePreferences.isFastDnsEnabled())
+    private val _fastDnsEnabled = MutableStateFlow(initialSettings.fastDnsEnabled)
     val fastDnsEnabled: StateFlow<Boolean> = _fastDnsEnabled.asStateFlow()
 
-    private val _ipv4OnlyEnabled = MutableStateFlow(vpnEnginePreferences.isIpv4OnlyEnabled())
+    private val _ipv4OnlyEnabled = MutableStateFlow(initialSettings.ipv4OnlyEnabled)
     val ipv4OnlyEnabled: StateFlow<Boolean> = _ipv4OnlyEnabled.asStateFlow()
 
-    private val _dpiCompatibilityEnabled = MutableStateFlow(vpnEnginePreferences.isDpiCompatibilityEnabled())
+    private val _dpiCompatibilityEnabled = MutableStateFlow(initialSettings.dpiCompatibilityEnabled)
     val dpiCompatibilityEnabled: StateFlow<Boolean> = _dpiCompatibilityEnabled.asStateFlow()
 
     private val _autoRouteOptimizationEnabled = MutableStateFlow(
-        vpnEnginePreferences.isAutoRouteOptimizationEnabled()
+        initialSettings.autoRouteOptimizationEnabled
     )
     val autoRouteOptimizationEnabled: StateFlow<Boolean> = _autoRouteOptimizationEnabled.asStateFlow()
 
     private val _seamlessFailoverEnabled = MutableStateFlow(
-        vpnEnginePreferences.isSeamlessFailoverEnabled()
+        initialSettings.seamlessFailoverEnabled
     )
     val seamlessFailoverEnabled: StateFlow<Boolean> = _seamlessFailoverEnabled.asStateFlow()
 
@@ -211,6 +233,12 @@ class G2RayViewModel internal constructor(
     }
 
     companion object {
+        private fun preferenceReadError(error: Exception): String =
+            "Saved VPN settings could not be read. Stored data was not changed: ${error.javaClass.simpleName}"
+
+        private fun savedDataMessage(data: String?, settings: String?): String? =
+            listOfNotNull(data, settings).distinct().joinToString("\n").takeIf { it.isNotBlank() }
+
         internal fun generateRouteCandidates(
             existing: List<G2RayProfile>,
             addresses: List<String>,
@@ -606,6 +634,18 @@ class G2RayViewModel internal constructor(
     private var pendingVpnProfileUri: String? = null
     private var pendingVpnAccountId: String? = null
 
+    private fun savedDataUnavailableNow(): String? = when {
+        !repository.savedDataReady.value -> repository.loadError.value ?: "Saved settings are being reloaded."
+        _preferenceLoadError.value != null -> _preferenceLoadError.value
+        else -> null
+    }
+
+    private fun requireSavedData(): Boolean {
+        val error = savedDataUnavailableNow() ?: return true
+        _statusMessage.value = error
+        return false
+    }
+
     private fun configurationMutationAllowedNow(): Boolean {
         val startupBusy = currentVpnStartJob?.isActive == true ||
             currentWakeJob?.isActive == true ||
@@ -617,21 +657,34 @@ class G2RayViewModel internal constructor(
     private fun <T> launchConfigurationMutation(
         operation: String,
         mutation: () -> T,
+        allowUnavailableData: Boolean = false,
         onResult: (Result<T>) -> Unit = {}
-    ) {
+    ): Job? {
         if (configurationMutationJob?.isActive == true) {
             val result = Result.failure<T>(
                 IllegalStateException("Wait for the current settings change to finish.")
             )
             _statusMessage.value = result.exceptionOrNull()?.message.orEmpty()
             onResult(result)
-            return
+            return null
+        }
+        val dataError = if (allowUnavailableData) null else savedDataUnavailableNow()
+        if (dataError != null) {
+            _statusMessage.value = dataError
+            onResult(Result.failure(IllegalStateException(dataError)))
+            return null
         }
 
         lateinit var job: kotlinx.coroutines.Job
         job = viewModelScope.launch(start = CoroutineStart.LAZY) {
             val result = withContext(Dispatchers.IO) {
-                runCatching { mutation() }
+                try {
+                    Result.success(mutation())
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Result.failure(e)
+                }
             }
             result.exceptionOrNull()?.let {
                 _statusMessage.value = it.localizedMessage ?: "Failed to $operation."
@@ -645,6 +698,45 @@ class G2RayViewModel internal constructor(
             }
         }
         job.start()
+        return job
+    }
+
+    fun reloadSavedData() {
+        if (_isReloadingSavedData.value || configurationMutationJob?.isActive == true) {
+            _statusMessage.value = "Wait for the current settings operation to finish."
+            return
+        }
+        if (!configurationMutationAllowedNow()) {
+            _statusMessage.value = "Stop VPN and finish the current operation before reloading saved settings."
+            return
+        }
+        _isReloadingSavedData.value = true
+        val job = launchConfigurationMutation(
+            operation = "reload saved settings",
+            allowUnavailableData = true,
+            mutation = {
+                repository.reloadSavedData()
+                vpnEnginePreferences.readSettings()
+            }
+        ) { result ->
+            result.onSuccess { settings ->
+                _vpnEngineMode.value = settings.mode
+                _fastDnsEnabled.value = settings.fastDnsEnabled
+                _ipv4OnlyEnabled.value = settings.ipv4OnlyEnabled
+                _dpiCompatibilityEnabled.value = settings.dpiCompatibilityEnabled
+                _autoRouteOptimizationEnabled.value = settings.autoRouteOptimizationEnabled
+                _seamlessFailoverEnabled.value = settings.seamlessFailoverEnabled
+                _preferenceLoadError.value = null
+                _statusMessage.value = repository.loadError.value ?: "Saved settings reloaded."
+            }
+            result.onFailure { failure ->
+                val error = if (failure is Exception) preferenceReadError(failure) else "Saved settings could not be read."
+                _preferenceLoadError.value = error
+                _statusMessage.value = error
+            }
+        }
+        if (job == null) _isReloadingSavedData.value = false
+        job?.invokeOnCompletion { _isReloadingSavedData.value = false }
     }
 
     private fun workerKeyFor(accountId: String): G2RayApiKey? {
@@ -704,6 +796,7 @@ class G2RayViewModel internal constructor(
     }
 
     fun wakeUpCodespace() {
+        if (!requireSavedData()) return
         if (currentWakeJob?.isActive == true) return
 
         currentWakeJob = viewModelScope.launch {
@@ -918,6 +1011,11 @@ class G2RayViewModel internal constructor(
     }
 
     fun startVpn(context: Context = getApplication()) {
+        savedDataUnavailableNow()?.let { error ->
+            _statusMessage.value = error
+            if (vpnStartAllowed(VpnStateRepository.state.value.tunnelState)) reportVpnStartBlocked(error)
+            return
+        }
         if (vpnStartRequestBusy(currentVpnStartJob?.isActive == true)) {
             _statusMessage.value = "VPN startup is already in progress."
             return
@@ -1134,6 +1232,10 @@ class G2RayViewModel internal constructor(
     }
 
     private fun startPendingVpnIfRequested() {
+        if (!requireSavedData()) {
+            clearPendingVpnStart()
+            return
+        }
         val profileUri = pendingVpnProfileUri ?: return
         val accountId = pendingVpnAccountId
         pendingVpnProfileUri = null
@@ -1208,6 +1310,10 @@ class G2RayViewModel internal constructor(
     }
 
     private fun startVpnService(profileUri: String, context: Context, accountId: String?) {
+        if (!requireSavedData()) {
+            clearPendingVpnStart()
+            return
+        }
         val intent = Intent(context.applicationContext, G2RayVpnService::class.java).apply {
             action = G2RayVpnService.ACTION_START
             putExtra(G2RayVpnService.EXTRA_RAW_PROFILE_URI, profileUri)
@@ -1553,6 +1659,7 @@ class G2RayViewModel internal constructor(
     }
 
     fun autoOptimizeRoutesIfNeeded() {
+        if (!requireSavedData()) return
         val networkKey = measurementContext.currentKey() ?: return
         val selection = repository.activeSelection.value
         val accountId = selection.accountId ?: return
@@ -1564,9 +1671,15 @@ class G2RayViewModel internal constructor(
             configurationMutationJob?.isActive == true ||
             currentDelayProbeJob?.isActive == true ||
             routeOptimizationJob?.isActive == true
+        val lastAttemptAt = try {
+            vpnEnginePreferences.getLastRouteOptimizationAttemptAt(accountId, networkKey)
+        } catch (_: Exception) {
+            _statusMessage.value = "Automatic route scan paused: its saved scan history could not be read."
+            return
+        }
         if (!shouldAutoOptimizeRoutes(
                 enabled = autoRouteOptimizationEnabled.value,
-                lastAttemptAt = vpnEnginePreferences.getLastRouteOptimizationAttemptAt(accountId, networkKey),
+                lastAttemptAt = lastAttemptAt,
                 now = now,
                 routeWasReady = VpnStateRepository.state.value.routeReady || account.lastRouteReady == true ||
                     hasOptimizationReadinessEvidence(
@@ -1587,6 +1700,7 @@ class G2RayViewModel internal constructor(
     }
 
     fun optimizeRoutes() {
+        if (!requireSavedData()) return
         if (!isVpnCoreAvailable.value) {
             _statusMessage.value = XrayCoreManager.MISSING_CORE_MESSAGE
             return
@@ -2021,6 +2135,7 @@ class G2RayViewModel internal constructor(
     }
 
     fun measureProfileDelay(profileId: String) {
+        if (!requireSavedData()) return
         if (currentDelayProbeJob?.isActive == true || routeOptimizationJob?.isActive == true) {
             _statusMessage.value = "Wait for the current route test to finish."
             return
@@ -2143,6 +2258,7 @@ class G2RayViewModel internal constructor(
     }
 
     fun refreshActiveCodespaceDelays() {
+        if (!requireSavedData()) return
         if (currentDelayProbeJob?.isActive == true || routeOptimizationJob?.isActive == true) {
             _statusMessage.value = "Wait for the current route test to finish."
             return

@@ -83,6 +83,11 @@ fun HomeScreen(
     val autoRouteOptimizationEnabled by viewModel.autoRouteOptimizationEnabled.collectAsState()
     val seamlessFailoverEnabled by viewModel.seamlessFailoverEnabled.collectAsState()
     val isRouteOptimizing by viewModel.isRouteOptimizing.collectAsState()
+    val savedDataReady by viewModel.savedDataReady.collectAsState()
+    val savedDataError by viewModel.repositoryLoadError.collectAsState()
+    val isReloadingSavedData by viewModel.isReloadingSavedData.collectAsState()
+    val originalLegacyConfig by viewModel.legacyProfileForRecovery.collectAsState()
+    val savedSettingsUsable = savedDataReady && !isReloadingSavedData
     var showCodespacePicker by remember { mutableStateOf(false) }
 
     val vpnUiState by com.g2ray.client.model.VpnStateRepository.state.collectAsState()
@@ -159,6 +164,21 @@ fun HomeScreen(
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
+            val loadMessage = savedDataError ?: if (isReloadingSavedData) "Reloading saved settings..." else null
+            if (loadMessage != null) {
+                SavedDataNotice(
+                    message = loadMessage,
+                    reloading = isReloadingSavedData,
+                    retryEnabled = !isVpnRunning && !isWakingUp && !isRouteOptimizing && !isAnyDelayTesting,
+                    onRetry = viewModel::reloadSavedData,
+                    onCopyOriginal = originalLegacyConfig?.let { raw ->
+                        {
+                            val copied = copyConfigLinkToClipboard(context, raw)
+                            Toast.makeText(context, if (copied) "Original config copied" else "Clipboard unavailable", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                )
+            }
             // Section 1: Active Account & Wake Control
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -175,7 +195,7 @@ fun HomeScreen(
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold
                         )
-                        TextButton(onClick = { showCodespacePicker = true }) {
+                        TextButton(onClick = { showCodespacePicker = true }, enabled = savedSettingsUsable) {
                             Text("Switch")
                         }
                     }
@@ -279,7 +299,7 @@ fun HomeScreen(
                         Button(
                             onClick = { viewModel.wakeUpCodespace() },
                             modifier = Modifier.fillMaxWidth(),
-                            enabled = activeAccount?.let(viewModel::wakeControlConfigured) == true
+                            enabled = savedSettingsUsable && activeAccount?.let(viewModel::wakeControlConfigured) == true
                         ) {
                             Text("Wake Up Codespace")
                         }
@@ -382,13 +402,13 @@ fun HomeScreen(
                     ) {
                         IconButton(
                             onClick = { showDeleteUnavailableConfirm = true },
-                            enabled = unavailableProfiles.isNotEmpty() && !isVpnRunning && !isRouteOptimizing
+                            enabled = savedSettingsUsable && unavailableProfiles.isNotEmpty() && !isVpnRunning && !isRouteOptimizing
                         ) {
                             Icon(Icons.Default.Delete, contentDescription = "Delete failed configs")
                         }
                         TextButton(
                             onClick = viewModel::optimizeRoutes,
-                            enabled = codespaceProfiles.isNotEmpty() && !isVpnRunning &&
+                            enabled = savedSettingsUsable && codespaceProfiles.isNotEmpty() && !isVpnRunning &&
                                 !isRouteOptimizing && !isAnyDelayTesting
                         ) {
                             Icon(Icons.Default.AutoFixHigh, contentDescription = null)
@@ -397,7 +417,7 @@ fun HomeScreen(
                         }
                         TextButton(
                             onClick = { viewModel.refreshActiveCodespaceDelays() },
-                            enabled = codespaceProfiles.isNotEmpty() &&
+                            enabled = savedSettingsUsable && codespaceProfiles.isNotEmpty() &&
                                 !isRouteOptimizing && !isAnyDelayTesting
                         ) {
                             Icon(Icons.Default.NetworkCheck, contentDescription = null)
@@ -418,7 +438,7 @@ fun HomeScreen(
                         Switch(
                             checked = autoRouteOptimizationEnabled,
                             onCheckedChange = viewModel::setAutoRouteOptimizationEnabled,
-                            enabled = !isVpnRunning && !isRouteOptimizing && !isAnyDelayTesting
+                            enabled = savedSettingsUsable && !isVpnRunning && !isRouteOptimizing && !isAnyDelayTesting
                         )
                     }
                 }
@@ -477,7 +497,7 @@ fun HomeScreen(
                                 Row {
                                     IconButton(
                                         onClick = { viewModel.measureProfileDelay(profile.id) },
-                                        enabled = !isVpnRunning && !isRouteOptimizing && !isAnyDelayTesting
+                                        enabled = savedSettingsUsable && !isVpnRunning && !isRouteOptimizing && !isAnyDelayTesting
                                     ) {
                                         Icon(Icons.Default.NetworkCheck, contentDescription = "Run accurate three-sample delay test")
                                     }
@@ -493,7 +513,7 @@ fun HomeScreen(
                                     }
                                     IconButton(
                                         onClick = { pendingDeleteProfileId = profile.id },
-                                        enabled = !isVpnRunning && !isRouteOptimizing &&
+                                        enabled = savedSettingsUsable && !isVpnRunning && !isRouteOptimizing &&
                                             !isAnyDelayTesting && state?.testing != true
                                     ) {
                                         Icon(Icons.Default.Delete, contentDescription = "Delete config")
@@ -592,7 +612,7 @@ fun HomeScreen(
                                     index = index,
                                     count = VpnEngineMode.entries.size
                                 ),
-                                enabled = !isVpnRunning
+                                enabled = savedSettingsUsable && !isVpnRunning
                             ) {
                                 Text(mode.label)
                             }
@@ -613,7 +633,7 @@ fun HomeScreen(
                         Switch(
                             checked = fastDnsEnabled,
                             onCheckedChange = viewModel::setFastDnsEnabled,
-                            enabled = !isVpnRunning
+                            enabled = savedSettingsUsable && !isVpnRunning
                         )
                     }
                     Row(
@@ -630,7 +650,7 @@ fun HomeScreen(
                         Switch(
                             checked = ipv4OnlyEnabled,
                             onCheckedChange = viewModel::setIpv4OnlyEnabled,
-                            enabled = !isVpnRunning
+                            enabled = savedSettingsUsable && !isVpnRunning
                         )
                     }
                     Row(
@@ -647,7 +667,7 @@ fun HomeScreen(
                         Switch(
                             checked = dpiCompatibilityEnabled,
                             onCheckedChange = viewModel::setDpiCompatibilityEnabled,
-                            enabled = !isVpnRunning
+                            enabled = savedSettingsUsable && !isVpnRunning
                         )
                     }
                     Row(
@@ -664,7 +684,7 @@ fun HomeScreen(
                         Switch(
                             checked = seamlessFailoverEnabled,
                             onCheckedChange = viewModel::setSeamlessFailoverEnabled,
-                            enabled = !isVpnRunning
+                            enabled = savedSettingsUsable && !isVpnRunning
                         )
                     }
                     if (vpnUiState.tunnelState == TunnelState.Connected && vpnUiState.tunnelVerified) {
@@ -718,7 +738,7 @@ fun HomeScreen(
                         Button(
                             onClick = { startVpnWithPermissions() },
                             modifier = Modifier.fillMaxWidth(),
-                            enabled = activeProfile != null && isVpnCoreAvailable
+                            enabled = savedSettingsUsable && activeProfile != null && isVpnCoreAvailable
                         ) {
                             Text("Start VPN")
                         }

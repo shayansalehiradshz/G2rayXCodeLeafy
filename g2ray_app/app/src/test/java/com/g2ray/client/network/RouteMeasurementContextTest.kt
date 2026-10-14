@@ -11,6 +11,7 @@ import com.g2ray.client.vpn.SocketProtector
 import com.g2ray.client.G2RayApplication
 import com.g2ray.client.data.AccountRepository
 import com.g2ray.client.data.AccountRepositoryTest.InMemorySecureStore
+import com.g2ray.client.data.SecureKeyValueStore
 import com.g2ray.client.parser.VlessUriParser
 import com.g2ray.client.ui.G2RayViewModel
 import com.g2ray.client.vpn.XrayBridge
@@ -223,6 +224,42 @@ class RouteMeasurementContextTest {
     @Test
     fun pingAllDiscardsMidScanHandoffResultsWithoutChangingSavedProfilesOrSelection() = runBlocking {
         exercisePingAll(changeNetwork = true)
+    }
+
+    @Test
+    fun unreadableScanHistoryPausesAutomaticScanningWithoutBlockingSavedSettings() {
+        defaultNetwork = physical(100)
+        val repository = AccountRepository(InMemorySecureStore())
+        repository.addAccount("Fixture", "", "fixture-space")
+        G2RayApplication::class.java.getDeclaredField("accountRepository\$delegate")
+            .apply { isAccessible = true }.set(application, lazyOf(repository))
+        val backing = InMemorySecureStore()
+        val preferencesStore = object : SecureKeyValueStore by backing {
+            override fun getString(key: String, defaultValue: String?): String? {
+                if (key.startsWith("vpn_route_optimization_attempt_")) {
+                    throw java.io.IOException("Fixture scan-history read failure")
+                }
+                return backing.getString(key, defaultValue)
+            }
+        }
+        val store = ViewModelStore()
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        try {
+            val viewModel = G2RayViewModel(application, { error("Unexpected route probe") }, VpnEnginePreferences(preferencesStore))
+            store.put("fixture", viewModel)
+            assertNotNull((application as G2RayApplication).routeMeasurementContext.currentKey())
+
+            viewModel.autoOptimizeRoutesIfNeeded()
+
+            assertTrue(viewModel.statusMessage.value.contains("scan history"))
+            assertTrue(viewModel.savedDataReady.value)
+            assertNull(viewModel.repositoryLoadError.value)
+            assertFalse(viewModel.isRouteOptimizing.value)
+            assertEquals(0, backing.atomicWriteCount)
+        } finally {
+            store.clear()
+            Dispatchers.resetMain()
+        }
     }
 
     private suspend fun exercisePingAll(changeNetwork: Boolean) {

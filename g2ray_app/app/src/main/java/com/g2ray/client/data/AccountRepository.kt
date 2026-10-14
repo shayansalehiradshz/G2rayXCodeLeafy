@@ -69,51 +69,93 @@ class AccountRepository(private val store: SecureKeyValueStore) {
     private val _loadError = MutableStateFlow<String?>(null)
     val loadError: StateFlow<String?> = _loadError.asStateFlow()
 
+    private val _savedDataReady = MutableStateFlow(false)
+    val savedDataReady: StateFlow<Boolean> = _savedDataReady.asStateFlow()
+
+    private val _legacyProfileForRecovery = MutableStateFlow<String?>(null)
+    val legacyProfileForRecovery: StateFlow<String?> = _legacyProfileForRecovery.asStateFlow()
+
     private var writesBlockedByLoadError = false
 
     init {
+        reloadSavedData()
+    }
+
+    @Synchronized
+    fun reloadSavedData(): Boolean {
+        _savedDataReady.value = false
         loadData()
-        migrateIfNeeded()
-        migrateSharedWorkerControlPlaneIfNeeded()
+        if (!writesBlockedByLoadError) {
+            try {
+                migrateIfNeeded()
+                migrateSharedWorkerControlPlaneIfNeeded()
+            } catch (e: Exception) {
+                writesBlockedByLoadError = true
+                _loadError.value = "Saved-data migration could not finish. Existing settings were preserved: ${e.javaClass.simpleName}"
+            }
+        }
+        if (!writesBlockedByLoadError && _loadError.value == null &&
+            _legacyProfileForRecovery.value != null && _profiles.value.isEmpty()
+        ) {
+            _loadError.value = "A legacy config could not be imported. The original text was preserved."
+        }
+        _savedDataReady.value = !writesBlockedByLoadError
+        return _savedDataReady.value
     }
 
     private fun loadData() {
         try {
             val accountsJson = store.getString("accounts_json", null)
-            _accounts.value = if (!accountsJson.isNullOrEmpty()) {
+            val loadedAccounts = if (!accountsJson.isNullOrEmpty()) {
                 listAccountAdapter.fromJson(accountsJson) ?: emptyList()
             } else {
                 emptyList()
             }
 
             val apiKeysJson = store.getString("api_keys_json", null)
-            _apiKeys.value = if (!apiKeysJson.isNullOrEmpty()) {
+            val loadedApiKeys = if (!apiKeysJson.isNullOrEmpty()) {
                 listApiKeyAdapter.fromJson(apiKeysJson) ?: emptyList()
             } else {
                 emptyList()
             }
 
             val profilesJson = store.getString("profiles_json", null)
-            _profiles.value = if (!profilesJson.isNullOrEmpty()) {
+            val loadedProfiles = if (!profilesJson.isNullOrEmpty()) {
                 listProfileAdapter.fromJson(profilesJson) ?: emptyList()
             } else {
                 emptyList()
             }
 
             val selectionJson = store.getString("active_selection_json", null)
-            _activeSelection.value = if (!selectionJson.isNullOrEmpty()) {
+            val loadedSelection = if (!selectionJson.isNullOrEmpty()) {
                 selectionAdapter.fromJson(selectionJson) ?: ActiveSelection(null, null, null)
             } else {
                 ActiveSelection(null, null, null)
             }
-            _workerControlPlane.value = store.getString("worker_control_plane_json", null)
+            val loadedControlPlane = store.getString("worker_control_plane_json", null)
                 ?.takeIf { it.isNotBlank() }
                 ?.let(controlPlaneAdapter::fromJson)
-            _loadError.value = null
+            var legacyWarning: String? = null
+            val legacyProfile = try {
+                store.getString("vpn_config", null)?.takeIf { it.isNotBlank() }
+            } catch (e: Exception) {
+                legacyWarning = "The legacy config backup could not be read: ${e.javaClass.simpleName}"
+                _legacyProfileForRecovery.value
+            }
+
+            // Publish only a fully parsed canonical snapshot. A failed reload
+            // must not replace part of the last known good in-memory state.
+            _accounts.value = loadedAccounts
+            _apiKeys.value = loadedApiKeys
+            _profiles.value = loadedProfiles
+            _activeSelection.value = loadedSelection
+            _workerControlPlane.value = loadedControlPlane
+            _legacyProfileForRecovery.value = legacyProfile
+            _loadError.value = legacyWarning
             writesBlockedByLoadError = false
         } catch (e: Exception) {
             writesBlockedByLoadError = true
-            _loadError.value = "Failed to load saved accounts. Your stored data was not overwritten: ${e.message ?: e.javaClass.simpleName}"
+            _loadError.value = "Failed to load saved accounts. Your stored data was not overwritten: ${e.javaClass.simpleName}"
         }
     }
 
@@ -154,7 +196,7 @@ class AccountRepository(private val store: SecureKeyValueStore) {
 
         try {
             saveData()
-        } catch (e: RuntimeException) {
+        } catch (e: Exception) {
             _accounts.value = previousAccounts
             _apiKeys.value = previousApiKeys
             _profiles.value = previousProfiles
@@ -221,8 +263,10 @@ class AccountRepository(private val store: SecureKeyValueStore) {
         val legacySecret = store.getString("wake_secret", "") ?: ""
         val legacyWorker = store.getString("worker_url", "") ?: ""
         val legacyVpnConfig = store.getString("vpn_config", "") ?: ""
+        val parsedLegacyProfile = legacyVpnConfig.takeIf { it.isNotBlank() }
+            ?.let { VlessUriParser.parseFirstProfile(it).getOrNull() }
 
-        if (legacyWorker.isNotEmpty() || legacySecret.isNotEmpty()) {
+        if (legacyWorker.isNotBlank() || legacySecret.isNotBlank() || parsedLegacyProfile != null) {
             val accountId = UUID.randomUUID().toString()
             val now = System.currentTimeMillis()
 
@@ -236,57 +280,58 @@ class AccountRepository(private val store: SecureKeyValueStore) {
                 updatedAt = now
             )
 
-            val newApiKey = G2RayApiKey(
-                id = UUID.randomUUID().toString(),
-                accountId = accountId,
-                label = "Default Wake Secret",
-                kind = ApiKeyKind.WORKER_WAKE_SECRET,
-                encryptedValue = legacySecret,
-                enabled = true,
-                priority = 1,
-                createdAt = now,
-                updatedAt = now,
-                lastUsedAt = null
-            )
+            val newApiKey = legacySecret.takeIf { it.isNotBlank() }?.let { secret ->
+                G2RayApiKey(
+                    id = UUID.randomUUID().toString(),
+                    accountId = accountId,
+                    label = "Default Wake Secret",
+                    kind = ApiKeyKind.WORKER_WAKE_SECRET,
+                    encryptedValue = secret,
+                    enabled = true,
+                    priority = 1,
+                    createdAt = now,
+                    updatedAt = now,
+                    lastUsedAt = null
+                )
+            }
 
-            var importedProfile: StoredG2RayProfile? = null
-            if (legacyVpnConfig.isNotEmpty()) {
-                val parsed = VlessUriParser.parseFirstProfile(legacyVpnConfig)
-                if (parsed.isSuccess) {
-                    val p = parsed.getOrThrow()
-                    importedProfile = StoredG2RayProfile(
-                        id = UUID.randomUUID().toString(),
-                        accountId = accountId,
-                        displayName = p.name.takeIf { it.isNotEmpty() } ?: "Default Profile",
-                        rawUri = p.rawUri,
-                        transport = p.transport,
-                        address = p.address,
-                        port = p.port,
-                        sni = p.sni ?: "",
-                        hostHeader = p.hostHeader ?: "",
-                        path = p.path,
-                        isDefault = true,
-                        createdAt = now,
-                        updatedAt = now
-                    )
-                }
+            val importedProfile = parsedLegacyProfile?.let { p ->
+                StoredG2RayProfile(
+                    id = UUID.randomUUID().toString(),
+                    accountId = accountId,
+                    displayName = p.name.takeIf { it.isNotEmpty() } ?: "Default Profile",
+                    rawUri = p.rawUri,
+                    transport = p.transport,
+                    address = p.address,
+                    port = p.port,
+                    sni = p.sni ?: "",
+                    hostHeader = p.hostHeader ?: "",
+                    path = p.path,
+                    isDefault = true,
+                    createdAt = now,
+                    updatedAt = now
+                )
             }
 
             commitState(
                 accounts = listOf(newAccount),
-                apiKeys = listOf(newApiKey),
-                profiles = if (importedProfile != null) listOf(importedProfile) else emptyList(),
+                apiKeys = listOfNotNull(newApiKey),
+                profiles = listOfNotNull(importedProfile),
                 selection = ActiveSelection(
                     accountId = accountId,
                     profileId = importedProfile?.id,
-                    apiKeyId = newApiKey.id
+                    apiKeyId = newApiKey?.id
                 )
             )
 
+            val keysToRemove = mutableListOf("codespace_name", "wake_secret", "worker_url")
+            if (legacyVpnConfig.isBlank() || parsedLegacyProfile != null) keysToRemove += "vpn_config"
             runCatching {
-                store.remove("codespace_name", "wake_secret", "worker_url", "vpn_config")
+                store.remove(*keysToRemove.toTypedArray())
+            }.onSuccess {
+                if ("vpn_config" in keysToRemove) _legacyProfileForRecovery.value = null
             }.onFailure { e ->
-                _loadError.value = "Migrated legacy settings, but failed to remove old keys: ${e.message ?: e.javaClass.simpleName}"
+                _loadError.value = "Migrated legacy settings, but failed to remove old keys: ${e.javaClass.simpleName}"
             }
         }
     }

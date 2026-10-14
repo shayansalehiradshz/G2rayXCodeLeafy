@@ -123,6 +123,199 @@ class AccountRepositoryTest {
     }
 
     @Test
+    fun legacyMigrationWriteFailurePreservesDataAndDoesNotCrashConstruction() {
+        val store = InMemorySecureStore()
+        store.putString("codespace_name", "legacy-space")
+        store.putString("wake_secret", "fixture-wake-key")
+        store.putString("worker_url", "https://worker.example")
+        store.shouldFail = true
+
+        val repository = AccountRepository(store)
+
+        assertNotNull(repository.loadError.value)
+        assertTrue(repository.accounts.value.isEmpty())
+        assertEquals("fixture-wake-key", store.getString("wake_secret"))
+        assertNull(store.getString("schema_version"))
+        store.shouldFail = false
+        assertThrows(IllegalStateException::class.java) {
+            repository.addAccount("Must not bypass migration", "", null)
+        }
+        assertNull(store.getString("accounts_json"))
+    }
+
+    @Test
+    fun migrationReadFailureDoesNotEscapeRepositoryConstruction() {
+        val store = InMemorySecureStore()
+        val failingRead = object : SecureKeyValueStore by store {
+            override fun getString(key: String, defaultValue: String?): String? {
+                if (key == "schema_version") throw IllegalStateException("Fixture migration read failure")
+                return store.getString(key, defaultValue)
+            }
+        }
+
+        val repository = AccountRepository(failingRead)
+
+        assertNotNull(repository.loadError.value)
+        assertEquals(0, store.atomicWriteCount)
+    }
+
+    @Test
+    fun sharedWorkerMigrationWriteFailureKeepsTheLoadedSnapshotAndStoredJson() {
+        val store = InMemorySecureStore()
+        val original = AccountRepository(store)
+        val account = original.addAccount("Legacy Worker", "https://worker.example", "fixture-space")
+        original.addApiKey(account.id, "Wake", "fixture-key", true)
+        val accountsBefore = store.getString("accounts_json")
+        val keysBefore = store.getString("api_keys_json")
+        val selectionBefore = original.activeSelection.value
+        val writesBefore = store.atomicWriteCount
+        store.shouldFail = true
+
+        val reloaded = AccountRepository(store)
+
+        assertNotNull(reloaded.loadError.value)
+        assertEquals(original.accounts.value, reloaded.accounts.value)
+        assertEquals(selectionBefore, reloaded.activeSelection.value)
+        assertNull(reloaded.workerControlPlane.value)
+        assertEquals(writesBefore, store.atomicWriteCount)
+        assertEquals(accountsBefore, store.getString("accounts_json"))
+        assertEquals(keysBefore, store.getString("api_keys_json"))
+        store.shouldFail = false
+        assertThrows(IllegalStateException::class.java) { reloaded.selectAccount(account.id) }
+    }
+
+    @Test
+    fun standaloneLegacyProfileMigratesWithoutInventingAWakeKey() {
+        val store = InMemorySecureStore()
+        val raw = "vless://00000000-0000-4000-8000-000000000001@fixture.example:443" +
+            "?encryption=none&security=tls&type=ws&sni=fixture.example&host=fixture.example&path=%2Fws#Standalone"
+        assertTrue(VlessUriParser.parseFirstProfile(raw).isSuccess)
+        store.putString("vpn_config", raw)
+
+        val repository = AccountRepository(store)
+
+        assertNull(repository.loadError.value)
+        assertEquals(raw, repository.profiles.value.single().rawUri)
+        assertEquals(repository.accounts.value.single().id, repository.profiles.value.single().accountId)
+        assertEquals(repository.profiles.value.single().id, repository.activeSelection.value.profileId)
+        assertTrue(repository.apiKeys.value.isEmpty())
+        assertNull(repository.activeSelection.value.apiKeyId)
+        assertNull(repository.workerControlPlane.value)
+        assertNull(store.getString("vpn_config"))
+        assertEquals(repository.profiles.value, AccountRepository(store).profiles.value)
+    }
+
+    @Test
+    fun unparseableLegacyConfigIsPreservedDuringWakeAccountMigration() {
+        val store = InMemorySecureStore()
+        val originalConfig = "vless://invalid-legacy-profile#Original"
+        assertTrue(VlessUriParser.parseFirstProfile(originalConfig).isFailure)
+        store.putString("vpn_config", originalConfig)
+        store.putString("worker_url", "https://worker.example")
+        store.putString("wake_secret", "fixture-wake-key")
+
+        val repository = AccountRepository(store)
+
+        assertEquals(originalConfig, store.getString("vpn_config"))
+        assertEquals(1, repository.accounts.value.size)
+        assertEquals(1, repository.apiKeys.value.size)
+        assertTrue(repository.profiles.value.isEmpty())
+        assertNotNull(repository.loadError.value)
+    }
+
+    @Test
+    fun reloadRetriesMigrationWithoutDuplicatingRecordsOrChangingOtherSettings() {
+        val store = InMemorySecureStore()
+        store.putString("worker_url", "https://worker.example")
+        store.putString("wake_secret", "fixture-key")
+        store.putString("vpn_engine_mode", "xray_native")
+        store.shouldFail = true
+        val repository = AccountRepository(store)
+        assertFalse(repository.savedDataReady.value)
+
+        store.shouldFail = false
+        assertTrue(repository.reloadSavedData())
+        assertTrue(repository.savedDataReady.value)
+        assertNull(repository.loadError.value)
+        val accounts = repository.accounts.value
+        val keys = repository.apiKeys.value
+        val selection = repository.activeSelection.value
+        val writes = store.atomicWriteCount
+        assertEquals(1, accounts.size)
+        assertEquals(1, keys.size)
+        assertEquals("fixture-key", repository.workerControlPlane.value?.encryptedWakeSecret)
+        assertEquals("xray_native", store.getString("vpn_engine_mode"))
+
+        assertTrue(repository.reloadSavedData())
+        assertEquals(accounts, repository.accounts.value)
+        assertEquals(keys, repository.apiKeys.value)
+        assertEquals(selection, repository.activeSelection.value)
+        assertEquals(writes, store.atomicWriteCount)
+    }
+
+    @Test
+    fun failedReloadDoesNotPublishAPartiallyParsedSnapshot() {
+        val store = InMemorySecureStore()
+        val repository = AccountRepository(store)
+        val account = repository.addAccount("Original", "", "fixture-space")
+        val parsed = VlessUriParser.parseFirstProfile(
+            "vless://00000000-0000-4000-8000-000000000001@fixture.example:443" +
+                "?encryption=none&security=tls&type=ws&sni=fixture.example&host=fixture.example&path=%2Fws"
+        ).getOrThrow()
+        repository.importProfile(account.id, parsed.name, parsed.rawUri, parsed)
+        val originalAccounts = repository.accounts.value
+        val originalProfiles = repository.profiles.value
+        val originalSelection = repository.activeSelection.value
+        val validProfiles = store.getString("profiles_json")
+        val editedAccounts = org.json.JSONArray(store.getString("accounts_json"))
+        editedAccounts.getJSONObject(0).put("displayName", "Updated")
+        store.putString("accounts_json", editedAccounts.toString())
+        store.putString("profiles_json", "{PRIVATE-FIXTURE-MARKER")
+
+        assertFalse(repository.reloadSavedData())
+        assertFalse(repository.savedDataReady.value)
+        assertEquals(originalAccounts, repository.accounts.value)
+        assertEquals(originalProfiles, repository.profiles.value)
+        assertEquals(originalSelection, repository.activeSelection.value)
+        assertFalse(repository.loadError.value.orEmpty().contains("PRIVATE-FIXTURE-MARKER"))
+        assertEquals("{PRIVATE-FIXTURE-MARKER", store.getString("profiles_json"))
+        assertThrows(IllegalStateException::class.java) { repository.deleteProfile(originalProfiles.single().id) }
+
+        store.putString("profiles_json", validProfiles)
+        assertTrue(repository.reloadSavedData())
+        assertEquals("Updated", repository.accounts.value.single().displayName)
+        assertEquals(originalProfiles, repository.profiles.value)
+        assertNull(repository.loadError.value)
+    }
+
+    @Test
+    fun unsupportedStandaloneLegacyTextCanBeCopiedAndDoesNotBlockAManualImport() {
+        val store = InMemorySecureStore()
+        val original = "vless://unsupported-original#Backup"
+        store.putString("vpn_config", original)
+        val repository = AccountRepository(store)
+
+        assertTrue(repository.savedDataReady.value)
+        assertEquals(original, repository.legacyProfileForRecovery.value)
+        assertNotNull(repository.loadError.value)
+        assertTrue(repository.accounts.value.isEmpty())
+        assertTrue(repository.apiKeys.value.isEmpty())
+        assertEquals(0, store.atomicWriteCount)
+        val account = repository.addAccount("Manual import", "", null)
+        val profile = VlessUriParser.parseFirstProfile(
+            "vless://00000000-0000-4000-8000-000000000001@fixture.example:443" +
+                "?encryption=none&security=tls&type=ws&sni=fixture.example&host=fixture.example&path=%2Fws"
+        ).getOrThrow()
+        repository.importProfile(account.id, profile.name, profile.rawUri, profile)
+
+        assertTrue(repository.reloadSavedData())
+        assertNull(repository.loadError.value)
+        assertEquals(original, repository.legacyProfileForRecovery.value)
+        assertEquals(original, store.getString("vpn_config"))
+        assertEquals(profile.rawUri, repository.profiles.value.single().rawUri)
+    }
+
+    @Test
     fun testMigrationRemoveFailureDoesNotDuplicateMigratedAccount() {
         val store = InMemorySecureStore()
         store.putString("wake_secret", "secret-123")
@@ -885,6 +1078,31 @@ class AccountRepositoryTest {
 
         assertEquals(listOf(existing), repo.accounts.value)
         assertEquals(existing.id, repo.activeSelection.value.accountId)
+    }
+
+    @Test
+    fun checkedStorageFailureAlsoRollsBackThePublishedSnapshot() {
+        val backing = InMemorySecureStore()
+        var failWrites = false
+        val store = object : SecureKeyValueStore by backing {
+            override fun putStrings(values: Map<String, String?>) {
+                if (failWrites) throw java.io.IOException("Fixture pending-rollback write failure")
+                backing.putStrings(values)
+            }
+        }
+        val repository = AccountRepository(store)
+        val existing = repository.addAccount("Stable", "", null)
+        val originalAccounts = backing.getString("accounts_json")
+        val originalSelection = repository.activeSelection.value
+        failWrites = true
+
+        assertThrows(java.io.IOException::class.java) {
+            repository.addAccount("Must not appear saved", "", null)
+        }
+
+        assertEquals(listOf(existing), repository.accounts.value)
+        assertEquals(originalSelection, repository.activeSelection.value)
+        assertEquals(originalAccounts, backing.getString("accounts_json"))
     }
 
     @Test

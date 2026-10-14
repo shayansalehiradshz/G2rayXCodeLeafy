@@ -5,11 +5,29 @@ import com.g2ray.client.data.EncryptedPrefsStore
 import com.g2ray.client.data.SecureKeyValueStore
 import com.g2ray.client.model.VpnEngineMode
 
+internal data class VpnSettingsSnapshot(
+    val mode: VpnEngineMode = VpnEngineMode.Auto,
+    val fastDnsEnabled: Boolean = false,
+    val ipv4OnlyEnabled: Boolean = false,
+    val dpiCompatibilityEnabled: Boolean = false,
+    val autoRouteOptimizationEnabled: Boolean = true,
+    val seamlessFailoverEnabled: Boolean = true
+)
+
 /** Persists the user's engine preference independently of a VPN service restart. */
 class VpnEnginePreferences internal constructor(
     private val store: SecureKeyValueStore
 ) {
     constructor(context: Context) : this(EncryptedPrefsStore(context.applicationContext))
+
+    internal fun readSettings(): VpnSettingsSnapshot = VpnSettingsSnapshot(
+        mode = getMode(),
+        fastDnsEnabled = isFastDnsEnabled(),
+        ipv4OnlyEnabled = isIpv4OnlyEnabled(),
+        dpiCompatibilityEnabled = isDpiCompatibilityEnabled(),
+        autoRouteOptimizationEnabled = isAutoRouteOptimizationEnabled(),
+        seamlessFailoverEnabled = isSeamlessFailoverEnabled()
+    )
 
     fun getMode(): VpnEngineMode = VpnEngineMode.fromStorage(store.getString(PREF_VPN_ENGINE_MODE, null))
 

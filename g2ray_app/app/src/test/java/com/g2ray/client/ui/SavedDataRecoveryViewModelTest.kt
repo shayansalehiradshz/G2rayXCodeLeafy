@@ -1,0 +1,286 @@
+package com.g2ray.client.ui
+
+import android.content.ComponentName
+import android.content.Context
+import android.content.ContextWrapper
+import android.content.Intent
+import androidx.lifecycle.ViewModelStore
+import com.g2ray.client.G2RayApplication
+import com.g2ray.client.data.AccountRepository
+import com.g2ray.client.data.AccountRepositoryTest.InMemorySecureStore
+import com.g2ray.client.data.SecureKeyValueStore
+import com.g2ray.client.data.EncryptedPrefsStore
+import com.g2ray.client.model.AppConnectionState
+import com.g2ray.client.model.RouteState
+import com.g2ray.client.model.TunnelState
+import com.g2ray.client.model.VpnStateRepository
+import com.g2ray.client.model.VpnEngineMode
+import com.g2ray.client.parser.VlessUriParser
+import com.g2ray.client.vpn.G2RayVpnService
+import com.g2ray.client.vpn.VpnEnginePreferences
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.setMain
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Assert.assertFalse
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
+import org.robolectric.annotation.Config
+import java.io.IOException
+import java.security.GeneralSecurityException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+
+@OptIn(ExperimentalCoroutinesApi::class)
+@RunWith(RobolectricTestRunner::class)
+@Config(application = G2RayApplication::class, sdk = [31])
+class SavedDataRecoveryViewModelTest {
+    @Test
+    fun unreadableVpnPreferencesDoNotCrashTheViewModelOrWriteDefaults() {
+        val application = RuntimeEnvironment.getApplication() as G2RayApplication
+        val repository = AccountRepository(InMemorySecureStore())
+        G2RayApplication::class.java.getDeclaredField("accountRepository\$delegate")
+            .apply { isAccessible = true }.set(application, lazyOf(repository))
+        val store = InMemorySecureStore()
+        store.putString("vpn_engine_mode", "xray_native")
+        store.putString("vpn_fast_dns_enabled", "true")
+        val failingStore = object : SecureKeyValueStore by store {
+            override fun getString(key: String, defaultValue: String?): String? {
+                throw IOException("Fixture preference read failure")
+            }
+        }
+        val viewModelStore = ViewModelStore()
+        val originalConnection = VpnStateRepository.state.value
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        VpnStateRepository.state.value = AppConnectionState(RouteState.Unknown, TunnelState.Disconnected, "Fixture")
+        try {
+            val viewModel = G2RayViewModel(application, { error("No native probe is expected") }, VpnEnginePreferences(failingStore))
+            viewModelStore.put("fixture", viewModel)
+
+            assertNotNull(viewModel.repositoryLoadError.value)
+            assertEquals("xray_native", store.getString("vpn_engine_mode"))
+            assertEquals("true", store.getString("vpn_fast_dns_enabled"))
+            assertEquals(0, store.atomicWriteCount)
+        } finally {
+            viewModelStore.clear()
+            Dispatchers.resetMain()
+            VpnStateRepository.state.value = originalConnection
+        }
+    }
+
+    @Test
+    fun unreadableSettingsBlockStartupProbesWakeAndPreferenceWrites() {
+        val store = InMemorySecureStore()
+        store.putString("vpn_engine_mode", "xray_native")
+        val failing = unreadableStore(store, AtomicBoolean(true))
+        withViewModel(AccountRepository(InMemorySecureStore()), failing) { viewModel, application ->
+            assertFalse(viewModel.savedDataReady.value)
+            viewModel.startVpn(application)
+            viewModel.refreshActiveCodespaceDelays()
+            viewModel.measureProfileDelay("unused")
+            viewModel.optimizeRoutes()
+            viewModel.wakeUpCodespace()
+            viewModel.setVpnEngineMode(VpnEngineMode.Hev)
+
+            assertTrue(viewModel.statusMessage.value.contains("settings", ignoreCase = true))
+            assertEquals("xray_native", store.getString("vpn_engine_mode"))
+            assertEquals(0, store.atomicWriteCount)
+            assertTrue(viewModel.profileDelayStates.value.isEmpty())
+        }
+    }
+
+    @Test
+    fun reloadRecoversAllPreferencesAndKeepsSavedProfileIds() {
+        val preferencesStore = InMemorySecureStore()
+        val preferences = VpnEnginePreferences(preferencesStore)
+        preferences.setMode(VpnEngineMode.XrayNative)
+        preferences.setFastDnsEnabled(true)
+        preferences.setIpv4OnlyEnabled(true)
+        preferences.setDpiCompatibilityEnabled(true)
+        preferences.setAutoRouteOptimizationEnabled(false)
+        preferences.setSeamlessFailoverEnabled(false)
+        val failReads = AtomicBoolean(true)
+        val repository = repositoryWithProfile()
+        val selection = repository.activeSelection.value
+        val profiles = repository.profiles.value
+        withViewModel(repository, unreadableStore(preferencesStore, failReads)) { viewModel, _ ->
+            assertFalse(viewModel.savedDataReady.value)
+            failReads.set(false)
+            viewModel.reloadSavedData()
+            awaitReload(viewModel)
+
+            assertTrue(viewModel.savedDataReady.value)
+            assertNull(viewModel.repositoryLoadError.value)
+            assertEquals(VpnEngineMode.XrayNative, viewModel.vpnEngineMode.value)
+            assertTrue(viewModel.fastDnsEnabled.value)
+            assertTrue(viewModel.ipv4OnlyEnabled.value)
+            assertTrue(viewModel.dpiCompatibilityEnabled.value)
+            assertFalse(viewModel.autoRouteOptimizationEnabled.value)
+            assertFalse(viewModel.seamlessFailoverEnabled.value)
+            assertEquals(selection, repository.activeSelection.value)
+            assertEquals(profiles, repository.profiles.value)
+            assertEquals(0, preferencesStore.atomicWriteCount)
+        }
+    }
+
+    @Test
+    fun settingsFailureDoesNotInvalidateAVerifiedTunnelAndStopStillDispatches() {
+        withViewModel(repositoryWithProfile(), unreadableStore(InMemorySecureStore(), AtomicBoolean(true))) { viewModel, application ->
+            val connected = AppConnectionState(
+                RouteState.Ready, TunnelState.Connected, "Fixture connected",
+                routeReady = true, tunnelVerified = true
+            )
+            VpnStateRepository.state.value = connected
+            viewModel.startVpn(application)
+            viewModel.refreshActiveCodespaceDelays()
+            viewModel.reloadSavedData()
+            assertEquals(connected, VpnStateRepository.state.value)
+            assertFalse(viewModel.isReloadingSavedData.value)
+
+            val context = object : ContextWrapper(application) {
+                var stopAction: String? = null
+                override fun startService(service: Intent): ComponentName? {
+                    stopAction = service.action
+                    return ComponentName(application, G2RayVpnService::class.java)
+                }
+            }
+            viewModel.stopVpn(context)
+            assertEquals(G2RayVpnService.ACTION_STOP, context.stopAction)
+        }
+    }
+
+    @Test
+    fun repeatedReloadWhileBusyDoesNotCreateASpuriousPreferenceFailure() {
+        val backing = InMemorySecureStore()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val blockReads = AtomicBoolean(false)
+        val store = object : SecureKeyValueStore by backing {
+            override fun getString(key: String, defaultValue: String?): String? {
+                if (blockReads.get() && key == "vpn_engine_mode") {
+                    entered.countDown()
+                    check(release.await(10, TimeUnit.SECONDS)) { "Fixture reload did not release" }
+                }
+                return backing.getString(key, defaultValue)
+            }
+        }
+        withViewModel(repositoryWithProfile(), store) { viewModel, _ ->
+            blockReads.set(true)
+            try {
+                viewModel.reloadSavedData()
+                assertTrue(entered.await(5, TimeUnit.SECONDS))
+                viewModel.reloadSavedData()
+                assertTrue(viewModel.isReloadingSavedData.value)
+                assertNull(viewModel.repositoryLoadError.value)
+            } finally {
+                release.countDown()
+            }
+            awaitReload(viewModel)
+            assertTrue(viewModel.savedDataReady.value)
+            assertNull(viewModel.repositoryLoadError.value)
+        }
+    }
+
+    @Test
+    fun defaultApplicationAndViewModelRecoverADeferredProviderFailureWithOneStore() {
+        val application = RuntimeEnvironment.getApplication() as G2RayApplication
+        val backing = application.getSharedPreferences("default-provider-fixture", Context.MODE_PRIVATE)
+        assertTrue(backing.edit().putString("vpn_engine_mode", "xray_native").commit())
+        val failOpen = AtomicBoolean(true)
+        var opens = 0
+        val encryptedStore = EncryptedPrefsStore {
+            opens += 1
+            if (failOpen.get()) throw GeneralSecurityException("Fixture provider unavailable")
+            backing
+        }
+        G2RayApplication::class.java.getDeclaredField("secureStore\$delegate")
+            .apply { isAccessible = true }.set(application, lazyOf(encryptedStore))
+        val originalConnection = VpnStateRepository.state.value
+        VpnStateRepository.state.value = AppConnectionState(RouteState.Unknown, TunnelState.Disconnected, "Fixture")
+        val viewModelStore = ViewModelStore()
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        try {
+            val viewModel = G2RayViewModel(application)
+            viewModelStore.put("fixture", viewModel)
+            assertFalse(viewModel.savedDataReady.value)
+            assertNotNull(viewModel.repositoryLoadError.value)
+            assertEquals(2, opens)
+            failOpen.set(false)
+            viewModel.reloadSavedData()
+            awaitReload(viewModel)
+            assertTrue(viewModel.savedDataReady.value)
+            assertNull(viewModel.repositoryLoadError.value)
+            assertEquals(VpnEngineMode.XrayNative, viewModel.vpnEngineMode.value)
+            assertEquals(3, opens)
+            viewModel.reloadSavedData()
+            awaitReload(viewModel)
+            assertEquals(3, opens)
+        } finally {
+            viewModelStore.clear()
+            Dispatchers.resetMain()
+            VpnStateRepository.state.value = originalConnection
+        }
+    }
+
+    private fun repositoryWithProfile(): AccountRepository {
+        val repository = AccountRepository(InMemorySecureStore())
+        val account = repository.addAccount("Fixture", "", "fixture-space")
+        val profile = VlessUriParser.parseFirstProfile(
+            "vless://00000000-0000-4000-8000-000000000001@fixture.example:443" +
+                "?encryption=none&security=tls&type=ws&sni=fixture.example&host=fixture.example&path=%2Fws"
+        ).getOrThrow()
+        repository.importProfile(account.id, profile.name, profile.rawUri, profile)
+        return repository
+    }
+
+    private fun unreadableStore(backing: SecureKeyValueStore, failReads: AtomicBoolean): SecureKeyValueStore =
+        object : SecureKeyValueStore by backing {
+            override fun getString(key: String, defaultValue: String?): String? {
+                if (failReads.get()) throw IOException("Fixture preference read failure")
+                return backing.getString(key, defaultValue)
+            }
+        }
+
+    private fun awaitReload(viewModel: G2RayViewModel) = runBlocking {
+        withTimeout(10_000L) {
+            combine(viewModel.isReloadingSavedData, viewModel.savedDataReady, viewModel.repositoryLoadError) { busy, ready, error ->
+                !busy && ready && error == null
+            }.first { it }
+        }
+    }
+
+    private fun withViewModel(
+        repository: AccountRepository,
+        preferenceStore: SecureKeyValueStore,
+        body: (G2RayViewModel, G2RayApplication) -> Unit
+    ) {
+        val application = RuntimeEnvironment.getApplication() as G2RayApplication
+        G2RayApplication::class.java.getDeclaredField("accountRepository\$delegate")
+            .apply { isAccessible = true }.set(application, lazyOf(repository))
+        val originalConnection = VpnStateRepository.state.value
+        VpnStateRepository.state.value = AppConnectionState(RouteState.Unknown, TunnelState.Disconnected, "Fixture")
+        val viewModelStore = ViewModelStore()
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        try {
+            val viewModel = G2RayViewModel(application, { error("Unexpected native route probe") }, VpnEnginePreferences(preferenceStore))
+            viewModelStore.put("fixture", viewModel)
+            body(viewModel, application)
+        } finally {
+            viewModelStore.clear()
+            Dispatchers.resetMain()
+            VpnStateRepository.state.value = originalConnection
+        }
+    }
+}
