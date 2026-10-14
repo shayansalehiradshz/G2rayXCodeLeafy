@@ -11,10 +11,14 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
 import org.json.JSONObject
 
 data class DiscoveredRouteCandidate(
@@ -110,7 +114,7 @@ class RouteCandidateDiscovery(
         endpoint: String,
         hostname: String,
         ednsClientSubnet: String? = null
-    ): List<String> = withContext(Dispatchers.IO) {
+    ): List<String> {
         val url = endpoint.toHttpUrl().newBuilder()
             .addQueryParameter("name", hostname)
             .addQueryParameter("type", "A")
@@ -123,18 +127,45 @@ class RouteCandidateDiscovery(
             .header("Accept", "application/dns-json")
             .get()
             .build()
-        httpClient.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) {
-                throw IOException("DoH returned HTTP ${response.code}")
+        // Include dispatcher queue time in the deadline and cancel obsolete
+        // network requests when the caller starts VPN or changes networks.
+        return withTimeoutOrNull(DOH_QUERY_TIMEOUT_MS) {
+            suspendCancellableCoroutine { continuation ->
+                val call = httpClient.newCall(request)
+                continuation.invokeOnCancellation { call.cancel() }
+                call.enqueue(object : Callback {
+                    override fun onFailure(call: Call, e: IOException) {
+                        continuation.resumeWith(Result.failure(e.cause as? CancellationException ?: e))
+                    }
+
+                    override fun onResponse(call: Call, response: Response) {
+                        val result = try {
+                            Result.success(response.use { extractResponse(it) })
+                        } catch (error: Exception) {
+                            Result.failure(error)
+                        }
+                        continuation.resumeWith(result)
+                    }
+                })
             }
-            val body = response.body?.string() ?: throw IOException("DoH returned an empty response")
-            extractIpv4Answers(body)
-        }
+        } ?: emptyList()
+    }
+
+    private fun extractResponse(response: Response): List<String> {
+        if (!response.isSuccessful) throw IOException("DoH returned HTTP ${response.code}")
+        val body = response.body ?: throw IOException("DoH returned an empty response")
+        if (body.contentLength() > MAX_DOH_RESPONSE_BYTES) throw IOException("DoH response is too large")
+        val source = body.source()
+        source.request(MAX_DOH_RESPONSE_BYTES + 1)
+        if (source.buffer.size > MAX_DOH_RESPONSE_BYTES) throw IOException("DoH response is too large")
+        return extractIpv4Answers(source.readUtf8())
     }
 
     companion object {
         private const val MAX_HOSTNAMES = 4
         const val MAX_CANDIDATES = 24
+        private const val DOH_QUERY_TIMEOUT_MS = 5_000L
+        private const val MAX_DOH_RESPONSE_BYTES = 65_536L
         private const val CLOUDFLARE_DOH = "https://cloudflare-dns.com/dns-query"
         private const val GOOGLE_DOH = "https://dns.google/resolve"
         private const val SOURCE_EXISTING = "saved"
