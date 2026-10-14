@@ -53,7 +53,7 @@ class RouteCandidateDiscovery(
             listOf(
                 async(Dispatchers.IO) {
                     queryOrEmpty {
-                        systemLookup(hostname)
+                        interruptibleDnsLookup { systemLookup(hostname) }
                             .filterIsInstance<Inet4Address>()
                             .mapNotNull(InetAddress::getHostAddress)
                             .map { it to SOURCE_SYSTEM }

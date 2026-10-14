@@ -3,6 +3,7 @@ package com.g2ray.client.vpn
 import android.net.Network
 import android.os.ParcelFileDescriptor
 import com.g2ray.client.network.ControlPlaneConnectionPools
+import com.g2ray.client.network.NetworkDnsResolver
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.Socket
@@ -25,6 +26,7 @@ object SocketProtector {
     fun underlyingNetworkGeneration(): Long = networkGeneration.get()
 
     private val lastDialerFailure = AtomicReference<String?>(null)
+    private val dnsResolver = NetworkDnsResolver()
 
     @JvmStatic
     fun protect(fd: Int): Boolean {
@@ -106,15 +108,11 @@ object SocketProtector {
      */
     fun lookupControlPlane(hostname: String): List<InetAddress> {
         val network = underlyingNetwork
-        val addresses = when {
-            network != null -> network.getAllByName(hostname).toList()
-            vpnService == null -> InetAddress.getAllByName(hostname).toList()
-            else -> throw UnknownHostException("No non-VPN network is available for $hostname")
+        if (network == null && vpnService != null) {
+            throw UnknownHostException("No non-VPN network is available for $hostname")
         }
-        if (addresses.isEmpty()) {
-            throw UnknownHostException("No addresses found for $hostname")
-        }
-        return addresses
+        if (isNumericAddress(hostname)) return listOf(InetAddress.getByName(hostname))
+        return dnsResolver.lookup(network, hostname)
     }
 
     /**

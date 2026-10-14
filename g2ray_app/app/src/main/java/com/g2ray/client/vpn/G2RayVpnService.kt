@@ -51,11 +51,14 @@ import com.g2ray.client.network.WakeRetryCooldown
 import com.g2ray.client.network.WorkerNetwork
 import com.g2ray.client.network.WorkerRouteCoordinator
 import com.g2ray.client.network.awaitWakeRetryDelay
+import com.g2ray.client.network.interruptibleDnsLookup
 import com.g2ray.client.parser.VlessUriParser
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -1724,10 +1727,13 @@ class G2RayVpnService : VpnService() {
         hevTunnelRunning = false
         val resolutionStartedAt = SystemClock.elapsedRealtime()
         val resolutionNetworkGeneration = underlyingNetworkGeneration.get()
-        val runtimeProfiles = resolveRuntimeProfiles(
-            liveRouteProfilesFor(profile),
-            maxProfiles = if (seamlessFailoverEnabled) MAX_LIVE_ROUTE_PROFILES else 1
-        ) { address -> SocketProtector.resolveTunnelEndpoints(address, MAX_LIVE_ROUTE_PROFILES) }
+        val runtimeProfiles = interruptibleDnsLookup {
+            resolveRuntimeProfiles(
+                liveRouteProfilesFor(profile),
+                maxProfiles = if (seamlessFailoverEnabled) MAX_LIVE_ROUTE_PROFILES else 1
+            ) { address -> SocketProtector.resolveTunnelEndpoints(address, MAX_LIVE_ROUTE_PROFILES) }
+        }
+        currentCoroutineContext().ensureActive()
         logStartupPhase("endpoint_resolution", engine, resolutionStartedAt, true)
         if (!isTunnelCurrent(lifecycleToken, tun)) {
             return RunningRouteResult(false, "VPN lifecycle changed during endpoint resolution")

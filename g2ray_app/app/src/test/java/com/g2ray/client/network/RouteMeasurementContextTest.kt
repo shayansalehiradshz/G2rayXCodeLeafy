@@ -291,10 +291,17 @@ class RouteMeasurementContextTest {
             withTimeout(10_000L) { viewModel.measurementNetworkKey.first { it != null } }
             withTimeout(10_000L) { viewModel.activeCodespaceProfiles.first { it.size == 2 } }
             viewModel.refreshActiveCodespaceDelays()
-            val states = withTimeout(10_000L) {
-                viewModel.profileDelayStates.first { results ->
-                    before.all { results[it.id]?.testing == false }
+            val states = try {
+                withTimeout(10_000L) {
+                    viewModel.profileDelayStates.first { results ->
+                        before.all { results[it.id]?.testing == false }
+                    }
                 }
+            } catch (error: kotlinx.coroutines.TimeoutCancellationException) {
+                throw AssertionError("Ping completion timed out: status=${viewModel.statusMessage.value}; " +
+                    "optimizing=${viewModel.isRouteOptimizing.value}; batchCalls=${bridge.batchCalls}; " +
+                    "vpn=${com.g2ray.client.model.VpnStateRepository.state.value.tunnelState}; " +
+                    "states=${viewModel.profileDelayStates.value}", error)
             }
             assertEquals(1, bridge.batchCalls)
             assertEquals(selection, repository.activeSelection.value)

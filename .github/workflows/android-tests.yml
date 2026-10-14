@@ -65,3 +65,13 @@ jobs:
           --no-daemon --console=plain
       - name: Test release-schema mapping verifier
         run: bash ./gradlew -p buildSrc test --no-daemon --console=plain
+      - name: Preserve Android test and lint evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-source-test-evidence
+          path: |
+            g2ray_app/app/build/test-results/testDebugUnitTest/*.xml
+            g2ray_app/app/build/reports/lint-results-debug.xml
+          if-no-files-found: warn
+          retention-days: 14

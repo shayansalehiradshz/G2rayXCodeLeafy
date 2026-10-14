@@ -1,5 +1,6 @@
 import java.security.MessageDigest
 import java.util.Properties
+import org.gradle.api.tasks.testing.Test
 import com.g2ray.gradle.VerifyHevBundleTask
 import com.g2ray.gradle.VerifyLibXrayBuildContractTask
 import com.g2ray.gradle.VerifyLibXrayBundleTask
@@ -147,6 +148,12 @@ dependencies {
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.runner)
     androidTestImplementation(libs.androidx.core)
+}
+
+val enabledRobolectricSdks = providers.gradleProperty("robolectricSdks")
+tasks.withType<Test>().configureEach {
+    // Optional local SDK selection; CI exercises every declared SDK by default.
+    enabledRobolectricSdks.orNull?.let { systemProperty("robolectric.enabledSdks", it) }
 }
 
 val verifyLibXrayBuildContract = tasks.register<VerifyLibXrayBuildContractTask>("verifyLibXrayBuildContract") {

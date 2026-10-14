@@ -31,9 +31,42 @@ import java.io.IOException
 import java.net.InetAddress
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
 
 @RunWith(RobolectricTestRunner::class)
 class RouteCandidateDiscoveryTest {
+    @Test
+    fun discover_cancellationInterruptsAnOutstandingSystemLookup() = runBlocking {
+        val started = CompletableDeferred<Unit>()
+        val release = CountDownLatch(1)
+        val client = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1)
+                    .code(200).message("OK")
+                    .body("""{"Answer":[]}""".toResponseBody("application/dns-json".toMediaType()))
+                    .build()
+            }
+            .build()
+        val discovery = RouteCandidateDiscovery(client) {
+            started.complete(Unit)
+            release.await()
+            emptyList()
+        }
+        val job = launch { discovery.discover(listOf("space-443.app.github.dev")) }
+        try {
+            withTimeout(5_000) { started.await() }
+            job.cancel()
+            val finishedPromptly = withTimeoutOrNull(1_500) { job.join(); true } ?: false
+            assertTrue("Cancellation must interrupt the system-lookup wait", finishedPromptly)
+        } finally {
+            release.countDown()
+            withTimeout(5_000) { job.cancelAndJoin() }
+            client.dispatcher.cancelAll()
+            client.connectionPool.evictAll()
+            client.dispatcher.executorService.shutdown()
+        }
+    }
+
     @Test
     fun discover_deadlineAlsoCancelsRequestsStillQueuedInOkHttp() = runBlocking {
         val release = AtomicBoolean(false)

@@ -2,6 +2,8 @@ package com.g2ray.client.vpn
 
 import android.os.Build
 import android.net.Network
+import android.net.DnsResolver
+import android.os.CancellationSignal
 import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import com.g2ray.client.data.AccountRepository
@@ -17,6 +19,7 @@ import com.g2ray.client.network.CodespaceWakeCoordinator
 import com.g2ray.client.parser.VlessUriParser
 import java.lang.reflect.InvocationTargetException
 import java.net.InetAddress
+import java.util.concurrent.Executor
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED
 import kotlin.coroutines.resume
@@ -39,7 +42,10 @@ import org.robolectric.shadow.api.Shadow
 import org.json.JSONObject
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [Build.VERSION_CODES.S], application = G2RayApplication::class, shadows = [G2RayVpnServiceStartupTest.EndpointNetworkShadow::class])
+@Config(sdk = [Build.VERSION_CODES.S], application = G2RayApplication::class, shadows = [
+    G2RayVpnServiceStartupTest.EndpointNetworkShadow::class,
+    G2RayVpnServiceStartupTest.EndpointResolverShadow::class
+])
 class G2RayVpnServiceStartupTest {
     @Test
     fun lifecycleChangedDuringEndpointDnsNeverStartsTheCore() = runTest {
@@ -293,6 +299,24 @@ class G2RayVpnServiceStartupTest {
         fun getAllByName(host: String): Array<InetAddress> {
             endpointLookupAction?.invoke()
             return arrayOf(InetAddress.getByAddress(byteArrayOf(203.toByte(), 0, 113, 1)))
+        }
+    }
+
+    @Implements(DnsResolver::class, minSdk = 29)
+    class EndpointResolverShadow {
+        companion object {
+            @JvmStatic
+            @Implementation
+            fun getInstance(): DnsResolver = Shadow.newInstanceOf(DnsResolver::class.java)
+        }
+
+        @Implementation
+        fun query(network: Network?, host: String, flags: Int, executor: Executor,
+                  cancellation: CancellationSignal?, callback: DnsResolver.Callback<List<InetAddress>>) {
+            endpointLookupAction?.invoke()
+            executor.execute {
+                callback.onAnswer(listOf(InetAddress.getByAddress(byteArrayOf(203.toByte(), 0, 113, 1))), 0)
+            }
         }
     }
 
