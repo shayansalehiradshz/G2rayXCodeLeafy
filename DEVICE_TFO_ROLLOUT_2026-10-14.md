@@ -230,3 +230,8 @@ the user's data budget. The completed tests do not certify sustained media/AI
 streaming, loaded latency, actual handoff, unplugged deep Doze, battery cost,
 other OEMs, or every exported WS ALPN/edge variant. Issue #1 remains open.
 No native payload, dependency, account, endpoint, or transport default changed.
+
+The later current-build phone/public-route checks and the explicitly
+incomplete Native/WS attempts are recorded in
+[Current Device and Public-Route Acceptance](CURRENT_DEVICE_ACCEPTANCE_2026-10-14.md).
+That follow-up preserves these earlier results rather than replacing them.
