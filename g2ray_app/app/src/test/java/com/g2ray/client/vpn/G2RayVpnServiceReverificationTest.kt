@@ -238,6 +238,135 @@ class G2RayVpnServiceReverificationTest {
         }
     }
 
+    @Test
+    fun handoffFailureFromAReplacedNetworkDoesNotRestartTheNewRoute() = runTest {
+        assertReplacedHandoffDoesNotRecover(oldProbeSuccess = false)
+    }
+
+    @Test
+    fun handoffSuccessFromAReplacedNetworkDoesNotRestartTheNewRoute() = runTest {
+        assertReplacedHandoffDoesNotRecover(oldProbeSuccess = true)
+    }
+
+    @Test
+    fun networkLossDuringHandoffVerificationDoesNotScheduleStaleRecovery() = runTest {
+        val probe = CountingProbe()
+        withConnectedService(probe) { service, bridge ->
+            probe.onProbe = {
+                applyNetwork(service, null)
+                RunningRouteResult(true)
+            }
+            applyNetwork(service, ShadowNetwork.newInstance(101))
+            val handoff = field(service, "networkHandoffJob") as Job
+            runCurrent()
+            advanceTimeBy(2_500L)
+            runCurrent()
+
+            assertTrue(handoff.isCancelled)
+            assertEquals(1, probe.calls)
+            assertTrue(field(service, "waitingForUnderlyingNetwork") as Boolean)
+            assertFalse("An obsolete handoff must not own recovery", field(service, "routeRecoveryInProgress") as Boolean)
+            assertEquals(0, bridge.stops)
+            assertFalse((field(service, "lifecycleOperationMutex") as Mutex).isLocked)
+            assertFalse(VpnStateRepository.state.value.tunnelVerified)
+        }
+    }
+
+    @Test
+    fun stableHandoffSuccessAfterNetworkReturnVerifiesWithoutRestarting() = runTest {
+        val probe = CountingProbe()
+        withConnectedService(probe) { service, bridge ->
+            applyNetwork(service, null)
+            runCurrent()
+            applyNetwork(service, ShadowNetwork.newInstance(101))
+            runCurrent()
+            advanceTimeBy(2_500L)
+            runCurrent()
+
+            assertEquals(1, probe.calls)
+            assertTrue(VpnStateRepository.state.value.tunnelVerified)
+            assertEquals(TunnelState.Connected, VpnStateRepository.state.value.tunnelState)
+            assertFalse(field(service, "routeRecoveryInProgress") as Boolean)
+            assertEquals(0, bridge.stops)
+        }
+    }
+
+    @Test
+    fun stableHandoffFailureStillConfirmsAndSchedulesRecovery() = runTest {
+        val probe = CountingProbe().apply { onProbe = { RunningRouteResult(false, "Fixture route failed") } }
+        withConnectedService(probe) { service, bridge ->
+            applyNetwork(service, ShadowNetwork.newInstance(101))
+            runCurrent()
+            advanceTimeBy(2_500L)
+            runCurrent()
+            assertEquals(1, probe.calls)
+            assertFalse(field(service, "routeRecoveryInProgress") as Boolean)
+
+            advanceTimeBy(1_500L)
+            runCurrent()
+            assertEquals(2, probe.calls)
+            assertEquals(1, bridge.stops)
+            assertTrue(field(service, "routeRecoveryInProgress") as Boolean)
+            assertFalse(VpnStateRepository.state.value.tunnelVerified)
+        }
+    }
+
+    @Test
+    fun handoffReplacedWhileWaitingForLifecycleMutexDoesNotProbeTheOldNetwork() = runTest {
+        val probe = CountingProbe()
+        withConnectedService(probe) { service, bridge ->
+            val mutex = field(service, "lifecycleOperationMutex") as Mutex
+            mutex.lock()
+            try {
+                applyNetwork(service, ShadowNetwork.newInstance(101))
+                val oldHandoff = field(service, "networkHandoffJob") as Job
+                runCurrent()
+                advanceTimeBy(2_500L)
+                runCurrent()
+                applyNetwork(service, ShadowNetwork.newInstance(102))
+                runCurrent()
+                assertTrue(oldHandoff.isCancelled)
+                assertEquals(0, probe.calls)
+            } finally {
+                mutex.unlock()
+            }
+
+            advanceTimeBy(2_500L)
+            runCurrent()
+            assertEquals(1, probe.calls)
+            assertEquals(0, bridge.stops)
+            assertFalse((field(service, "lifecycleOperationMutex") as Mutex).isLocked)
+        }
+    }
+
+    private suspend fun TestScope.assertReplacedHandoffDoesNotRecover(oldProbeSuccess: Boolean) {
+        val probe = CountingProbe()
+        withConnectedService(probe) { service, bridge ->
+            probe.onProbe = {
+                applyNetwork(service, ShadowNetwork.newInstance(102))
+                RunningRouteResult(oldProbeSuccess, "Fixture old-network result")
+            }
+            applyNetwork(service, ShadowNetwork.newInstance(101))
+            val handoff = field(service, "networkHandoffJob") as Job
+            runCurrent()
+            advanceTimeBy(2_500L)
+            runCurrent()
+
+            assertTrue(handoff.isCancelled)
+            assertEquals(1, probe.calls)
+            assertEquals("A replacement network must not be restarted by an old result", 0, bridge.stops)
+            assertFalse("An obsolete handoff must not own recovery", field(service, "routeRecoveryInProgress") as Boolean)
+            assertFalse((field(service, "lifecycleOperationMutex") as Mutex).isLocked)
+            assertFalse(VpnStateRepository.state.value.tunnelVerified)
+
+            probe.onProbe = { RunningRouteResult(true) }
+            advanceTimeBy(2_500L)
+            runCurrent()
+            assertEquals("The newest network must still receive a fresh check", 2, probe.calls)
+            assertEquals(0, bridge.stops)
+        }
+    }
+
     private suspend fun TestScope.withConnectedService(
         probe: VpnDataPathProbe, block: suspend (G2RayVpnService, CountingBridge) -> Unit
     ) {

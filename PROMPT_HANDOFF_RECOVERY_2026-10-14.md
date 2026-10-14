@@ -52,7 +52,7 @@ Changed production file:
 New regression class:
 `g2ray_app/app/src/test/java/com/g2ray/client/vpn/G2RayVpnServiceReverificationTest.kt`.
 
-## Verification
+## Initial Verification
 
 Nine scenarios pass on both API 24 and API 31, for 18 new regression cases:
 obsolete failure, obsolete success, suspended-probe cancellation, loss of
@@ -91,3 +91,68 @@ sustained upload/download, loaded latency, and battery behavior remain
 unverified. The user's small-probe budget and decision to finish without
 more device tests are preserved. No throughput or zero-drop claim follows
 from these fixtures, and Codespaces hosting limits are unchanged.
+
+## Cancelled Handoff Follow-Up
+
+Follow-up baseline: `06e3f4038279b4c56d5f0813691d5e71a2623c24`.
+The initial fix guarded prompt verification. Reviewing the separate handoff
+job exposed another result-processing race: a cancelled handoff could
+schedule a separately owned recovery job after its probe returned. That
+recovery was not a child of the cancelled handoff.
+
+The final pre-fix focused run executed 12 cases on API 24 and 31. Six failed
+and six positive-control cases passed:
+
+| Reproduced scenario | Observed before this follow-up |
+| --- | --- |
+| A successful probe replaces network 101 with 102 before returning | The old handoff was cancelled, but one bridge.stop call was recorded on the replacement route. |
+| A failed probe replaces network 101 with 102 before returning | The old handoff was cancelled, but one bridge.stop call was recorded on the replacement route. |
+| A successful probe removes all physical networks before returning | The cancelled handoff still claimed recovery ownership instead of leaving connectivity restoration to a current handoff. |
+
+The recording bridge is a fixture, not an actual native engine. These are
+real service-method executions with controlled callback timing; they do not
+prove that this race caused the previously measured phone stalls.
+The original XML is retained privately at
+`data/verification/handoff-cancelled-core-stop-before-20261014.xml`.
+An earlier selection ran five failing cases because its exact method filter
+did not include the API-24 suffix for the network-loss scenario; the final
+pre-fix run includes both SDKs for all six new scenarios.
+
+Cancellation must be observed before subsequent synchronous actions.
+The project's pinned kotlinx.coroutines 1.10.2 already supplies the
+current-context `ensureActive` check; this follow-up adds no dependency or
+library upgrade. The behavior is supported by the
+[pinned Job implementation](https://github.com/Kotlin/kotlinx.coroutines/blob/1.10.2/kotlinx-coroutines-core/common/src/Job.kt)
+and [official cancellation-check API documentation](https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines/ensure-active.html).
+
+The follow-up changes are:
+
+- Transition verification checks cancellation at entry and after each probe.
+- Each handoff captures its network generation and, after acquiring the
+  lifecycle mutex, captures its lifecycle token and TUN identity.
+- Old, cancelled, networkless, or lifecycle-obsolete handoffs cannot dispatch
+  recovery or publish verified state.
+- Final recovery/state checks use the same service monitor as
+  `applyUnderlyingNetwork`, keeping the check and side effect atomic with
+  actual network callbacks. No suspension is performed under that monitor.
+- Existing confirmation delays, real-failure recovery, transport settings,
+  wake preferences, and background probe traffic remain unchanged.
+
+The expanded verification class now passes 30 cases on API 24 and 31. Its
+12 new cases cover obsolete success, obsolete failure, complete network
+loss, successful network return, confirmed failure on a stable replacement
+network, and replacement while waiting for the lifecycle mutex. Tests also
+require a fresh check of the newest network without an unnecessary core stop.
+Including startup and periodic-monitor cases, the focused run passed 40.
+
+The full follow-up local run passed 477 cases in 36 suites with zero
+failures, errors, or skips among the selected cached SDKs. Lint reported
+zero errors and 25 warnings. Instrumentation Kotlin compilation and
+`git diff --check` passed. The command is unchanged from Initial Verification.
+No existing assertion, timeout, or recovery threshold was weakened.
+
+The Acceptance Still Open section remains applicable. No APK was packaged
+or installed, no device tests or media transfers were performed, and the
+retained-socket idle-stall issue remains open. This prevents a verified
+source-level cause of unnecessary recovery during handoff; it is not a
+measured throughput, ISP-latency, or uninterrupted-video improvement.

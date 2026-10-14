@@ -972,6 +972,7 @@ class G2RayVpnService : VpnService() {
     }
 
     private suspend fun verifyRouteAfterTransition(): RunningRouteResult {
+        currentCoroutineContext().ensureActive()
         val networkGeneration = underlyingNetworkGeneration.get()
         fun networkIsCurrent(): Boolean = !waitingForUnderlyingNetwork &&
             networkGeneration == underlyingNetworkGeneration.get()
@@ -981,11 +982,13 @@ class G2RayVpnService : VpnService() {
         )
         if (!networkIsCurrent()) return obsolete
         var route = diagnoseVpnRoute(resetConnections = true)
+        currentCoroutineContext().ensureActive()
         if (!networkIsCurrent()) return obsolete
         if (shouldConfirmTransitionRouteFailure(route)) {
             delay(TRANSITION_ROUTE_CONFIRM_DELAY_MS)
             if (!networkIsCurrent()) return obsolete
             route = diagnoseVpnRoute(resetConnections = true)
+            currentCoroutineContext().ensureActive()
         }
         return if (networkIsCurrent()) route else obsolete
     }
@@ -2675,36 +2678,55 @@ class G2RayVpnService : VpnService() {
             return
         }
         networkHandoffJob?.cancel()
+        val handoffNetworkGeneration = underlyingNetworkGeneration.get()
         networkHandoffJob = scope.launch {
             delay(NETWORK_HANDOFF_RECOVERY_DELAY_MS)
             lifecycleOperationMutex.withLock {
+                val token = activeLifecycleToken
+                val tun = vpnInterface
+                fun handoffIsCurrent(): Boolean = isActive && !waitingForUnderlyingNetwork &&
+                    handoffNetworkGeneration == underlyingNetworkGeneration.get() &&
+                    tun != null && isTunnelCurrent(token, tun)
                 when (
                     networkHandoffAction(
-                        coroutineActive = isActive,
-                        hasVpnInterface = vpnInterface != null,
+                        coroutineActive = handoffIsCurrent(),
+                        hasVpnInterface = tun != null,
                         coreState = core.state.value
                     )
                 ) {
                     NetworkHandoffAction.Ignore -> return@withLock
                     NetworkHandoffAction.Defer -> return@withLock
                     NetworkHandoffAction.RecoverCore -> {
-                        scheduleRouteRecovery(
-                            core.lastError.value ?: "Xray stopped while the underlying network was unavailable"
-                        )
+                        synchronized(this@G2RayVpnService) {
+                            if (handoffIsCurrent()) {
+                                scheduleRouteRecovery(
+                                    core.lastError.value ?: "Xray stopped while the underlying network was unavailable"
+                                )
+                            }
+                        }
                     }
                     NetworkHandoffAction.VerifyRoute -> {
                         val route = verifyRouteAfterTransition()
+                        if (!handoffIsCurrent()) return@withLock
                         if (route.success) {
                             if (wasWaiting) {
                                 withContext(Dispatchers.Main) {
-                                    markTunnelVerified("VPN connected after network handoff")
+                                    synchronized(this@G2RayVpnService) {
+                                        if (handoffIsCurrent()) {
+                                            markTunnelVerified("VPN connected after network handoff")
+                                        }
+                                    }
                                 }
                             }
                         } else {
-                            scheduleRouteRecovery(
-                                route.error ?: "Tunnel route failed after network handoff",
-                                failureScope = route.failureScope
-                            )
+                            synchronized(this@G2RayVpnService) {
+                                if (handoffIsCurrent()) {
+                                    scheduleRouteRecovery(
+                                        route.error ?: "Tunnel route failed after network handoff",
+                                        failureScope = route.failureScope
+                                    )
+                                }
+                            }
                         }
                     }
                 }
