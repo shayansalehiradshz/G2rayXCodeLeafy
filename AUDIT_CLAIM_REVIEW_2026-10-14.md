@@ -32,6 +32,10 @@ in force: no media streaming, large transfer, or loaded-throughput test.
 ## Focused Changes
 
 No production transport default or native dependency changed.
+No new production defect was reproduced in this pass. Existing fixes were
+verified instead of reapplying stale patches or replacing the working system.
+Returning several DNS addresses is not proof of immediate success when the
+first answer is blackholed; that remains a separate device/network scenario.
 
 - Android parser regression: preserve an encoded WS early-data path, nested
   query values, SNI/Host, ALPN, and route-template identity during IP discovery.
@@ -84,8 +88,35 @@ A live-host attempt ran both Python unit suites and read the pinned core/TFO
 state, but stopped before the real pair because no Go compiler was installed.
 No toolchain was installed and no active engine was restarted. Use the hosted
 real-core job for the new fixture rather than claiming this attempt passed.
-Hosted results and the final non-restarting source sync are recorded below
-after completion.
+
+### Completed Hosted And Live Checks
+
+Both workflows completed successfully for the exact diagnostic/test commit
+`2dd9e7497266740a4f971f277d2818601f912ff6`:
+
+- [Static Tests 38515869467](https://github.com/z2roozsh/G2rayXCodeLeafy/actions/runs/38515869467):
+  66 static, 197 server behavior, 65 Worker behavior checks (counts independently
+  read from their job logs); benchmark budgets, Go diagnostic race tests,
+  Python 14 + 9 tests, ShellCheck error-level, and Worker dry-run passed.
+- The real-core job passed saturated-upload expiry, three client-validation
+  cases, and both generated-server/client runs. Each run also validated all
+  12 generated/migrated profile and WS-toggle cases. Normal XHTTP/WS had a
+  zero-second idle compatibility check. The WS early-data experiment measured
+  a 70,040-ms gap, reused all three original HTTP/2 connections, and returned
+  three HTTP 204 retained responses reported as 0 ms at millisecond resolution.
+  Fresh responses were 6 / 6 / 6 ms. These are loopback fixture timings, not
+  phone latency or a before/after speedup.
+- [Android Tests 38515869424](https://github.com/z2roozsh/G2rayXCodeLeafy/actions/runs/38515869424):
+  source checks, instrumentation compilation, native build/schema contract
+  gates, and native-payload fixtures passed. Hosted source CI does not package
+  a functional private-AAR APK or perform a physical-device run.
+
+The clean live checkout then fast-forwarded from `35a05d9` to that exact tested
+commit. Engine PID 258 and the script/config/UUID/export hashes remained
+unchanged; no engine restart occurred. The installed core remained 26.7.28,
+origin TFO remained false, and local XHTTP OPTIONS returned HTTP 200. Direct
+GitHub wake preferences were not edited. The final report-only follow-up does
+not change any runtime source or test implementation.
 
 Remaining acceptance is explicit: final HEV/WS idle completion, repeated core
 recovery, current APK crash/ANR review, real media/AI sessions, sustained
