@@ -471,12 +471,19 @@ after startup checks and does not certify idle survival or cold-host wake.
 It refuses to run without `smallProbesOnly=true`.
 
 Debug builds record bounded per-request DNS, connect, TLS, and response-header
-event times plus default-VPN status at the start/end of the probe. Event
+event times, DNS address-family counts (never addresses), the attempted
+connection family, and default-VPN status at the start/end of the probe. Event
 callbacks capture timing only; diagnostic logging occurs outside those
 callbacks. A pending or truncated trace is labeled, not treated as completed.
 Connect time contains TLS time; do not sum nested intervals as independent
 latency. No credentials, complete URLs, addresses, or exception messages enter
 the timing record. Release builds do not attach this timing listener.
+If the phone suppresses the new tag, record its old property value and
+temporarily enable capture using `adb shell setprop log.tag.G2RayVpnProbe I`.
+Restore the previous value afterwards; for an originally empty value use
+`adb shell 'setprop log.tag.G2RayVpnProbe ""'`. An empty capture is not timing
+evidence: require actual per-request records or the no-network packaged
+factory regression `debugDataPathClientAttachesPerRequestTimingWithoutNetworkAccess`.
 
 ## v2rayNG A/B comparison
 

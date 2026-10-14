@@ -9,6 +9,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.IOException
 import java.net.InetSocketAddress
+import java.net.InetAddress
 import java.net.Proxy
 
 class VpnProbeTimingTraceTest {
@@ -43,6 +44,22 @@ class VpnProbeTimingTraceTest {
         assertTrue(result.contains("outcome=completed elapsed_ms=400"))
         assertTrue(result.contains("dns_start:10,dns_end:60,connect_start:60,tls_start:90,tls_end:190"))
         assertTrue(result.contains("request_sent:200,response_headers:390,completed:400"))
+    }
+
+    @Test
+    fun recordsAddressFamilyCountsWithoutLoggingAddresses() {
+        val ipv4 = InetAddress.getByAddress(byteArrayOf(192.toByte(), 0, 2, 1))
+        val ipv6 = InetAddress.getByAddress(ByteArray(16).apply { this[15] = 1 })
+        val trace = VpnProbeTimingTrace { 0L }
+        val listener = trace.listenerFor("www.gstatic.com")
+        listener.callStart(call)
+        listener.dnsEnd(call, "www.gstatic.com", listOf(ipv4, ipv6))
+        listener.connectStart(call, InetSocketAddress(ipv6, 443), Proxy.NO_PROXY)
+
+        val result = trace.summaries().single()
+        assertTrue(result.contains("dns_last_ipv4_count=1 dns_last_ipv6_count=1 connect_last_family=ipv6"))
+        assertFalse(result.contains(ipv4.hostAddress!!))
+        assertFalse(result.contains(ipv6.hostAddress!!))
     }
 
     @Test

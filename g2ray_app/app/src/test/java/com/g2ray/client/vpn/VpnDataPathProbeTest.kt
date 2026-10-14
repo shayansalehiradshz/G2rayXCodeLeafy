@@ -3,6 +3,7 @@ package com.g2ray.client.vpn
 import kotlinx.coroutines.runBlocking
 import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
+import okhttp3.Request
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
@@ -12,6 +13,25 @@ import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
 class VpnDataPathProbeTest {
+    @Test
+    fun debugClientAttachesTheRequestTimingTagWithoutSharingItWithOtherCalls() = runBlocking {
+        val probe = OkHttpVpnDataPathProbe()
+        try {
+            val method = OkHttpVpnDataPathProbe::class.java.getDeclaredMethod("client").apply { isAccessible = true }
+            val client = method.invoke(probe) as OkHttpClient
+            val trace = VpnProbeTimingTrace { 0L }
+            client.newCall(Request.Builder().url("https://www.gstatic.com/generate_204")
+                .tag(VpnProbeTimingTrace::class.java, trace).build())
+            client.newCall(Request.Builder().url("https://example.com/").build())
+
+            val records = trace.summaries()
+            assertEquals(1, records.size)
+            assertEquals(true, records.single().contains("endpoint=www.gstatic.com outcome=pending"))
+        } finally {
+            probe.reset()
+        }
+    }
+
     @Test
     fun resetClosesCachedClientOffCallingThreadAndOnlyOnce() = runBlocking {
         val caller = Thread.currentThread()

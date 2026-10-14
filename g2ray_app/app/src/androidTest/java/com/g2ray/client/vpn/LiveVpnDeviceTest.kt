@@ -69,6 +69,25 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 class LiveVpnDeviceTest {
     @Test
+    fun debugDataPathClientAttachesPerRequestTimingWithoutNetworkAccess() = runBlocking {
+        assertTrue("This regression requires the actual debug client", com.g2ray.client.BuildConfig.DEBUG)
+        val probe = OkHttpVpnDataPathProbe()
+        try {
+            val method = OkHttpVpnDataPathProbe::class.java.getDeclaredMethod("client").apply { isAccessible = true }
+            val client = method.invoke(probe) as OkHttpClient
+            val trace = VpnProbeTimingTrace(SystemClock::elapsedRealtime)
+            client.newCall(Request.Builder().url("https://www.gstatic.com/generate_204")
+                .tag(VpnProbeTimingTrace::class.java, trace).build())
+            val records = trace.summaries()
+            assertEquals("Actual packaged client did not attach the timing listener", 1, records.size)
+            assertTrue(records.single().contains("endpoint=www.gstatic.com outcome=pending"))
+            report("event=probe_timing_factory attached=true network_access=false")
+        } finally {
+            probe.reset()
+        }
+    }
+
+    @Test
     fun explicitEngineArgumentsCannotSilentlyExerciseAnotherEngine() {
         assertEquals(VpnEngineMode.Hev, engineFromTestArgument(null))
         VpnEngineMode.entries.forEach { mode ->

@@ -1840,7 +1840,9 @@ class G2RayVpnService : VpnService() {
         if (fullPath.success) return fullPath
         // A successful TUN proof already includes SOCKS/core/remote transport.
         // Probe SOCKS separately only to diagnose a failed full-device path.
+        val socksDiagnosisStartedAt = SystemClock.elapsedRealtime()
         val xrayRoute = core.verifyRunningRoute()
+        logStartupPhase("socks_diagnosis", engine, socksDiagnosisStartedAt, xrayRoute.success)
         val diagnosed = classifyVpnRouteHealth(
             fullPath = fullPath,
             xrayRoute = xrayRoute,

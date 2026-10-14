@@ -6,6 +6,8 @@ import okhttp3.Handshake
 import okhttp3.Protocol
 import java.io.IOException
 import java.net.InetAddress
+import java.net.Inet4Address
+import java.net.Inet6Address
 import java.net.InetSocketAddress
 import java.net.Proxy
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -25,11 +27,26 @@ internal class VpnProbeTimingTrace(private val nowMs: () -> Long) {
         @Volatile private var startedAt: Long? = null
         @Volatile private var finishedAt: Long? = null
         @Volatile private var outcome = "pending"
+        @Volatile private var dnsLastIpv4Count: Int? = null
+        @Volatile private var dnsLastIpv6Count: Int? = null
+        @Volatile private var connectLastFamily = "unknown"
 
         override fun callStart(call: Call) = record("call_start")
         override fun dnsStart(call: Call, domainName: String) = record("dns_start")
-        override fun dnsEnd(call: Call, domainName: String, inetAddressList: List<InetAddress>) = record("dns_end")
-        override fun connectStart(call: Call, inetSocketAddress: InetSocketAddress, proxy: Proxy) = record("connect_start")
+        override fun dnsEnd(call: Call, domainName: String, inetAddressList: List<InetAddress>) {
+            dnsLastIpv4Count = inetAddressList.count { it is Inet4Address }
+            dnsLastIpv6Count = inetAddressList.count { it is Inet6Address }
+            record("dns_end")
+        }
+
+        override fun connectStart(call: Call, inetSocketAddress: InetSocketAddress, proxy: Proxy) {
+            connectLastFamily = when (inetSocketAddress.address) {
+                is Inet4Address -> "ipv4"
+                is Inet6Address -> "ipv6"
+                else -> "unknown"
+            }
+            record("connect_start")
+        }
         override fun secureConnectStart(call: Call) = record("tls_start")
         override fun secureConnectEnd(call: Call, handshake: Handshake?) = record("tls_end")
         override fun connectEnd(call: Call, inetSocketAddress: InetSocketAddress, proxy: Proxy, protocol: Protocol?) =
@@ -70,6 +87,8 @@ internal class VpnProbeTimingTrace(private val nowMs: () -> Long) {
             val elapsed = if (start == null || end == null) "unknown" else (end - start).coerceAtLeast(0L).toString()
             val stages = events.joinToString(",")
             return "endpoint=$endpoint outcome=$outcome elapsed_ms=$elapsed " +
+                "dns_last_ipv4_count=${dnsLastIpv4Count ?: "unknown"} " +
+                "dns_last_ipv6_count=${dnsLastIpv6Count ?: "unknown"} connect_last_family=$connectLastFamily " +
                 "events_truncated=${eventCount.get() > MAX_EVENTS_PER_REQUEST} stages=$stages"
         }
     }
