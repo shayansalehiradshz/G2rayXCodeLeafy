@@ -227,6 +227,62 @@ class RouteMeasurementContextTest {
     }
 
     @Test
+    fun pingAllUsesStoredProfilesWithoutAUiListCollector() = runBlocking {
+        exercisePingAll(changeNetwork = false, observeProfiles = false)
+    }
+
+    @Test
+    fun pingAllUsesTheSelectedAccountWhenTheUiListIsStale() = runBlocking {
+        exercisePingAll(changeNetwork = false, switchAccount = true)
+    }
+
+    @Test
+    fun unavailableCleanupUsesTheSelectedAccountWhenTheUiListIsStale() = runBlocking {
+        defaultNetwork = physical(100)
+        val repository = AccountRepository(InMemorySecureStore())
+        val first = repository.addAccount("First", "", "first-space")
+        val second = repository.addAccount("Second", "", "second-space")
+        val key = (application as G2RayApplication).routeMeasurementContext.currentKey()!!
+        listOf(first, second).forEachIndexed { index, account ->
+            val parsed = VlessUriParser.parse(
+                "vless://00000000-0000-4000-8000-000000000001@203.0.113.${index + 1}:443" +
+                    "?encryption=none&security=tls&sni=fixture.example&type=ws&host=fixture.example&path=%2Fws"
+            ).getOrThrow()
+            val stored = repository.importProfile(account.id, account.displayName, parsed.rawUri, parsed)
+            repeat(2) {
+                repository.recordProfileDelay(stored.id, false, null, "Fixture unavailable", networkKey = key)
+            }
+        }
+        repository.selectAccount(first.id)
+        G2RayApplication::class.java.getDeclaredField("accountRepository\$delegate")
+            .apply { isAccessible = true }.set(application, lazyOf(repository))
+        val dispatcher = UnconfinedTestDispatcher()
+        val store = ViewModelStore()
+        Dispatchers.setMain(dispatcher)
+        try {
+            val viewModel = G2RayViewModel(application, { error("Unexpected route probe") }, VpnEnginePreferences(InMemorySecureStore()))
+            store.put("fixture", viewModel)
+            withTimeout(10_000L) { viewModel.measurementNetworkKey.first { it != null } }
+            withTimeout(10_000L) {
+                viewModel.activeCodespaceProfiles.first { it.singleOrNull()?.accountId == first.id }
+            }
+            dispatcher.scheduler.advanceTimeBy(5_001L)
+            dispatcher.scheduler.runCurrent()
+            repository.selectAccount(second.id)
+            assertEquals(first.id, viewModel.activeCodespaceProfiles.value.single().accountId)
+
+            viewModel.deleteUnavailableProfiles()
+
+            withTimeout(10_000L) { viewModel.statusMessage.first { it.startsWith("Deleted ") } }
+            assertEquals(second.id, repository.activeSelection.value.accountId)
+            assertEquals(listOf(first.id), repository.profiles.value.map { it.accountId })
+        } finally {
+            store.clear()
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
     fun unreadableScanHistoryPausesAutomaticScanningWithoutBlockingSavedSettings() {
         defaultNetwork = physical(100)
         val repository = AccountRepository(InMemorySecureStore())
@@ -262,7 +318,9 @@ class RouteMeasurementContextTest {
         }
     }
 
-    private suspend fun exercisePingAll(changeNetwork: Boolean) {
+    private suspend fun exercisePingAll(
+        changeNetwork: Boolean, observeProfiles: Boolean = true, switchAccount: Boolean = false
+    ) {
         defaultNetwork = physical(100)
         val repository = AccountRepository(InMemorySecureStore())
         val account = repository.addAccount("Fixture", "", "fixture-space")
@@ -275,21 +333,41 @@ class RouteMeasurementContextTest {
         }
         G2RayApplication::class.java.getDeclaredField("accountRepository\$delegate")
             .apply { isAccessible = true }.set(application, lazyOf(repository))
-        val before = repository.profiles.value
-        val selection = repository.activeSelection.value
         val bridge = DelayBridge {
             if (changeNetwork) {
                 defaultNetwork = physical(101)
                 callbacks.toList().forEach { it.onAvailable(defaultNetwork!!) }
             }
         }
-        Dispatchers.setMain(UnconfinedTestDispatcher())
+        val dispatcher = UnconfinedTestDispatcher()
+        Dispatchers.setMain(dispatcher)
         val store = ViewModelStore()
         try {
             val viewModel = G2RayViewModel(application, { XrayCoreManager(bridge) }, VpnEnginePreferences(InMemorySecureStore()))
             store.put("fixture", viewModel)
             withTimeout(10_000L) { viewModel.measurementNetworkKey.first { it != null } }
-            withTimeout(10_000L) { viewModel.activeCodespaceProfiles.first { it.size == 2 } }
+            if (observeProfiles) {
+                withTimeout(10_000L) { viewModel.activeCodespaceProfiles.first { it.size == 2 } }
+            } else {
+                assertTrue(viewModel.activeCodespaceProfiles.value.isEmpty())
+            }
+            if (switchAccount) {
+                dispatcher.scheduler.advanceTimeBy(5_001L)
+                dispatcher.scheduler.runCurrent()
+                val second = repository.addAccount("Second", "", "second-space")
+                listOf("203.0.113.3", "203.0.113.4").forEach { address ->
+                    val parsed = VlessUriParser.parse(
+                        "vless://00000000-0000-4000-8000-000000000001@$address:443" +
+                            "?encryption=none&security=tls&sni=fixture.example&type=ws&host=fixture.example&path=%2Fws"
+                    ).getOrThrow()
+                    repository.importProfile(second.id, address, parsed.rawUri, parsed)
+                }
+                repository.selectAccount(second.id)
+                assertTrue(viewModel.activeCodespaceProfiles.value.all { it.accountId == account.id })
+            }
+            val selection = repository.activeSelection.value
+            val before = repository.profiles.value.filter { it.accountId == selection.accountId }
+            val untested = repository.profiles.value.filter { it.accountId != selection.accountId }
             viewModel.refreshActiveCodespaceDelays()
             val states = try {
                 withTimeout(10_000L) {
@@ -305,13 +383,15 @@ class RouteMeasurementContextTest {
             }
             assertEquals(1, bridge.batchCalls)
             assertEquals(selection, repository.activeSelection.value)
+            assertEquals(untested, repository.profiles.value.filter { it.accountId != selection.accountId })
             if (changeNetwork) {
                 assertEquals(before, repository.profiles.value)
                 assertTrue(states.values.all { it.delayMs == null && it.error != null })
             } else {
                 val key = (application as G2RayApplication).routeMeasurementContext.currentKey()
                 assertNotNull(key)
-                assertTrue(repository.profiles.value.all { it.lastDelayMs == 100L && it.lastDelayNetworkKey == key })
+                assertTrue(repository.profiles.value.filter { it.accountId == selection.accountId }
+                    .all { it.lastDelayMs == 100L && it.lastDelayNetworkKey == key })
                 assertTrue(states.values.all { it.delayMs == 100L && it.networkKey == key })
             }
         } finally {

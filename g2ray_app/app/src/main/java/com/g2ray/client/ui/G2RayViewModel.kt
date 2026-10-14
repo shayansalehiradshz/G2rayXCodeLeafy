@@ -136,14 +136,7 @@ class G2RayViewModel internal constructor(
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
     val activeCodespaceProfiles: StateFlow<List<StoredG2RayProfile>> = combine(profiles, activeSelection, measurementNetworkKey) { profs, sel, networkKey ->
-        val now = System.currentTimeMillis()
-        profs.filter { it.accountId == sel.accountId }
-            .sortedWith(
-                compareBy<StoredG2RayProfile> { ProfileHealth.rank(it, now, networkKey) }
-                    .thenBy { ProfileHealth.delaySortValue(it, now, networkKey) }
-                    .thenByDescending { it.lastDelayTestedAt ?: 0L }
-                    .thenBy { it.createdAt }
-            )
+        rankedCodespaceProfiles(profs, sel.accountId, networkKey)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val activeApiKey: StateFlow<G2RayApiKey?> = apiKeys.combine(activeSelection) { keys, sel ->
@@ -233,6 +226,19 @@ class G2RayViewModel internal constructor(
     }
 
     companion object {
+        private fun rankedCodespaceProfiles(
+            profiles: List<StoredG2RayProfile>, accountId: String?, networkKey: String?
+        ): List<StoredG2RayProfile> {
+            val now = System.currentTimeMillis()
+            return profiles.filter { it.accountId == accountId }
+                .sortedWith(
+                    compareBy<StoredG2RayProfile> { ProfileHealth.rank(it, now, networkKey) }
+                        .thenBy { ProfileHealth.delaySortValue(it, now, networkKey) }
+                        .thenByDescending { it.lastDelayTestedAt ?: 0L }
+                        .thenBy { it.createdAt }
+                )
+        }
+
         private fun preferenceReadError(error: Exception): String =
             "Saved VPN settings could not be read. Stored data was not changed: ${error.javaClass.simpleName}"
 
@@ -646,6 +652,26 @@ class G2RayViewModel internal constructor(
         return false
     }
 
+    private fun requireStableCommandSettings(): Boolean {
+        if (!requireSavedData()) return false
+        if (configurationMutationJob?.isActive != true) return true
+        _statusMessage.value = "Wait for the current settings change to finish."
+        return false
+    }
+
+    private data class SelectedCodespaceContext(
+        val account: G2RayAccount?, val profile: StoredG2RayProfile?
+    )
+
+    private fun selectedCodespaceContext(): SelectedCodespaceContext {
+        val selection = repository.activeSelection.value
+        val account = repository.accounts.value.firstOrNull { it.id == selection.accountId }
+        val profile = repository.profiles.value.firstOrNull {
+            account != null && it.accountId == account.id && it.id == selection.profileId
+        }
+        return SelectedCodespaceContext(account, profile)
+    }
+
     private fun configurationMutationAllowedNow(): Boolean {
         val startupBusy = currentVpnStartJob?.isActive == true ||
             currentWakeJob?.isActive == true ||
@@ -781,7 +807,8 @@ class G2RayViewModel internal constructor(
         message: String,
         activeAccountId: String?,
         routeReady: Boolean,
-        activeProfileId: String? = activeProfile.value?.id
+        activeProfileId: String? = selectedCodespaceContext().profile
+            ?.takeIf { it.accountId == activeAccountId }?.id
     ) {
         VpnStateRepository.state.update { previous ->
             mergeRouteState(
@@ -796,11 +823,12 @@ class G2RayViewModel internal constructor(
     }
 
     fun wakeUpCodespace() {
-        if (!requireSavedData()) return
+        if (!requireStableCommandSettings()) return
         if (currentWakeJob?.isActive == true) return
 
         currentWakeJob = viewModelScope.launch {
-            val account = activeAccount.value
+            val selected = selectedCodespaceContext()
+            val account = selected.account
 
             if (account == null) {
                 _statusMessage.value = "No active account selected."
@@ -881,7 +909,7 @@ class G2RayViewModel internal constructor(
                                 routeState = RouteState.Ready,
                                 message = "Codespace route ready",
                                 activeAccountId = account.id,
-                                activeProfileId = activeProfile.value?.id,
+                                activeProfileId = selected.profile?.id,
                                 routeReady = true
                             )
                         } else {
@@ -894,7 +922,7 @@ class G2RayViewModel internal constructor(
                                 routeState = RouteState.Settling,
                                 message = "Codespace available; route verification pending",
                                 activeAccountId = account.id,
-                                activeProfileId = activeProfile.value?.id,
+                                activeProfileId = selected.profile?.id,
                                 routeReady = false
                             )
                         }
@@ -1001,7 +1029,7 @@ class G2RayViewModel internal constructor(
         clearPendingVpnStart()
         _isWakingUp.value = false
         _statusMessage.value = "Wake cancelled."
-        val activeAccId = activeAccount.value?.id
+        val activeAccId = selectedCodespaceContext().account?.id
         publishRouteState(
             routeState = RouteState.Unknown,
             message = "Wake cancelled",
@@ -1045,7 +1073,8 @@ class G2RayViewModel internal constructor(
             return
         }
 
-        val profile = activeProfile.value
+        val selected = selectedCodespaceContext()
+        val profile = selected.profile
         if (profile == null) {
             _statusMessage.value = "No active VLESS config selected."
             VpnStateRepository.state.update { previous ->
@@ -1057,7 +1086,7 @@ class G2RayViewModel internal constructor(
             return
         }
 
-        val account = activeAccount.value
+        val account = selected.account
         val wakeConfigured = account?.let(::wakeControlConfigured) == true
         when (vpnStartPlan(wakeConfigured, VpnStateRepository.state.value.routeReady)) {
             VpnStartPlan.DirectProbeThenWake -> {
@@ -1623,7 +1652,9 @@ class G2RayViewModel internal constructor(
             _statusMessage.value = "Connect to the tested network before deleting unavailable configs."
             return
         }
-        val ids = activeCodespaceProfiles.value
+        val accountId = repository.activeSelection.value.accountId
+        val ids = repository.profiles.value
+            .filter { it.accountId == accountId }
             .filter {
                 ProfileHealth.isUnavailableForCleanup(it, networkKey = measurement.networkKey) &&
                     _profileDelayStates.value[it.id]?.testing != true
@@ -1637,6 +1668,9 @@ class G2RayViewModel internal constructor(
             operation = "delete unavailable configs",
             mutation = {
                 checkMeasurementNetwork(measurement)
+                check(repository.activeSelection.value.accountId == accountId) {
+                    "Selected Codespace changed before cleanup; no configs were deleted."
+                }
                 repository.deleteProfiles(ids)
             }
         ) { result ->
@@ -1700,7 +1734,7 @@ class G2RayViewModel internal constructor(
     }
 
     fun optimizeRoutes() {
-        if (!requireSavedData()) return
+        if (!requireStableCommandSettings()) return
         if (!isVpnCoreAvailable.value) {
             _statusMessage.value = XrayCoreManager.MISSING_CORE_MESSAGE
             return
@@ -2135,7 +2169,7 @@ class G2RayViewModel internal constructor(
     }
 
     fun measureProfileDelay(profileId: String) {
-        if (!requireSavedData()) return
+        if (!requireStableCommandSettings()) return
         if (currentDelayProbeJob?.isActive == true || routeOptimizationJob?.isActive == true) {
             _statusMessage.value = "Wait for the current route test to finish."
             return
@@ -2258,7 +2292,7 @@ class G2RayViewModel internal constructor(
     }
 
     fun refreshActiveCodespaceDelays() {
-        if (!requireSavedData()) return
+        if (!requireStableCommandSettings()) return
         if (currentDelayProbeJob?.isActive == true || routeOptimizationJob?.isActive == true) {
             _statusMessage.value = "Wait for the current route test to finish."
             return
@@ -2267,7 +2301,12 @@ class G2RayViewModel internal constructor(
             _statusMessage.value = "Stop VPN before refreshing real delays."
             return
         }
-        val candidates = activeCodespaceProfiles.value
+        // A WhileSubscribed UI cache can still describe the previous account.
+        val candidates = rankedCodespaceProfiles(
+            repository.profiles.value,
+            repository.activeSelection.value.accountId,
+            measurementContext.currentKey()
+        )
         if (candidates.isEmpty()) {
             _statusMessage.value = "No configs are saved for this Codespace."
             return

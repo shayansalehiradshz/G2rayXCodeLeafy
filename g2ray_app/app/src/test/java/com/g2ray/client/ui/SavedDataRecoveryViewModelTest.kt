@@ -15,6 +15,7 @@ import com.g2ray.client.model.RouteState
 import com.g2ray.client.model.TunnelState
 import com.g2ray.client.model.VpnStateRepository
 import com.g2ray.client.model.VpnEngineMode
+import kotlinx.coroutines.flow.MutableStateFlow
 import com.g2ray.client.parser.VlessUriParser
 import com.g2ray.client.vpn.G2RayVpnService
 import com.g2ray.client.vpn.VpnEnginePreferences
@@ -25,6 +26,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.TestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
 import org.junit.Assert.assertEquals
@@ -47,6 +49,71 @@ import java.util.concurrent.atomic.AtomicBoolean
 @RunWith(RobolectricTestRunner::class)
 @Config(application = G2RayApplication::class, sdk = [31])
 class SavedDataRecoveryViewModelTest {
+    @Test
+    fun startUsesStoredSelectionWithoutUiCollectors() {
+        exerciseStartFromStoredSelection(staleUi = false)
+    }
+
+    @Test
+    fun startUsesTheSelectedCodespaceInsteadOfAStaleUiAccountAndProfile() {
+        exerciseStartFromStoredSelection(staleUi = true)
+    }
+
+    @Test
+    fun wakeUsesTheStoredAccountWithoutAUiCollector() {
+        withViewModel(repositoryWithProfile(), InMemorySecureStore()) { viewModel, _ ->
+            assertNull(viewModel.activeAccount.value)
+
+            viewModel.wakeUpCodespace()
+
+            assertEquals("Configure the shared Worker or add a GitHub token for this Codespace.", viewModel.statusMessage.value)
+            assertFalse(viewModel.isWakingUp.value)
+        }
+    }
+
+    @Test
+    fun manualCommandsWaitForAnInFlightAccountSelection() {
+        val backing = InMemorySecureStore()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val blockWrites = AtomicBoolean(false)
+        val store = object : SecureKeyValueStore by backing {
+            override fun putStrings(values: Map<String, String?>) {
+                if (blockWrites.get()) {
+                    entered.countDown()
+                    check(release.await(10, TimeUnit.SECONDS)) { "Fixture account selection did not release" }
+                }
+                backing.putStrings(values)
+            }
+        }
+        val repository = repositoryWithProfile(store)
+        val profileId = repository.activeSelection.value.profileId!!
+        val second = repository.addAccount("Second", "", "second-space")
+        withViewModel(repository, InMemorySecureStore()) { viewModel, _ ->
+            blockWrites.set(true)
+            try {
+                viewModel.selectAccount(second.id)
+                assertTrue(entered.await(5, TimeUnit.SECONDS))
+                val commands = listOf<() -> Unit>(
+                    { viewModel.measureProfileDelay(profileId) },
+                    viewModel::refreshActiveCodespaceDelays,
+                    viewModel::optimizeRoutes,
+                    viewModel::wakeUpCodespace
+                )
+                commands.forEach { command ->
+                    command()
+                    assertTrue(viewModel.statusMessage.value.contains("settings change"))
+                    assertTrue(viewModel.profileDelayStates.value.isEmpty())
+                }
+            } finally {
+                release.countDown()
+                runBlocking {
+                    withTimeout(10_000L) { repository.activeSelection.first { it.accountId == second.id } }
+                }
+            }
+        }
+    }
+
     @Test
     fun unreadableVpnPreferencesDoNotCrashTheViewModelOrWriteDefaults() {
         val application = RuntimeEnvironment.getApplication() as G2RayApplication
@@ -234,8 +301,60 @@ class SavedDataRecoveryViewModelTest {
         }
     }
 
-    private fun repositoryWithProfile(): AccountRepository {
-        val repository = AccountRepository(InMemorySecureStore())
+    private fun exerciseStartFromStoredSelection(staleUi: Boolean) {
+        val repository = repositoryWithProfile()
+        val first = repository.activeSelection.value
+        val dispatcher = UnconfinedTestDispatcher()
+        withViewModel(repository, InMemorySecureStore(), dispatcher) { viewModel, application ->
+            if (staleUi) {
+                runBlocking {
+                    withTimeout(10_000L) { viewModel.activeAccount.first { it?.id == first.accountId } }
+                    withTimeout(10_000L) { viewModel.activeProfile.first { it?.id == first.profileId } }
+                }
+                dispatcher.scheduler.advanceTimeBy(5_001L)
+                dispatcher.scheduler.runCurrent()
+                val second = repository.addAccount("Second", "", "second-space")
+                val profile = VlessUriParser.parseFirstProfile(
+                    "vless://00000000-0000-4000-8000-000000000001@203.0.113.2:443" +
+                        "?encryption=none&security=tls&type=ws&sni=second.example&host=second.example&path=%2Fws"
+                ).getOrThrow()
+                repository.importProfile(second.id, profile.name, profile.rawUri, profile)
+                repository.selectAccount(second.id)
+                assertEquals(first.accountId, viewModel.activeAccount.value?.id)
+                assertEquals(first.profileId, viewModel.activeProfile.value?.id)
+            } else {
+                assertNull(viewModel.activeAccount.value)
+                assertNull(viewModel.activeProfile.value)
+            }
+            val selected = repository.activeSelection.value
+            val expected = repository.profiles.value.single { it.id == selected.profileId }
+            @Suppress("UNCHECKED_CAST")
+            val availability = G2RayViewModel::class.java.getDeclaredField("_isVpnCoreAvailable")
+                .apply { isAccessible = true }.get(viewModel) as MutableStateFlow<Boolean>
+            availability.value = true
+            val context = RecordingServiceContext(application)
+
+            viewModel.startVpn(context)
+
+            assertEquals(G2RayVpnService.ACTION_START, context.startedIntent?.action)
+            assertEquals(selected.accountId, context.startedIntent?.getStringExtra(G2RayVpnService.EXTRA_ACCOUNT_ID))
+            assertEquals(expected.rawUri, context.startedIntent?.getStringExtra(G2RayVpnService.EXTRA_RAW_PROFILE_URI))
+            assertEquals(selected, repository.activeSelection.value)
+        }
+    }
+
+    private class RecordingServiceContext(base: Context) : ContextWrapper(base) {
+        var startedIntent: Intent? = null
+        override fun getApplicationContext(): Context = this
+        override fun startService(service: Intent): ComponentName {
+            startedIntent = service
+            return ComponentName(this, G2RayVpnService::class.java)
+        }
+        override fun startForegroundService(service: Intent): ComponentName = startService(service)
+    }
+
+    private fun repositoryWithProfile(store: SecureKeyValueStore = InMemorySecureStore()): AccountRepository {
+        val repository = AccountRepository(store)
         val account = repository.addAccount("Fixture", "", "fixture-space")
         val profile = VlessUriParser.parseFirstProfile(
             "vless://00000000-0000-4000-8000-000000000001@fixture.example:443" +
@@ -264,6 +383,7 @@ class SavedDataRecoveryViewModelTest {
     private fun withViewModel(
         repository: AccountRepository,
         preferenceStore: SecureKeyValueStore,
+        dispatcher: TestDispatcher = UnconfinedTestDispatcher(),
         body: (G2RayViewModel, G2RayApplication) -> Unit
     ) {
         val application = RuntimeEnvironment.getApplication() as G2RayApplication
@@ -272,7 +392,7 @@ class SavedDataRecoveryViewModelTest {
         val originalConnection = VpnStateRepository.state.value
         VpnStateRepository.state.value = AppConnectionState(RouteState.Unknown, TunnelState.Disconnected, "Fixture")
         val viewModelStore = ViewModelStore()
-        Dispatchers.setMain(UnconfinedTestDispatcher())
+        Dispatchers.setMain(dispatcher)
         try {
             val viewModel = G2RayViewModel(application, { error("Unexpected native route probe") }, VpnEnginePreferences(preferenceStore))
             viewModelStore.put("fixture", viewModel)
