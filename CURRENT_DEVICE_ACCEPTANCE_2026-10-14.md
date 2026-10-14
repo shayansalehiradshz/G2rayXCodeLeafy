@@ -16,9 +16,12 @@ An independent installed-file hash matched this local SHA-256:
 
 `5b43f2bff8c7b413284e0cbdde0b63c2aa261fd5b425bf92b9add0a6aa67660a`.
 
-The phone is the Galaxy A52s, Android 14, arm64, using LTE. No subagents, PIN
-entry, lock-policy change, radio toggle, or live server restart was used in
-this follow-up. Screen wake/sleep keys were used between or within the
+The phone is the Galaxy A52s, Android 14, arm64, using LTE. No subagents,
+lock-policy change, radio toggle, or live server restart was used in this
+follow-up. When the owner later authorized PIN entry, the phone was unlocked
+between completed tests after inspecting the empty, focused PIN field. The
+PIN was not written to project files, scripts, reports, or evidence.
+Screen wake/sleep keys were used between or within the
 specified test intervals. USB-powered screen-off is not unplugged deep Doze.
 Only small HTTPS probes were authorized; every device VPN run explicitly
 used `smallProbesOnly=true` and printed that transfer samples were skipped.
@@ -64,7 +67,7 @@ reopen the VPN activity before the post-idle requests.
 | Auto / HEV / XHTTP | 310,004 ms | 1,104 / 1,093 / 2,249 | Each initially acquired the old connection, then retried on a replacement | 1,075 / 1,192 / 1,062 | 7,031 ms | Passed |
 | Native / Native / XHTTP | 310,006 ms | 733 / 772 / 754 | Each initially acquired the old connection, then retried on a replacement | 761 / 779 / 793 | 4,354 ms | Passed |
 | HEV / HEV / WS | 310,008 ms | 1,801 / 1,815 / 3,644 | Each initially acquired the old connection, then retried on a replacement | 1,803 / 1,903 / 2,088 | 3,395 ms | Passed |
-| Native / Native / WS | Not completed | Not measured | Not measured | Not measured | 8,669 ms in the repeat | Incomplete: screen wake, then ADB loss |
+| Native / Native / WS, final repeat | 310,007 ms | 1,497 / 297 / 295 | First replaced after trying the old connection; other two reused | 1,445 / 1,561 / 1,498 | 3,231 ms | Passed |
 
 The completed runs remained Connected/verified during idle, until the
 test's explicit Stop. The ordinary HTTPS client may transparently replace
@@ -84,9 +87,68 @@ result or post-idle HTTPS was received. It is INCOMPLETE, not passed. The
 record remains at
 `data/verification/device-310-native-ws-repeat-current-20261014.txt`.
 Current-build short-retention, repeated core-failure, and active-VPN
-control-plane follow-ups had not been started when device access was lost.
+control-plane follow-ups had not been started at that loss. Later
+reconnection allowed the completed repeats and recovery results below.
+The third Native/WS five-minute attempt reached a passing terminal result,
+without an idle-period reconnect or reopening the VPN activity. Both earlier
+interrupted attempts remain recorded; the later pass does not erase them.
 
 ## Wake, Ping, and Harness Correctness
+
+After reconnection, the current Native/XHTTP APK also completed a short
+retention comparison with the phone interactive and the VPN activity still
+stopped. After 60,008 ms, all three original HTTP/2 connections were reused;
+complete responses took 296 / 344 / 321 ms, and fresh requests took
+897 / 770 / 706 ms. The unchanged six-second quorum passed with a terminal
+result. Verified startup took 10,250 ms and included an initial route retry;
+that delay is not hidden or described as instant. This sample directly
+matches the original retained-flow failure window, rather than relying only
+on replacement connections after five minutes.
+
+The current HEV/WS APK survived two deliberate phone-local native core
+stops, preserving connected intent and proving complete full-VPN HTTPS after
+each recovery. End-to-end cycle durations were 12,113 / 12,482 ms, including
+failure detection, restoration, and three sequential independent requests.
+The post-recovery HTTPS times were 1,872 / 1,836 / 1,800 ms for cycle one and
+1,735 / 1,772 / 1,837 ms for cycle two. The test reached a passing terminal
+result. This does not imply an existing remote socket survived a core stop.
+
+Native/XHTTP also passed both phone-local core-stop cycles. Complete cycle
+durations were 7,659 / 7,211 ms, including the independent HTTPS checks.
+Post-recovery responses took 684 / 874 / 694 ms and 705 / 709 / 730 ms.
+Its verified startup took 7,300 ms and included an initial route retry.
+
+The current HEV/WS short-retention repeat passed after 60,008 ms, reusing all
+three original connections with 293 / 316 / 303 ms responses; fresh sockets
+took 1,804 / 1,852 / 1,820 ms. The screen was interactive at the beginning
+and noninteractive at the end. This was not a controlled screen-off test.
+The test kept the VPN activity stopped and printed verified startup of
+7,487 ms. These new short runs do not certify always-instant startup.
+
+The normal Home Start VPN ViewModel action also passed on the saved profile
+and engine preference: Auto selected HEV with XHTTP and reached verified
+startup in 4,638 ms. After 60,007 ms of interactive idle, without reopening
+the VPN activity, all three original HTTP/2 connections were reused and
+responded in 314 / 319 / 311 ms. Fresh requests took 1,064 / 1,089 / 950 ms.
+The run reached a passing terminal result and explicitly stopped the VPN.
+This exercises the actual UI action method, not a rendered button click,
+controlled screen-off, or cold-host wake.
+
+The active-VPN direct-GitHub check passed with HEV/XHTTP. The production
+control-plane socket was protected before connecting; the independent
+descriptor regression confirmed that protection before descriptor
+materialization fails and protection after physical-network binding
+succeeds. The selected account returned Ready in 983 ms while the ordinary
+VPN carried complete HTTPS requests. This does not establish Worker
+reachability on the phone's network or a new stopped-host wake result.
+
+An authoritative read-only live follow-up observed source `515b76d`, the
+same engine PID 261, the running process's actual 26.7.28 executable,
+origin TFO off, and local XHTTP HTTP 200. The panel source hash matched
+`3dfc270`; both earlier owned diagnostic core PIDs were absent. The original
+source-sync command's observation handle was lost across a chat-context
+transition, so its terminal result was not inferred from intent. The live
+state was inspected independently instead of restarting that operation.
 
 - The three packaged-core device tests passed: actual ABI loading, the
   generated DNS/TUN contract, and a real multi-outbound native start/stop.
@@ -129,9 +191,20 @@ inspected through Android's DropBox. Both were AndroidJUnitRunner
 `UiAutomation.disconnect` / `DeadObjectException` teardown failures on ADB
 loss, not an ordinary browsing-session stack. Older records included the
 previously fixed main-thread TLS pool eviction. The current source queues
-that eviction on its IO maintenance scope. The completed follow-up runs
-reached terminal results, but the final ADB loss prevents a complete new
-exit-record inspection or an absence-of-crashes certification.
+that eviction on its IO maintenance scope. On reconnection, the new
+14:43:14 phone crash record was inspected: it has
+the same AndroidJUnitRunner `UiAutomation.disconnect` /
+`DeadObjectException` teardown stack after ADB loss. No ordinary application
+stack or native-engine crash is established by that entry. This distinction
+does not convert the interrupted instrumentation run into a pass.
+
+After the final UI-start and active-VPN checks, a fresh Android process
+exit-info inspection found seven subsequent exits, all attributed to
+`finished inst`, with no newer crash, native-crash, or ANR exit. The installed
+base APK hash was independently checked again and still matched the hash
+above. No instrumentation or VPN service remained running after explicit
+test cleanup. These bounded observations are not a crash-free guarantee
+for untested long browsing sessions or all devices.
 
 Unchanged server/Worker source passed 197 behavior checks, 66 static checks,
 65 Worker checks, Worker syntax/packaging dry-run, and all six deterministic
