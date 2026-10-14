@@ -27,6 +27,7 @@ import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.CancellationException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -47,6 +48,117 @@ import org.json.JSONObject
     G2RayVpnServiceStartupTest.EndpointResolverShadow::class
 ])
 class G2RayVpnServiceStartupTest {
+    @Test
+    fun nativeStartupConfirmsThePacketPathWithoutRestartingHealthyCore() = runTest {
+        withRejectedConfigService(runningRouteProbe = RunningRouteProbe { RunningRouteResult(true) }) { service, tun, bridge ->
+            bridge.rejectedAddresses = emptySet()
+            var probes = 0
+            setField(service, "fullVpnDataPathProbe", object : VpnDataPathProbe {
+                override suspend fun probe(): RunningRouteResult {
+                    probes++
+                    return if (probes == 1) RunningRouteResult(false, "initial TLS timeout") else RunningRouteResult(true)
+                }
+            })
+
+            val result = invokeRoute(service, "startEngineAndVerify", profile(), tun, ActiveVpnEngine.XrayNative, 0L)
+
+            assertTrue(result.success)
+            assertEquals(2, probes)
+            assertEquals(1, bridge.starts)
+            assertTrue(bridge.running)
+        }
+    }
+
+    @Test
+    fun nativeStartupConfirmationStillRejectsABrokenPacketPath() = runTest {
+        withRejectedConfigService(runningRouteProbe = RunningRouteProbe { RunningRouteResult(true) }) { service, tun, bridge ->
+            bridge.rejectedAddresses = emptySet()
+            var probes = 0
+            setField(service, "fullVpnDataPathProbe", object : VpnDataPathProbe {
+                override suspend fun probe(): RunningRouteResult {
+                    probes++
+                    return RunningRouteResult(false, "packet path still unavailable")
+                }
+            })
+
+            val result = invokeRoute(service, "startEngineAndVerify", profile(), tun, ActiveVpnEngine.XrayNative, 0L)
+
+            assertFalse(result.success)
+            assertEquals(RouteFailureScope.PacketEngine, result.failureScope)
+            assertEquals(2, probes)
+            assertEquals(1, bridge.starts)
+        }
+    }
+
+    @Test
+    fun nativeStartupConfirmationCannotAcceptAnObsoleteNetworkResult() = runTest {
+        withRejectedConfigService(runningRouteProbe = RunningRouteProbe { RunningRouteResult(true) }) { service, tun, bridge ->
+            bridge.rejectedAddresses = emptySet()
+            var probes = 0
+            setField(service, "fullVpnDataPathProbe", object : VpnDataPathProbe {
+                override suspend fun probe(): RunningRouteResult {
+                    probes++
+                    if (probes == 1) return RunningRouteResult(false, "initial TLS timeout")
+                    val generation = G2RayVpnService::class.java.getDeclaredField("underlyingNetworkGeneration")
+                        .apply { isAccessible = true }.get(service) as java.util.concurrent.atomic.AtomicLong
+                    generation.incrementAndGet()
+                    return RunningRouteResult(true)
+                }
+            })
+
+            val result = invokeRoute(service, "startEngineAndVerify", profile(), tun, ActiveVpnEngine.XrayNative, 0L)
+
+            assertFalse(result.success)
+            assertEquals(RouteFailureScope.DialerBinding, result.failureScope)
+            assertEquals(2, probes)
+        }
+    }
+
+    @Test
+    fun nativeStartupConfirmationCannotAcceptAStoppedTunnel() = runTest {
+        withRejectedConfigService(runningRouteProbe = RunningRouteProbe { RunningRouteResult(true) }) { service, tun, bridge ->
+            bridge.rejectedAddresses = emptySet()
+            var probes = 0
+            setField(service, "fullVpnDataPathProbe", object : VpnDataPathProbe {
+                override suspend fun probe(): RunningRouteResult {
+                    probes++
+                    if (probes == 1) return RunningRouteResult(false, "initial TLS timeout")
+                    setField(service, "vpnInterface", null)
+                    return RunningRouteResult(true)
+                }
+            })
+
+            val result = invokeRoute(service, "startEngineAndVerify", profile(), tun, ActiveVpnEngine.XrayNative, 0L)
+
+            assertFalse(result.success)
+            assertEquals(RouteFailureScope.DialerBinding, result.failureScope)
+            assertEquals(2, probes)
+        }
+    }
+
+    @Test
+    fun nativeStartupConfirmationPropagatesCancellationWithoutRestarting() = runTest {
+        withRejectedConfigService(runningRouteProbe = RunningRouteProbe { RunningRouteResult(true) }) { service, tun, bridge ->
+            bridge.rejectedAddresses = emptySet()
+            var probes = 0
+            setField(service, "fullVpnDataPathProbe", object : VpnDataPathProbe {
+                override suspend fun probe(): RunningRouteResult {
+                    probes++
+                    if (probes == 1) return RunningRouteResult(false, "initial TLS timeout")
+                    throw CancellationException("Fixture startup cancelled")
+                }
+            })
+
+            val error = runCatching {
+                invokeRoute(service, "startEngineAndVerify", profile(), tun, ActiveVpnEngine.XrayNative, 0L)
+            }.exceptionOrNull()
+
+            assertTrue(error is CancellationException)
+            assertEquals(2, probes)
+            assertEquals(1, bridge.starts)
+        }
+    }
+
     @Test
     fun lifecycleChangedDuringEndpointDnsNeverStartsTheCore() = runTest {
         withRejectedConfigService { service, tun, bridge ->
@@ -211,13 +323,14 @@ class G2RayVpnServiceStartupTest {
     }
 
     private suspend fun TestScope.withRejectedConfigService(
+        runningRouteProbe: RunningRouteProbe = RunningRouteProbe { error("A rejected config must not probe the network") },
         block: suspend (G2RayVpnService, ParcelFileDescriptor, RejectingBridge) -> Unit
     ) {
         val service = Robolectric.buildService(G2RayVpnService::class.java).create().get()
         val pipe = ParcelFileDescriptor.createPipe()
         val bridge = RejectingBridge()
         val core = XrayCoreManager(
-            bridge, RunningRouteProbe { error("A rejected config must not probe the network") },
+            bridge, runningRouteProbe,
             portAllocator = { 19090 },
             localSocksListenerProbe = LocalSocksListenerProbe { true }
         )

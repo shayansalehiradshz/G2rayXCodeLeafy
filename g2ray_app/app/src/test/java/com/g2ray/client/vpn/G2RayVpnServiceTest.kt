@@ -291,6 +291,18 @@ class G2RayVpnServiceTest {
     }
 
     @Test
+    fun nativeStartupConfirmationIsLimitedToARetryablePacketPathDiagnosis() {
+        val packetFailure = RunningRouteResult(false, "packet path unavailable", failureScope = RouteFailureScope.PacketEngine)
+        assertTrue(G2RayVpnService.shouldConfirmNativeStartupPacketFailure(ActiveVpnEngine.XrayNative, packetFailure))
+        assertFalse(G2RayVpnService.shouldConfirmNativeStartupPacketFailure(ActiveVpnEngine.Hev, packetFailure))
+        assertFalse(G2RayVpnService.shouldConfirmNativeStartupPacketFailure(ActiveVpnEngine.XrayNative, packetFailure.copy(retryAllowed = false)))
+        assertFalse(G2RayVpnService.shouldConfirmNativeStartupPacketFailure(ActiveVpnEngine.XrayNative, RunningRouteResult(true)))
+        listOf(RouteFailureScope.Configuration, RouteFailureScope.DialerBinding, RouteFailureScope.XrayRoute, RouteFailureScope.Unknown).forEach { scope ->
+            assertFalse(G2RayVpnService.shouldConfirmNativeStartupPacketFailure(ActiveVpnEngine.XrayNative, packetFailure.copy(failureScope = scope)))
+        }
+    }
+
+    @Test
     fun transitionFailuresAreConfirmedBeforeDisruptiveRecovery() {
         assertTrue(
             G2RayVpnService.shouldConfirmTransitionRouteFailure(

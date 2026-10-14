@@ -4,8 +4,14 @@ import android.content.Context
 import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.net.TrafficStats
+import android.net.Uri
 import android.net.VpnService
+import android.media.MediaMetadata
+import android.media.session.MediaSessionManager
+import android.media.session.PlaybackState
 import android.os.Bundle
+import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import android.os.SystemClock
@@ -36,6 +42,9 @@ import com.g2ray.client.network.GitHubCodespaceCoordinator
 import com.g2ray.client.network.GitHubNetwork
 import com.g2ray.client.network.WorkerNetwork
 import com.g2ray.client.network.WorkerRouteCoordinator
+import java.io.ByteArrayInputStream
+import java.io.IOException
+import java.io.InputStream
 import java.net.Proxy
 import java.net.Socket
 import java.util.concurrent.TimeUnit
@@ -239,6 +248,44 @@ class LiveVpnDeviceTest {
     fun selectedProfileStartsWithSmallProbes() = runLiveTest(startupOnly = true)
 
     @Test
+    fun selectedProfileCarriesBoundedTransferSamples() {
+        assumeTrue("Larger transfers require -e liveTransfers true",
+            InstrumentationRegistry.getArguments().getString("liveTransfers") == "true")
+        runLiveTest(transferOnly = true)
+    }
+
+    @Test
+    fun selectedProfilePlaysBoundedYoutubeSample() {
+        assumeTrue("Third-party video tests require -e liveVideo true",
+            InstrumentationRegistry.getArguments().getString("liveVideo") == "true")
+        runLiveTest(videoOnly = true)
+    }
+
+    @Test
+    fun transferReaderRejectsTruncatedAndOversizedBodies() {
+        assertEquals(4, readTransferBody(ByteArrayInputStream(ByteArray(4)), 4))
+        assertThrows(IOException::class.java) { readTransferBody(ByteArrayInputStream(ByteArray(3)), 4) }
+        val oversized = ByteArrayInputStream(ByteArray(100))
+        assertThrows(IOException::class.java) { readTransferBody(oversized, 4) }
+        assertEquals("Oversized responses must stop after one extra byte", 95, oversized.available())
+    }
+
+    @Test
+    fun youtubeObservationNeverCreditsAnUnobservedGapOrAStoppedPlayer() {
+        val observation = PlayingObservation()
+        observation.record(0L, true)
+        observation.record(100L, true)
+        assertEquals(100L, observation.observedMs)
+        observation.record(10_000L, true)
+        assertEquals("A suspended observer cannot certify uninterrupted playback", 100L, observation.observedMs)
+        observation.record(10_100L, false)
+        observation.record(10_200L, true)
+        assertEquals("A stopped interval cannot count as playing", 100L, observation.observedMs)
+        observation.record(10_300L, true)
+        assertEquals(200L, observation.observedMs)
+    }
+
+    @Test
     fun selectedProfileRecoversAfterRepeatedCoreFailures() {
         assumeTrue(
             "Core failure injection requires -e liveCoreRecovery true",
@@ -258,10 +305,14 @@ class LiveVpnDeviceTest {
         coreFailureCycles: Int = 0,
         uiStart: Boolean = false,
         controlPlaneCheck: Boolean = false,
-        startupOnly: Boolean = false
+        startupOnly: Boolean = false,
+        transferOnly: Boolean = false,
+        videoOnly: Boolean = false
     ) = runBlocking {
         val args = InstrumentationRegistry.getArguments()
         assumeTrue("Live network tests require -e liveVpn true", args.getString("liveVpn") == "true")
+        val mobileRxBefore = TrafficStats.getMobileRxBytes()
+        val mobileTxBefore = TrafficStats.getMobileTxBytes()
         val context = ApplicationProvider.getApplicationContext<G2RayApplication>()
         assertTrue("Grant VPN permission in the app before this test", VpnService.prepare(context) == null)
         val repository = context.accountRepository
@@ -291,6 +342,10 @@ class LiveVpnDeviceTest {
         val resumeVpnActivity = args.getString("resumeVpnActivity") != "false"
         val smallProbesOnly = args.getString("smallProbesOnly") == "true"
         require(!startupOnly || smallProbesOnly) { "Startup timing tests require -e smallProbesOnly true" }
+        require(!transferOnly || !smallProbesOnly) { "Transfer tests cannot run with smallProbesOnly=true" }
+        require(!videoOnly || smallProbesOnly) { "Video tests require smallProbesOnly=true to reserve their budget" }
+        val downloadBytes = if (transferOnly) BOUNDED_DOWNLOAD_BYTES else DOWNLOAD_BYTES
+        val uploadBytes = if (transferOnly) BOUNDED_UPLOAD_BYTES else UPLOAD_BYTES
         val screenOff = args.getString("screenOff") == "true"
         require(!screenOff || !resumeVpnActivity) {
             "Controlled screen-off tests require -e resumeVpnActivity false"
@@ -362,10 +417,10 @@ class LiveVpnDeviceTest {
             if (smallProbesOnly) {
                 report("transfer_sample_skipped=true small_probes_only=true")
             } else {
-                transferSample(client)
+                transferSample(client, downloadBytes, uploadBytes)
             }
             if (expectedEngine == ActiveVpnEngine.Hev) {
-                val minimumRxBytes = if (smallProbesOnly) 1L else DOWNLOAD_BYTES.toLong()
+                val minimumRxBytes = if (smallProbesOnly) 1L else downloadBytes.toLong()
                 val counters = withTimeout(15_000L) {
                     VpnStateRepository.state.first {
                         it.tunnelTrafficSource == TunnelTrafficSource.HevTun && it.totalRxBytes >= minimumRxBytes
@@ -379,6 +434,16 @@ class LiveVpnDeviceTest {
 
             if (startupOnly) {
                 report("startup_only_acceptance=true")
+                return@runBlocking
+            }
+            if (transferOnly) {
+                assertResponsiveQuorum(probeHttpsQuorum(client, "after_transfer"), "after_transfer")
+                report("bounded_transfer_acceptance=true payload_budget_bytes=${downloadBytes + uploadBytes}")
+                return@runBlocking
+            }
+            if (videoOnly) {
+                playBoundedYoutubeSample(context)
+                assertResponsiveQuorum(probeHttpsQuorum(client, "after_video"), "after_video")
                 return@runBlocking
             }
             if (controlPlaneCheck) {
@@ -455,6 +520,15 @@ class LiveVpnDeviceTest {
                     client.dispatcher.cancelAll()
                     client.connectionPool.evictAll()
                     client.dispatcher.executorService.shutdown()
+                    val mobileRxAfter = TrafficStats.getMobileRxBytes()
+                    val mobileTxAfter = TrafficStats.getMobileTxBytes()
+                    if (mobileRxBefore >= 0L && mobileTxBefore >= 0L &&
+                        mobileRxAfter >= mobileRxBefore && mobileTxAfter >= mobileTxBefore) {
+                        report("event=mobile_budget_delta rx_bytes=${mobileRxAfter - mobileRxBefore} " +
+                            "tx_bytes=${mobileTxAfter - mobileTxBefore} includes_other_apps=true")
+                    } else {
+                        report("event=mobile_budget_delta unavailable=true")
+                    }
                 }
             }
         }
@@ -584,27 +658,152 @@ class LiveVpnDeviceTest {
         )
     }
 
-    private fun transferSample(client: OkHttpClient) {
+    private fun transferSample(client: OkHttpClient, downloadBytes: Int, uploadBytes: Int) {
+        // A failed transfer must not silently consume another copy of the budget.
+        val transferClient = client.newBuilder().retryOnConnectionFailure(false)
+            .followRedirects(false).followSslRedirects(false).build()
         val nonce = SystemClock.elapsedRealtimeNanos()
         val started = SystemClock.elapsedRealtime()
-        client.newCall(Request.Builder()
-            .url("https://speed.cloudflare.com/__down?bytes=$DOWNLOAD_BYTES&nonce=$nonce")
+        transferClient.newCall(Request.Builder()
+            .url("https://speed.cloudflare.com/__down?bytes=$downloadBytes&nonce=$nonce")
             .header("Accept-Encoding", "identity")
             .header("Cache-Control", "no-store")
             .build()).execute().use { response ->
                 assertEquals("Download endpoint rejected the transfer", 200, response.code)
-                assertEquals("Download body was truncated", DOWNLOAD_BYTES, response.body?.bytes()?.size ?: 0)
+                val body = response.body ?: throw IOException("Download response has no body")
+                body.byteStream().use { readTransferBody(it, downloadBytes) }
             }
-        report("download_bytes=$DOWNLOAD_BYTES elapsed_ms=${SystemClock.elapsedRealtime() - started}")
+        report("download_bytes=$downloadBytes elapsed_ms=${SystemClock.elapsedRealtime() - started}")
         val uploadStarted = SystemClock.elapsedRealtime()
-        val payload = ByteArray(UPLOAD_BYTES) { (it and 0xff).toByte() }
-        client.newCall(Request.Builder()
+        val payload = ByteArray(uploadBytes) { (it and 0xff).toByte() }
+        transferClient.newCall(Request.Builder()
             .url("https://speed.cloudflare.com/__up?nonce=$nonce")
             .post(payload.toRequestBody("application/octet-stream".toMediaType()))
             .build()).execute().use { response ->
                 assertTrue("Upload endpoint rejected the transfer: HTTP ${response.code}", response.isSuccessful)
             }
-        report("upload_bytes=$UPLOAD_BYTES elapsed_ms=${SystemClock.elapsedRealtime() - uploadStarted}")
+        report("upload_bytes=$uploadBytes elapsed_ms=${SystemClock.elapsedRealtime() - uploadStarted}")
+    }
+
+    private fun readTransferBody(input: InputStream, expectedBytes: Int): Int {
+        require(expectedBytes > 0)
+        var total = 0
+        val buffer = ByteArray(8 * 1024)
+        while (true) {
+            val count = input.read(buffer, 0, minOf(buffer.size, expectedBytes - total + 1))
+            if (count == -1) break
+            total += count
+            if (total > expectedBytes) throw IOException("Download response exceeded the byte budget")
+        }
+        if (total != expectedBytes) throw IOException("Download response was truncated: $total/$expectedBytes bytes")
+        return total
+    }
+
+    private suspend fun playBoundedYoutubeSample(context: Context) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            error("Budgeted third-party playback requires Android 10 or newer")
+        }
+        val args = InstrumentationRegistry.getArguments()
+        val uri = Uri.parse(requireNotNull(args.getString("videoUrl")) { "Pass an explicit public YouTube videoUrl" })
+        require(uri.scheme == "https" && uri.host == "www.youtube.com" && uri.path == "/watch" &&
+            !uri.getQueryParameter("v").isNullOrBlank()) { "videoUrl must be a public HTTPS YouTube watch URL" }
+        val expectedTitle = requireNotNull(args.getString("videoTitle")) { "Pass the public video's expected title" }
+        require(expectedTitle.isNotBlank())
+        val power = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+        assertTrue("Unlock the phone before third-party playback", power.isInteractive &&
+            !(context.getSystemService(Context.KEYGUARD_SERVICE) as android.app.KeyguardManager).isKeyguardLocked)
+        fun mobileBytes(): Long {
+            val rx = TrafficStats.getMobileRxBytes()
+            val tx = TrafficStats.getMobileTxBytes()
+            check(rx >= 0L && tx >= 0L) { "Mobile counters are unavailable; refuse unbudgeted video" }
+            return rx + tx
+        }
+        val initialBytes = mobileBytes()
+        val started = SystemClock.elapsedRealtime()
+        val manager = context.getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
+        val automation = InstrumentationRegistry.getInstrumentation().uiAutomation
+        automation.adoptShellPermissionIdentity(android.Manifest.permission.MEDIA_CONTENT_CONTROL)
+        var controller: android.media.session.MediaController? = null
+        var firstPlayingAt: Long? = null
+        var initialPosition: Long? = null
+        var maximumPosition = 0L
+        val playingObservation = PlayingObservation()
+        var bufferingTransitions = 0
+        var previousState: Int? = null
+        var budgetReached = false
+        try {
+            context.startActivity(Intent(Intent.ACTION_VIEW, uri).setPackage("com.google.android.youtube")
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            while (SystemClock.elapsedRealtime() - started < 60_000L) {
+                val elapsed = SystemClock.elapsedRealtime() - started
+                val used = mobileBytes() - initialBytes
+                check(used >= 0L) { "Mobile counters reset during video; stop rather than guess the budget" }
+                if (used >= VIDEO_MOBILE_BUDGET_BYTES) {
+                    budgetReached = true
+                    break
+                }
+                controller = manager.getActiveSessions(null).firstOrNull { it.packageName == "com.google.android.youtube" }
+                    ?: controller
+                val metadata = controller?.metadata
+                val titleMatches = metadata?.getString(MediaMetadata.METADATA_KEY_TITLE)
+                    ?.contains(expectedTitle, ignoreCase = true) == true
+                val playback = controller?.playbackState
+                val state = playback?.state
+                val playingLocally = titleMatches && state == PlaybackState.STATE_PLAYING &&
+                    controller?.playbackInfo?.playbackType == android.media.session.MediaController.PlaybackInfo.PLAYBACK_TYPE_LOCAL
+                playingObservation.record(elapsed, playingLocally)
+                if (playingLocally) {
+                    if (firstPlayingAt == null) {
+                        firstPlayingAt = elapsed
+                        initialPosition = playback?.position
+                        report("event=youtube_first_play elapsed_ms=$elapsed")
+                    }
+                    maximumPosition = maxOf(maximumPosition, playback?.position ?: 0L)
+                }
+                if (firstPlayingAt != null && state == PlaybackState.STATE_BUFFERING && previousState != state) {
+                    bufferingTransitions++
+                }
+                if (state != previousState) report("event=youtube_state state=$state title_matches=$titleMatches elapsed_ms=$elapsed")
+                previousState = state
+                delay(100L)
+            }
+        } finally {
+            try {
+                controller?.transportControls?.pause()
+                // Stop only the explicitly launched video app, so it cannot
+                // continue prefetching after the test or its budget guard ends.
+                ParcelFileDescriptor.AutoCloseInputStream(automation.executeShellCommand(
+                    "am force-stop com.google.android.youtube"
+                )).use { output -> while (output.read() != -1) { /* Drain shell completion. */ } }
+            } finally {
+                automation.dropShellPermissionIdentity()
+            }
+            val usedBytes = runCatching { mobileBytes() - initialBytes }.getOrNull()
+            report("event=youtube_sample elapsed_ms=${SystemClock.elapsedRealtime() - started} " +
+                "mobile_bytes=$usedBytes budget_reached=$budgetReached " +
+                "reported_position_delta_ms=${maximumPosition - (initialPosition ?: maximumPosition)} " +
+                "observed_playing_ms=${playingObservation.observedMs} " +
+                "buffering_transitions=$bufferingTransitions")
+        }
+        assertNotNull("The requested video never reported active playback", firstPlayingAt)
+        assertTrue("The requested video did not report local Playing state for 15 observed seconds",
+            playingObservation.observedMs >= 15_000L)
+        assertTrue("YouTube reported rebuffering during the bounded sample", bufferingTransitions == 0)
+        report("bounded_youtube_acceptance=true")
+    }
+
+    private class PlayingObservation {
+        var observedMs = 0L
+            private set
+        private var previousPlayingAt: Long? = null
+
+        fun record(elapsedMs: Long, playing: Boolean) {
+            // A MediaSession position is an update-time snapshot, not a frame
+            // counter. Count only adjacent observations of local Playing state.
+            val gap = previousPlayingAt?.let { elapsedMs - it }
+            if (playing && gap != null && gap in 1L..1_500L) observedMs += gap
+            previousPlayingAt = elapsedMs.takeIf { playing }
+        }
     }
 
     private fun report(message: String) {
@@ -632,6 +831,9 @@ class LiveVpnDeviceTest {
     private companion object {
         const val DOWNLOAD_BYTES = 2 * 1024 * 1024
         const val UPLOAD_BYTES = 64 * 1024
+        const val BOUNDED_DOWNLOAD_BYTES = 8 * 1024 * 1024
+        const val BOUNDED_UPLOAD_BYTES = 2 * 1024 * 1024
+        const val VIDEO_MOBILE_BUDGET_BYTES = 12 * 1024 * 1024L
         // A generous regression ceiling, not a promise of instant browsing.
         const val RESPONSIVE_ENDPOINT_LIMIT_MS = 6_000L
     }

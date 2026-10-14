@@ -488,6 +488,49 @@ Restore the previous value afterwards; for an originally empty value use
 evidence: require actual per-request records or the no-network packaged
 factory regression `debugDataPathClientAttachesPerRequestTimingWithoutNetworkAccess`.
 
+## Bounded full-device transfers
+
+Obtain a data budget first. With a selected working profile and VPN permission,
+run this opt-in check once per intended engine/transport combination:
+
+```bash
+adb shell am instrument -w -r -e liveVpn true -e liveTransfers true -e engine xray_native -e transport xhttp -e class com.g2ray.client.vpn.LiveVpnDeviceTest#selectedProfileCarriesBoundedTransferSamples com.g2ray.client.test/androidx.test.runner.AndroidJUnitRunner
+```
+
+Each invocation requests exactly 8 MiB down and 2 MiB up through Android's
+default VPN, plus small independent HTTPS checks before/after. It stops rather
+than automatically retrying or following a redirect. The body reader rejects
+truncation and stops on an oversized response; its packaged no-network
+regression is `transferReaderRejectsTruncatedAndOversizedBodies`. A failed
+invocation still consumes data and must count toward the budget. Preserve
+considerable headroom for TLS/tunnel framing, retransmissions, DNS, health
+checks, and other phone applications; payload bytes are not carrier billing.
+
+Require a terminal result, exact byte counts, actual engine/default-VPN proof,
+and post-transfer HTTPS responsiveness. Compute the whole-request sample rate
+as `bytes * 8 / elapsed_ms / 1000` Mbps. It includes request setup and is not a
+long-duration throughput ceiling. These checks do not establish actual YouTube
+buffering, Instagram feed behavior, packet loss, or superiority to another
+client. Test those separately within the remaining budget.
+
+An Android 10+ opt-in YouTube observation is available with `liveVideo=true`,
+`smallProbesOnly=true`, and an explicit public `videoUrl`/`videoTitle`, using
+`selectedProfilePlaysBoundedYoutubeSample`. Unlock the phone first. It observes
+the real YouTube app's matching local media session for at most 60 seconds,
+stops at a 12 MiB device-mobile-counter threshold, and force-stops only the
+launched YouTube app during cleanup to end prefetching. Shell media-session
+permission is temporary and dropped afterwards. The counter includes other
+applications, may be cached, and can overshoot while the player is stopping;
+reserve substantial extra budget. It refuses unavailable/reset counters.
+
+Acceptance requires at least 15 seconds of adjacent observations of local
+Playing state and no reported post-start buffering transition. Media-session
+position snapshots and any unobserved time gaps do not establish decoded
+frames or uninterrupted playback. A budget-limited run that cannot complete
+the observation is not a pass. No video resolution, app settings, account
+data, or lock policy is changed. Repeat controlled visual/video acceptance
+separately before claiming smooth high-resolution or long-session playback.
+
 ## v2rayNG A/B comparison
 
 For each client, run three alternating 15-minute rounds with the same config and physical network. Record median and p95 for:

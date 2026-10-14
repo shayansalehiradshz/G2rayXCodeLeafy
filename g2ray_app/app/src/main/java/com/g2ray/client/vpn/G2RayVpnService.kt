@@ -312,6 +312,12 @@ class G2RayVpnService : VpnService() {
             return !result.success && !shouldRecoverImmediatelyForLocalSocksFailure(result.error)
         }
 
+        internal fun shouldConfirmNativeStartupPacketFailure(
+            engine: ActiveVpnEngine,
+            result: RunningRouteResult
+        ): Boolean = engine == ActiveVpnEngine.XrayNative && !result.success && result.retryAllowed &&
+            result.failureScope == RouteFailureScope.PacketEngine
+
         internal fun shouldConfirmActiveStallFailure(
             reason: RouteReverifyReason,
             result: RunningRouteResult
@@ -1843,11 +1849,34 @@ class G2RayVpnService : VpnService() {
         val socksDiagnosisStartedAt = SystemClock.elapsedRealtime()
         val xrayRoute = core.verifyRunningRoute()
         logStartupPhase("socks_diagnosis", engine, socksDiagnosisStartedAt, xrayRoute.success)
-        val diagnosed = classifyVpnRouteHealth(
+        var diagnosed = classifyVpnRouteHealth(
             fullPath = fullPath,
             xrayRoute = xrayRoute,
             dialerFailure = SocketProtector.consumeDialerFailure()
         )
+        if (
+            shouldConfirmNativeStartupPacketFailure(engine, diagnosed) &&
+            isTunnelCurrent(lifecycleToken, tun) && core.state.value == TunnelCoreState.Connected &&
+            resolutionNetworkGeneration == underlyingNetworkGeneration.get()
+        ) {
+            // A newly usable SOCKS path can outlive the first TUN/TLS timeout.
+            // Require one fresh full-device proof before replacing this core.
+            val confirmationStartedAt = SystemClock.elapsedRealtime()
+            fullVpnDataPathProbe.reset()
+            currentCoroutineContext().ensureActive()
+            if (!isTunnelCurrent(lifecycleToken, tun) || resolutionNetworkGeneration != underlyingNetworkGeneration.get()) {
+                return RunningRouteResult(false, "VPN lifecycle or physical network changed during startup confirmation",
+                    failureScope = RouteFailureScope.DialerBinding)
+            }
+            val confirmed = fullVpnDataPathProbe.probe()
+            logStartupPhase("startup_packet_confirm", engine, confirmationStartedAt, confirmed.success)
+            currentCoroutineContext().ensureActive()
+            if (!isTunnelCurrent(lifecycleToken, tun) || resolutionNetworkGeneration != underlyingNetworkGeneration.get()) {
+                return RunningRouteResult(false, "VPN lifecycle or physical network changed during startup confirmation",
+                    failureScope = RouteFailureScope.DialerBinding)
+            }
+            diagnosed = classifyVpnRouteHealth(confirmed, xrayRoute, SocketProtector.consumeDialerFailure())
+        }
         if (!diagnosed.success && diagnosed.failureScope == RouteFailureScope.PacketEngine && engine == ActiveVpnEngine.Hev) {
             stopActivePacketEngine()
         }
