@@ -3,10 +3,10 @@
 import json
 from pathlib import Path
 import unittest
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from xray_authenticated_transport_check import outbound
-from xray_isolated_server_pair_check import allow_owned_origins, prepare_bundle, prepare_server
+from xray_isolated_server_pair_check import allow_owned_origins, prepare_bundle, prepare_server, validate
 
 
 IDENTIFIER = "00000000-0000-4000-8000-000000000001"
@@ -28,18 +28,42 @@ def template():
     }
 
 
-def bundle():
+def bundle(ws_path="/ws"):
     return {"schema_version": 2, "configs": [
         f"vless://{IDENTIFIER}@fixture.example:443?" + urlencode({
             "security": "tls", "sni": "validation.example", "host": "validation.example", "type": transport,
             "fp": "chrome", "alpn": "h2" if transport == "xhttp" else "http/1.1",
-            "path": "/" if transport == "xhttp" else "/ws", "mode": "packet-up",
+            "path": "/" if transport == "xhttp" else ws_path, "mode": "packet-up",
             **({"extra": '{"scMaxEachPostBytes":60000,"xmux":{"hKeepAlivePeriod":20}}'} if transport == "xhttp" else {})
         }) for transport in ("xhttp", "ws")
     ]}
 
 
 class IsolatedServerPairTest(unittest.TestCase):
+    def test_ws_early_data_is_opt_in_bounded_and_changes_only_the_copied_ws_path(self):
+        source = bundle(ws_path="/ws?ed=1&token=a%2Bb&blank=")
+        ports = {"xhttp": 12345, "ws": 12346}
+        baseline = prepare_bundle(source, ports, template())
+        experiment = prepare_bundle(source, ports, template(), ws_early_data_bytes=2560)
+        self.assertEqual("/ws?ed=1&token=a%2Bb&blank=", outbound(baseline["configs"][1])["streamSettings"]["wsSettings"]["path"])
+        self.assertEqual(baseline["configs"][0], experiment["configs"][0])
+        old, new = outbound(baseline["configs"][1]), outbound(experiment["configs"][1])
+        path = new["streamSettings"]["wsSettings"]["path"]
+        self.assertEqual("/ws", urlsplit(path).path)
+        self.assertEqual({"ed": ["2560"], "token": ["a+b"], "blank": [""]},
+                         parse_qs(urlsplit(path).query, keep_blank_values=True))
+        old["streamSettings"]["wsSettings"]["path"] = path
+        self.assertEqual(old, new)
+        self.assertIn("ed=1", outbound(source["configs"][1])["streamSettings"]["wsSettings"]["path"])
+        for invalid in (0, -1, 4097, True, "2560"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                prepare_bundle(source, ports, template(), ws_early_data_bytes=invalid)
+
+    def test_ws_early_data_cannot_be_reported_for_an_xhttp_only_experiment(self):
+        with self.assertRaisesRegex(ValueError, "requires the WS transport"):
+            validate(Path("unused-core"), Path("unused-helper"), Path("unused-panel"), "low_latency",
+                     ("xhttp",), 0, loopback_baseline=True, ws_early_data_bytes=2560)
+
     def test_only_owned_listeners_and_tls_are_changed(self):
         original = template()
         result = prepare_server(original, {"xhttp": 12345, "ws": 12346}, Path("ca.pem"), Path("key.pem"))

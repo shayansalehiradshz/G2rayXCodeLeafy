@@ -19,6 +19,16 @@ def link(transport="xhttp", **overrides):
 
 
 class AuthenticatedTransportCheckTest(unittest.TestCase):
+    def test_ws_early_data_preserves_nested_path_query_and_tls_identity(self):
+        path = "/ws?ed=2560&token=a%2Bb"
+        stream = outbound(link(transport="ws", path=path))["streamSettings"]
+        self.assertEqual(path, stream["wsSettings"]["path"])
+        self.assertEqual("validation.example", stream["wsSettings"]["headers"]["Host"])
+        self.assertEqual("validation.example", stream["tlsSettings"]["serverName"])
+        self.assertFalse(stream["tlsSettings"].get("allowInsecure", False))
+        self.assertNotIn("maxEarlyData", stream["wsSettings"])
+        self.assertNotIn("earlyDataHeaderName", stream["wsSettings"])
+
     def test_preserves_extra_fragment_and_unsafe_cipher_settings(self):
         mask = {"tcp": [{"type": "fragment", "settings": {"packets": "tlshello"}}]}
         extra = {"scMaxEachPostBytes": 60000, "xmux": {"hKeepAlivePeriod": 20}}

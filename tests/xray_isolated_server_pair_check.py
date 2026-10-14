@@ -9,7 +9,7 @@ from pathlib import Path
 import socket
 import subprocess
 import tempfile
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from xray_authenticated_transport_check import outbound, running_core, validate as validate_client
 
@@ -46,7 +46,11 @@ def prepare_server(template, ports, certificate, key):
     return server
 
 
-def prepare_bundle(template, ports, server):
+def prepare_bundle(template, ports, server, ws_early_data_bytes=None):
+    if ws_early_data_bytes is not None and (
+        type(ws_early_data_bytes) is not int or not 1 <= ws_early_data_bytes <= 4096
+    ):
+        raise ValueError("Fixture WS early data must be from 1 to 4096 bytes")
     if template.get("schema_version") != 2 or not isinstance(template.get("configs"), list):
         raise ValueError("Use a generated schema-2 fixture bundle")
     bundle = copy.deepcopy(template)
@@ -66,6 +70,14 @@ def prepare_bundle(template, ports, server):
             raise ValueError("Fixture bundle has duplicate transports")
         seen.add(transport)
         uri = urlsplit(link)
+        if transport == "ws" and ws_early_data_bytes is not None:
+            path = urlsplit(parsed["streamSettings"]["wsSettings"]["path"])
+            path_query = [(key, value) for key, value in parse_qsl(path.query, keep_blank_values=True) if key != "ed"]
+            path_query.append(("ed", str(ws_early_data_bytes)))
+            early_data_path = urlunsplit(path._replace(query=urlencode(path_query)))
+            query = [(key, value) for key, value in parse_qsl(uri.query, keep_blank_values=True) if key != "path"]
+            query.append(("path", early_data_path))
+            uri = uri._replace(query=urlencode(query))
         links.append(urlunsplit(uri._replace(netloc=f"{uri.username}@127.0.0.1:{ports[transport]}")))
     if seen != set(ports):
         raise ValueError("Fixture bundle must include every server transport")
@@ -92,7 +104,10 @@ def allow_owned_origins(template, ports):
     return server
 
 
-def validate(core, helper, panel, profile, transports, idle_seconds, loopback_baseline=False, runtime_log_dir=None):
+def validate(core, helper, panel, profile, transports, idle_seconds, loopback_baseline=False, runtime_log_dir=None,
+             ws_early_data_bytes=None):
+    if ws_early_data_bytes is not None and "ws" not in transports:
+        raise ValueError("WS early-data experiment requires the WS transport")
     with tempfile.TemporaryDirectory(prefix="g2ray-server-pair-") as directory:
         root = Path(directory)
         fixtures = root / "generated"
@@ -125,7 +140,8 @@ def validate(core, helper, panel, profile, transports, idle_seconds, loopback_ba
         if runtime_log_dir is not None:
             server["log"]["loglevel"] = "debug"
             runtime_log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        bundle = prepare_bundle(json.loads((fixtures / f"{profile}.bundle.json").read_text(encoding="utf-8")), ports, server)
+        bundle = prepare_bundle(json.loads((fixtures / f"{profile}.bundle.json").read_text(encoding="utf-8")),
+                                ports, server, ws_early_data_bytes=ws_early_data_bytes)
         server_path, bundle_path = root / "server.json", root / "bundle.json"
         server_path.write_text(json.dumps(server), encoding="ascii")
         bundle_path.write_text(json.dumps(bundle), encoding="ascii")
@@ -135,6 +151,8 @@ def validate(core, helper, panel, profile, transports, idle_seconds, loopback_ba
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15)
         origins = "owned HTTP/2 origins" if loopback_baseline else "real Internet origins"
         print(f"PAIR SCOPE: generated profile={profile}; local TLS; {origins}; no public edge or Android", flush=True)
+        if ws_early_data_bytes is not None:
+            print(f"FIXTURE ONLY: WS early-data limit={ws_early_data_bytes}; production links/config unchanged", flush=True)
         log = (root / "server.log").open("wb") if runtime_log_dir is None else \
             tempfile.NamedTemporaryFile(prefix="server-pair-", suffix=".log", dir=runtime_log_dir, mode="wb", delete=False)
         if runtime_log_dir is not None:
@@ -156,14 +174,21 @@ def main():
     parser.add_argument("--live", action="store_true", help="Consent to authenticated real HTTPS test traffic")
     parser.add_argument("--loopback-baseline", action="store_true", help="Use only owned loopback HTTPS origins, without Internet traffic")
     parser.add_argument("--runtime-log-dir", type=Path, help="Save private owned-core debug logs for diagnosis; never publish raw logs")
+    parser.add_argument("--ws-early-data-bytes", type=int,
+                        help="Test-only WS path early-data limit (1-4096); does not modify production exports")
     arguments = parser.parse_args()
     if (not arguments.live and not arguments.loopback_baseline) or not 0 <= arguments.idle_seconds <= 600:
         parser.error("Supply --live or --loopback-baseline, and --idle-seconds from 0 to 600")
+    if arguments.ws_early_data_bytes is not None and (
+        not 1 <= arguments.ws_early_data_bytes <= 4096 or arguments.transport == "xhttp"
+    ):
+        parser.error("--ws-early-data-bytes requires WS and a limit from 1 to 4096")
     try:
         transports = ("xhttp", "ws") if arguments.transport == "all" else (arguments.transport,)
         validate(arguments.xray.resolve(strict=True), arguments.retained_probe.resolve(strict=True),
                  arguments.panel_fixture.resolve(strict=True), arguments.profile, transports, arguments.idle_seconds,
-                 arguments.loopback_baseline, arguments.runtime_log_dir.resolve() if arguments.runtime_log_dir else None)
+                 arguments.loopback_baseline, arguments.runtime_log_dir.resolve() if arguments.runtime_log_dir else None,
+                 ws_early_data_bytes=arguments.ws_early_data_bytes)
     except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
         parser.exit(1, f"FAIL: {error}\n")
 

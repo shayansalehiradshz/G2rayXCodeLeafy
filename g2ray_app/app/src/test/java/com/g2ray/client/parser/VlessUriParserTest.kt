@@ -15,6 +15,28 @@ import org.robolectric.RobolectricTestRunner
 class VlessUriParserTest {
 
     @Test
+    fun parse_wsEarlyData_preservesNestedQueryAndDiscoveredRouteIdentity() {
+        val path = "/ws?ed=2560&token=a%2Bb"
+        val uri = "vless://00000000-0000-0000-0000-000000000000@example.com:443" +
+            "?encryption=none&security=tls&sni=example.com&type=ws&host=example.com" +
+            "&alpn=http%2F1.1&path=${Uri.encode(path)}#early-data"
+        val source = VlessUriParser.parse(uri).getOrThrow()
+        val discovered = VlessUriParser.withEndpointAddress(source, "20.85.77.48").getOrThrow()
+
+        assertEquals(path, source.path)
+        assertEquals(path, discovered.path)
+        assertEquals(source.sni, discovered.sni)
+        assertEquals(source.hostHeader, discovered.hostHeader)
+        assertEquals(source.alpn, discovered.alpn)
+        assertEquals(uri.substringAfter('?').substringBefore('#'),
+            discovered.rawUri.substringAfter('?').substringBefore('#'))
+        assertEquals(VlessUriParser.transportTemplateKey(source),
+            VlessUriParser.transportTemplateKey(discovered))
+        assertFalse(VlessUriParser.transportTemplateKey(source) ==
+            VlessUriParser.transportTemplateKey(source.copy(path = "/ws")))
+    }
+
+    @Test
     fun parse_rejectsPortsOutsideTcpRange() {
         listOf("0", "-1", "65536", "2147483647", "", "not-a-port").forEach { port ->
             val uri = "vless://00000000-0000-0000-0000-000000000000@example.com:$port?encryption=none&security=tls&sni=example.com&type=ws&host=example.com&path=%2F"

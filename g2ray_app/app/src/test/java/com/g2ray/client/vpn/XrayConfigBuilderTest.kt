@@ -15,6 +15,31 @@ import org.robolectric.RobolectricTestRunner
 class XrayConfigBuilderTest {
 
     @Test
+    fun buildConfigs_wsEarlyData_preservesSupportedPathSyntaxAcrossEngines() {
+        val path = "/ws?ed=2560&token=a%2Bb"
+        val profile = testXhttpProfile().copy(
+            transport = Transport.WS, path = path, mode = null, alpn = listOf("http/1.1")
+        )
+        val configs = listOf(
+            XrayConfigBuilder.buildConfig(profile),
+            XrayConfigBuilder.buildDelayTestConfig(profile, socksPort = 19090),
+            XrayConfigBuilder.buildVpnConfig(profile, engine = ActiveVpnEngine.Hev),
+            XrayConfigBuilder.buildVpnConfig(profile, engine = ActiveVpnEngine.XrayNative)
+        )
+        configs.forEach { config ->
+            val stream = JSONObject(config).getJSONArray("outbounds")
+                .getJSONObject(0).getJSONObject("streamSettings")
+            val ws = stream.getJSONObject("wsSettings")
+            assertEquals(path, ws.getString("path"))
+            assertEquals(profile.hostHeader, ws.getJSONObject("headers").getString("Host"))
+            assertEquals(profile.sni, stream.getJSONObject("tlsSettings").getString("serverName"))
+            assertFalse(stream.getJSONObject("tlsSettings").getBoolean("allowInsecure"))
+            assertFalse(ws.has("maxEarlyData"))
+            assertFalse(ws.has("earlyDataHeaderName"))
+        }
+    }
+
+    @Test
     fun buildConfig_xhttpProfile_correctConfig() {
         val profile = G2RayProfile(
             rawUri = "vless://00000000-0000-0000-0000-000000000000@example.com:443?encryption=none&security=tls&sni=example.com&type=xhttp&host=example.com&path=%2F&mode=packet-up&alpn=h2#test",
