@@ -156,3 +156,56 @@ or installed, no device tests or media transfers were performed, and the
 retained-socket idle-stall issue remains open. This prevents a verified
 source-level cause of unnecessary recovery during handoff; it is not a
 measured throughput, ISP-latency, or uninterrupted-video improvement.
+
+## Delayed Network-Loss Publication
+
+Baseline: `0a7edf36e981db9c5a2ccf7e449f1acbf2cb6b92`.
+The network-loss branch posted an anonymous job to the service scope and
+then to the main dispatcher. It did not check whether that loss still
+described the current network or tunnel before publishing its state.
+
+The pre-fix run executed six cases on API 24 and 31. Four failed, and the
+two current-loss positive controls passed:
+
+- After a new handoff successfully verified its route, releasing a delayed
+  notification for the old network changed Connected/Ready/verified to
+  Starting/Settling/unverified.
+- After the real Stop path published Stopping, releasing the old loss
+  notification changed the state back to Starting while cleanup waited for
+  the lifecycle mutex.
+
+The original XML is retained privately at
+`data/verification/network-loss-publication-before-20261014.xml`.
+These cases execute the actual service methods with a recording bridge
+and fake data-path probe. A test dispatcher holds the first queued task
+while subsequent tasks and virtual-time delays run normally. Its Delay
+delegation uses the project's
+[pinned TestDispatcher implementation](https://github.com/Kotlin/kotlinx.coroutines/blob/1.10.2/kotlinx-coroutines-test/common/src/TestDispatcher.kt).
+The ready state in the replacement-network case comes from the service's
+handoff verification path, not a manually injected successful UI state.
+
+This is also relevant to misleading zero-speed displays:
+`markTunnelUnverified` cancels traffic sampling and clears displayed
+traffic. That consequence is established by the source, not a measured
+speed or phone-session reproduction.
+
+The production fix captures the lifecycle token, TUN identity, and network
+generation before queuing the loss notification. At main-dispatch
+publication it requires the same current tunnel, the same generation, and
+an actual continued wait for physical connectivity. The check and state
+change use the existing network-callback monitor. Current network loss
+still publishes an unavailable state; obsolete loss and stopped-tunnel
+notifications are discarded.
+
+All six new cases pass. The expanded class passes 36 cases, and the focused
+run including startup and periodic-monitor checks passes 46. The full
+local cached-SDK run passes 483 cases in 36 suites, with no failures,
+errors, or skips among selected cases. Lint reports zero errors and 25
+warnings. Instrumentation Kotlin compilation and `git diff --check` pass.
+No existing assertion, timeout, or recovery threshold was weakened.
+
+No polling, transport tuning, wake-preference change, new runtime
+dependency, APK packaging, device testing, or media transfer is involved.
+The remaining physical-device and performance acceptance requirements
+above remain open; this fixes a reproduced state-publication defect, not
+the complete retained-socket idle-stall problem.

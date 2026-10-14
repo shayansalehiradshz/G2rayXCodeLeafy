@@ -2665,9 +2665,20 @@ class G2RayVpnService : VpnService() {
         if (network == null) {
             networkHandoffJob?.cancel()
             networkHandoffJob = null
+            val token = activeLifecycleToken
+            val tun = vpnInterface
+            val networkGeneration = underlyingNetworkGeneration.get()
             scope.launch {
                 withContext(Dispatchers.Main) {
-                    markTunnelUnverified("Underlying network changed. Waiting to reconnect...")
+                    synchronized(this@G2RayVpnService) {
+                        if (
+                            waitingForUnderlyingNetwork &&
+                            networkGeneration == underlyingNetworkGeneration.get() &&
+                            tun != null && isTunnelCurrent(token, tun)
+                        ) {
+                            markTunnelUnverified("Underlying network changed. Waiting to reconnect...")
+                        }
+                    }
                 }
             }
             return

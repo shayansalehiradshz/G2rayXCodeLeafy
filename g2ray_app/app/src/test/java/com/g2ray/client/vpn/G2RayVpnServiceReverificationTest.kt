@@ -9,15 +9,21 @@ import com.g2ray.client.model.TunnelState
 import com.g2ray.client.model.VpnStateRepository
 import com.g2ray.client.parser.VlessUriParser
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.coroutines.CoroutineContext
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.InternalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestDispatcher
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.resetMain
@@ -339,6 +345,78 @@ class G2RayVpnServiceReverificationTest {
         }
     }
 
+    @Test
+    fun delayedNetworkLossCannotUnverifyAReverifiedReplacementNetwork() = runTest {
+        val probe = CountingProbe()
+        withConnectedService(probe) { service, bridge ->
+            val dispatcher = HoldFirstDispatch(StandardTestDispatcher(testScheduler))
+            setField(service, "scope", CoroutineScope(backgroundScope.coroutineContext + dispatcher))
+            applyNetwork(service, null)
+            assertTrue(dispatcher.hasHeldTask)
+            applyNetwork(service, ShadowNetwork.newInstance(101))
+            runCurrent()
+            advanceTimeBy(2_500L)
+            runCurrent()
+
+            assertEquals(1, probe.calls)
+            val ready = VpnStateRepository.state.value
+            assertTrue(ready.tunnelVerified)
+            dispatcher.releaseHeldTask()
+            runCurrent()
+
+            assertEquals("An old loss must not overwrite the current verified route", ready, VpnStateRepository.state.value)
+            assertEquals(0, bridge.stops)
+        }
+    }
+
+    @Test
+    fun delayedNetworkLossCannotOverwriteAnInProgressStop() = runTest {
+        val probe = CountingProbe()
+        withConnectedService(probe) { service, bridge ->
+            val dispatcher = HoldFirstDispatch(StandardTestDispatcher(testScheduler))
+            setField(service, "scope", CoroutineScope(backgroundScope.coroutineContext + dispatcher))
+            val mutex = field(service, "lifecycleOperationMutex") as Mutex
+            mutex.lock()
+            try {
+                applyNetwork(service, null)
+                assertTrue(dispatcher.hasHeldTask)
+                G2RayVpnService::class.java.getDeclaredMethod("stopTunnel")
+                    .apply { isAccessible = true }.invoke(service)
+                val stopping = VpnStateRepository.state.value
+                assertEquals(TunnelState.Stopping, stopping.tunnelState)
+                dispatcher.releaseHeldTask()
+                runCurrent()
+
+                assertEquals("An old loss must not turn Stop back into startup", stopping, VpnStateRepository.state.value)
+                assertEquals(0, probe.calls)
+                assertEquals(0, bridge.stops)
+            } finally {
+                mutex.unlock()
+            }
+        }
+    }
+
+    @Test
+    fun currentNetworkLossStillMarksTheTunnelUnverified() = runTest {
+        val probe = CountingProbe()
+        withConnectedService(probe) { service, bridge ->
+            assertTrue(requestReverification(service))
+            runCurrent()
+            assertTrue(VpnStateRepository.state.value.tunnelVerified)
+            val dispatcher = HoldFirstDispatch(StandardTestDispatcher(testScheduler))
+            setField(service, "scope", CoroutineScope(backgroundScope.coroutineContext + dispatcher))
+            applyNetwork(service, null)
+            assertTrue(dispatcher.hasHeldTask)
+            dispatcher.releaseHeldTask()
+            runCurrent()
+
+            assertEquals(TunnelState.Starting, VpnStateRepository.state.value.tunnelState)
+            assertFalse(VpnStateRepository.state.value.tunnelVerified)
+            assertTrue(field(service, "waitingForUnderlyingNetwork") as Boolean)
+            assertEquals(0, bridge.stops)
+        }
+    }
+
     private suspend fun TestScope.assertReplacedHandoffDoesNotRecover(oldProbeSuccess: Boolean) {
         val probe = CountingProbe()
         withConnectedService(probe) { service, bridge ->
@@ -421,6 +499,28 @@ class G2RayVpnServiceReverificationTest {
         override suspend fun probe(): RunningRouteResult {
             calls++
             return onProbe()
+        }
+    }
+
+    @OptIn(InternalCoroutinesApi::class)
+    private class HoldFirstDispatch(private val delegate: TestDispatcher) : CoroutineDispatcher(), Delay by delegate {
+        private var heldTask: Pair<CoroutineContext, Runnable>? = null
+        private var firstDispatch = true
+        val hasHeldTask: Boolean get() = heldTask != null
+
+        override fun dispatch(context: CoroutineContext, block: Runnable) {
+            if (firstDispatch) {
+                firstDispatch = false
+                heldTask = context to block
+            } else {
+                delegate.dispatch(context, block)
+            }
+        }
+
+        fun releaseHeldTask() {
+            val (context, block) = checkNotNull(heldTask)
+            heldTask = null
+            delegate.dispatch(context, block)
         }
     }
 
