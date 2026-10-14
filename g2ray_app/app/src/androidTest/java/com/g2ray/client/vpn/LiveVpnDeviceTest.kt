@@ -60,6 +60,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Test
@@ -67,6 +68,17 @@ import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class LiveVpnDeviceTest {
+    @Test
+    fun explicitEngineArgumentsCannotSilentlyExerciseAnotherEngine() {
+        assertEquals(VpnEngineMode.Hev, engineFromTestArgument(null))
+        VpnEngineMode.entries.forEach { mode ->
+            assertEquals(mode, engineFromTestArgument(mode.storageValue))
+        }
+        listOf("native", "", "unknown", "HEV").forEach { value ->
+            assertThrows(IllegalArgumentException::class.java) { engineFromTestArgument(value) }
+        }
+    }
+
     @Test
     fun selectedCodespacePingAllCompletesWithVisibleResults() = runBlocking {
         val args = InstrumentationRegistry.getArguments()
@@ -213,6 +225,13 @@ class LiveVpnDeviceTest {
         runLiveTest(coreFailureCycles = 2)
     }
 
+    private fun engineFromTestArgument(value: String?): VpnEngineMode {
+        val storageValue = value ?: VpnEngineMode.Hev.storageValue
+        return requireNotNull(VpnEngineMode.entries.firstOrNull { it.storageValue == storageValue }) {
+            "Test engine must be auto, hev, or xray_native"
+        }
+    }
+
     private fun runLiveTest(
         coreFailureCycles: Int = 0,
         uiStart: Boolean = false,
@@ -240,7 +259,7 @@ class LiveVpnDeviceTest {
         assertTrue("UI startup uses the selected profile, not a transport override",
             !uiStart || transport == null || transport == selected!!.transport)
         val mode = if (uiStart) VpnEnginePreferences(context).getMode() else {
-            VpnEngineMode.fromStorage(args.getString("engine") ?: "hev")
+            engineFromTestArgument(args.getString("engine"))
         }
         val idleSeconds = (args.getString("idleSeconds")?.toLongOrNull() ?: 60L).coerceIn(60L, 600L)
         val resumeVpnActivity = args.getString("resumeVpnActivity") != "false"

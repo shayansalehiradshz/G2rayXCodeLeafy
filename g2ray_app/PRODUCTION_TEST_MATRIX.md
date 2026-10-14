@@ -155,6 +155,11 @@ adb shell am instrument -w -r -e class 'com.g2ray.client.vpn.LiveVpnDeviceTest#s
 
 Repeat with `-e engine xray_native`. An optional `-e transport ws` uses a
 matching saved profile on the same account/edge without changing selection.
+Accepted engine arguments are exactly `auto`, `hev`, and `xray_native`;
+an unknown value must fail rather than silently testing Auto. The separate
+`explicitEngineArgumentsCannotSilentlyExerciseAnotherEngine` regression checks
+this contract without contacting the network. Record the engine printed by
+the run, not just the intended command label.
 Record screen interactivity and the actual elapsed gap; requested idle alone
 does not prove a screen-off test. Retained and fresh HTTPS each need two of
 three endpoints within six seconds. Failed retained checks must remain visible
