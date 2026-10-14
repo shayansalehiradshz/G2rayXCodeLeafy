@@ -1,0 +1,314 @@
+package com.g2ray.client.vpn
+
+import android.net.Network
+import android.os.Build
+import android.os.ParcelFileDescriptor
+import com.g2ray.client.model.AppConnectionState
+import com.g2ray.client.model.RouteState
+import com.g2ray.client.model.TunnelState
+import com.g2ray.client.model.VpnStateRepository
+import com.g2ray.client.parser.VlessUriParser
+import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.test.setMain
+import org.junit.After
+import org.junit.Assert.*
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.Robolectric
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+import org.robolectric.shadows.ShadowNetwork
+
+@OptIn(ExperimentalCoroutinesApi::class)
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [Build.VERSION_CODES.N, Build.VERSION_CODES.S])
+class G2RayVpnServiceReverificationTest {
+    private lateinit var originalState: AppConnectionState
+
+    @Before
+    fun setUp() {
+        originalState = VpnStateRepository.state.value
+        Dispatchers.setMain(StandardTestDispatcher())
+        VpnStateRepository.state.value = AppConnectionState(
+            RouteState.Settling, TunnelState.Starting, "Fixture waiting for verification",
+            routeReady = false, tunnelVerified = false
+        )
+    }
+
+    @After
+    fun tearDown() {
+        Dispatchers.resetMain()
+        VpnStateRepository.state.value = originalState
+    }
+
+    @Test
+    fun promptFailureFromAnObsoleteNetworkDoesNotConfirmOrRestartTheTunnel() = runTest {
+        val probe = CountingProbe()
+        withConnectedService(probe) { service, bridge ->
+            val before = VpnStateRepository.state.value
+            val generation = field(service, "underlyingNetworkGeneration") as AtomicLong
+            probe.onProbe = {
+                generation.incrementAndGet()
+                RunningRouteResult(false, "Fixture old-network failure")
+            }
+
+            assertTrue(requestReverification(service))
+            runCurrent()
+            advanceTimeBy(1_500L)
+            runCurrent()
+
+            assertEquals("An obsolete failure must not start a confirmation probe", 1, probe.calls)
+            assertEquals(0, bridge.stops)
+            assertFalse(field(service, "routeRecoveryInProgress") as Boolean)
+            assertEquals(before, VpnStateRepository.state.value)
+            assertFalse((field(service, "lifecycleOperationMutex") as Mutex).isLocked)
+        }
+    }
+
+    @Test
+    fun promptSuccessFromAnObsoleteNetworkCannotMarkTheNewNetworkVerified() = runTest {
+        val probe = CountingProbe()
+        withConnectedService(probe) { service, bridge ->
+            val before = VpnStateRepository.state.value
+            val generation = field(service, "underlyingNetworkGeneration") as AtomicLong
+            probe.onProbe = {
+                generation.incrementAndGet()
+                RunningRouteResult(true)
+            }
+
+            assertTrue(requestReverification(service))
+            runCurrent()
+
+            assertEquals(1, probe.calls)
+            assertEquals(0, bridge.stops)
+            assertEquals(before, VpnStateRepository.state.value)
+        }
+    }
+
+    @Test
+    fun physicalHandoffCancelsAnOutstandingPromptProbeAndReleasesItsMutex() = runTest {
+        val entered = CompletableDeferred<Unit>()
+        val cancelled = CompletableDeferred<Unit>()
+        val probe = CountingProbe().apply {
+            onProbe = {
+                entered.complete(Unit)
+                try { awaitCancellation() } finally { cancelled.complete(Unit) }
+            }
+        }
+        withConnectedService(probe) { service, bridge ->
+            assertTrue(requestReverification(service))
+            val promptJob = field(service, "routeReverifyJob") as Job
+            runCurrent()
+            assertTrue(entered.isCompleted)
+            assertTrue((field(service, "lifecycleOperationMutex") as Mutex).isLocked)
+
+            applyNetwork(service, ShadowNetwork.newInstance(101))
+            runCurrent()
+
+            assertTrue("The handoff must not wait for an obsolete probe deadline", promptJob.isCancelled)
+            assertTrue(cancelled.isCompleted)
+            assertFalse((field(service, "lifecycleOperationMutex") as Mutex).isLocked)
+            assertEquals(0, bridge.stops)
+
+            probe.onProbe = { RunningRouteResult(true) }
+            advanceTimeBy(2_500L)
+            runCurrent()
+            assertEquals("The replacement network must still get a fresh check", 2, probe.calls)
+            assertEquals(0, bridge.stops)
+        }
+    }
+
+    @Test
+    fun lossOfAllPhysicalNetworksCancelsThePromptWithoutStartingRecovery() = runTest {
+        val probe = CountingProbe().apply { onProbe = { awaitCancellation() } }
+        withConnectedService(probe) { service, bridge ->
+            assertTrue(requestReverification(service))
+            val job = field(service, "routeReverifyJob") as Job
+            runCurrent()
+
+            applyNetwork(service, null)
+            runCurrent()
+
+            assertTrue(job.isCancelled)
+            assertTrue(field(service, "waitingForUnderlyingNetwork") as Boolean)
+            assertFalse((field(service, "lifecycleOperationMutex") as Mutex).isLocked)
+            assertFalse(field(service, "routeRecoveryInProgress") as Boolean)
+            assertEquals(0, bridge.stops)
+        }
+    }
+
+    @Test
+    fun networkChangedDuringConfirmationDelayDoesNotLaunchAnotherProbe() = runTest {
+        val probe = CountingProbe().apply { onProbe = { RunningRouteResult(false, "Fixture failure") } }
+        withConnectedService(probe) { service, bridge ->
+            val before = VpnStateRepository.state.value
+            assertTrue(requestReverification(service))
+            runCurrent()
+            assertEquals(1, probe.calls)
+
+            (field(service, "underlyingNetworkGeneration") as AtomicLong).incrementAndGet()
+            advanceTimeBy(1_500L)
+            runCurrent()
+
+            assertEquals(1, probe.calls)
+            assertEquals(0, bridge.stops)
+            assertEquals(before, VpnStateRepository.state.value)
+        }
+    }
+
+    @Test
+    fun networkChangedWhilePublicationIsQueuedCannotBeMarkedVerified() = runTest {
+        val probe = CountingProbe()
+        withConnectedService(probe) { service, bridge ->
+            val before = VpnStateRepository.state.value
+            val generation = field(service, "underlyingNetworkGeneration") as AtomicLong
+            probe.onProbe = {
+                backgroundScope.launch(Dispatchers.Main) { generation.incrementAndGet() }
+                RunningRouteResult(true)
+            }
+
+            assertTrue(requestReverification(service))
+            runCurrent()
+
+            assertEquals(1, probe.calls)
+            assertEquals(0, bridge.stops)
+            assertEquals(before, VpnStateRepository.state.value)
+        }
+    }
+
+    @Test
+    fun stableNetworkSuccessStillVerifiesTheTunnelWithoutRestarting() = runTest {
+        val probe = CountingProbe()
+        withConnectedService(probe) { service, bridge ->
+            assertTrue(requestReverification(service))
+            runCurrent()
+
+            assertEquals(1, probe.calls)
+            assertTrue(VpnStateRepository.state.value.tunnelVerified)
+            assertEquals(TunnelState.Connected, VpnStateRepository.state.value.tunnelState)
+            assertEquals(0, bridge.stops)
+        }
+    }
+
+    @Test
+    fun stableNetworkFailureStillConfirmsAndSchedulesRecovery() = runTest {
+        val probe = CountingProbe().apply { onProbe = { RunningRouteResult(false, "Fixture route unavailable") } }
+        withConnectedService(probe) { service, bridge ->
+            assertTrue(requestReverification(service))
+            runCurrent()
+            assertEquals(1, probe.calls)
+
+            advanceTimeBy(1_500L)
+            runCurrent()
+
+            assertEquals(2, probe.calls)
+            assertTrue(field(service, "routeRecoveryInProgress") as Boolean)
+            assertEquals(1, bridge.stops)
+            assertFalse(VpnStateRepository.state.value.tunnelVerified)
+        }
+    }
+
+    @Test
+    fun noPhysicalNetworkRejectsPromptVerificationWithoutTakingTheMutex() = runTest {
+        val probe = CountingProbe()
+        withConnectedService(probe) { service, bridge ->
+            setField(service, "waitingForUnderlyingNetwork", true)
+
+            assertFalse(requestReverification(service))
+            runCurrent()
+
+            assertEquals(0, probe.calls)
+            assertEquals(0, bridge.stops)
+            assertFalse((field(service, "lifecycleOperationMutex") as Mutex).isLocked)
+        }
+    }
+
+    private suspend fun TestScope.withConnectedService(
+        probe: VpnDataPathProbe, block: suspend (G2RayVpnService, CountingBridge) -> Unit
+    ) {
+        val service = Robolectric.buildService(G2RayVpnService::class.java).create().get()
+        val bridge = CountingBridge()
+        val core = XrayCoreManager(bridge, RunningRouteProbe {
+            RunningRouteResult(false, "Fixture SOCKS route unavailable")
+        })
+        @Suppress("UNCHECKED_CAST")
+        val state = XrayCoreManager::class.java.getDeclaredField("_state")
+            .apply { isAccessible = true }.get(core) as MutableStateFlow<TunnelCoreState>
+        state.value = TunnelCoreState.Connected
+        val pipe = ParcelFileDescriptor.createPipe()
+        setField(service, "scope", backgroundScope)
+        setField(service, "core", core)
+        setField(service, "fullVpnDataPathProbe", probe)
+        setField(service, "vpnInterface", pipe[0])
+        setField(service, "underlyingNetwork", ShadowNetwork.newInstance(100))
+        setField(service, "activeProfile", VlessUriParser.parse(
+            "vless://00000000-0000-4000-8000-000000000001@203.0.113.1:443" +
+                "?encryption=none&security=tls&type=ws&sni=fixture.example&host=fixture.example&path=%2Fws"
+        ).getOrThrow())
+        try {
+            block(service, bridge)
+        } finally {
+            setField(service, "vpnInterface", null)
+            service.onDestroy()
+            pipe.forEach { it.close() }
+        }
+    }
+
+    private fun requestReverification(service: G2RayVpnService): Boolean = G2RayVpnService::class.java
+            .getDeclaredMethod("requestRouteReverification", RouteReverifyReason::class.java)
+            .apply { isAccessible = true }.invoke(service, RouteReverifyReason.DeviceWake) as Boolean
+
+    private fun applyNetwork(service: G2RayVpnService, network: Network?) {
+        G2RayVpnService::class.java
+            .getDeclaredMethod("applyUnderlyingNetwork", Network::class.java, Boolean::class.javaPrimitiveType)
+            .apply { isAccessible = true }.invoke(service, network, true)
+    }
+
+    private fun field(service: G2RayVpnService, name: String): Any? =
+        G2RayVpnService::class.java.getDeclaredField(name).apply { isAccessible = true }.get(service)
+
+    private fun setField(service: G2RayVpnService, name: String, value: Any?) {
+        G2RayVpnService::class.java.getDeclaredField(name).apply { isAccessible = true }.set(service, value)
+    }
+
+    private class CountingProbe : VpnDataPathProbe {
+        var calls = 0
+        var onProbe: suspend () -> RunningRouteResult = { RunningRouteResult(true) }
+        override suspend fun probe(): RunningRouteResult {
+            calls++
+            return onProbe()
+        }
+    }
+
+    private class CountingBridge : XrayBridge {
+        var stops = 0
+        override fun isAvailable() = true
+        override fun getState() = true
+        override fun capabilities(): XrayRuntimeCapabilities = error("Unexpected core startup")
+        override fun registerDialerController(protectFd: (Int) -> Boolean) = Unit
+        override fun registerListenerController(protectFd: (Int) -> Boolean) = Unit
+        override fun setTunFd(fd: Int) = Unit
+        override fun newRunFromJsonRequest(datDir: String, configJson: String): String = error("Unexpected startup")
+        override fun runFromJson(base64Request: String): XrayCallResult = error("Unexpected startup")
+        override fun ping(base64Request: String): XrayPingResult = error("Unexpected ping")
+        override fun stop(): XrayCallResult {
+            stops++
+            return XrayCallResult(true, null)
+        }
+    }
+}

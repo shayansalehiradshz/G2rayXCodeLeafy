@@ -836,7 +836,7 @@ class G2RayVpnService : VpnService() {
     ): Boolean {
         val token = activeLifecycleToken
         val tun = vpnInterface ?: return false
-        if (!isTunnelCurrent(token, tun)) return false
+        if (!isTunnelCurrent(token, tun) || waitingForUnderlyingNetwork) return false
 
         lateinit var job: Job
         synchronized(this) {
@@ -856,6 +856,7 @@ class G2RayVpnService : VpnService() {
                 lifecycleOperationMutex.withLock {
                     if (
                         !isTunnelCurrent(token, tun) ||
+                        waitingForUnderlyingNetwork ||
                         routeRecoveryInProgress ||
                         routeRecoveryJob?.isActive == true ||
                         networkHandoffJob?.isActive == true
@@ -863,11 +864,15 @@ class G2RayVpnService : VpnService() {
                         return@withLock
                     }
 
+                    val verificationNetworkGeneration = underlyingNetworkGeneration.get()
+                    fun verificationIsCurrent(): Boolean = isTunnelCurrent(token, tun) &&
+                        !waitingForUnderlyingNetwork &&
+                        verificationNetworkGeneration == underlyingNetworkGeneration.get()
                     val trafficBeforeProbe = currentMeasuredTrafficSnapshot()
                     var route = verifyRouteAfterTransition()
                     var trafficAfterProbe = currentMeasuredTrafficSnapshot()
                     if (
-                        !isTunnelCurrent(token, tun) ||
+                        !verificationIsCurrent() ||
                         routeRecoveryInProgress ||
                         routeRecoveryJob?.isActive == true
                     ) {
@@ -881,7 +886,7 @@ class G2RayVpnService : VpnService() {
                     if (shouldConfirmActiveStallFailure(reason, route)) {
                         delay(ACTIVE_STALL_CONFIRM_DELAY_MS)
                         if (
-                            !isTunnelCurrent(token, tun) ||
+                            !verificationIsCurrent() ||
                             routeRecoveryInProgress ||
                             routeRecoveryJob?.isActive == true
                         ) {
@@ -890,6 +895,7 @@ class G2RayVpnService : VpnService() {
                         route = diagnoseVpnRoute(resetConnections = true)
                         trafficAfterProbe = currentMeasuredTrafficSnapshot()
                     }
+                    if (!verificationIsCurrent()) return@withLock
 
                     val liveResponsesResumed = shouldSuppressRouteRecoveryAfterFailedReverification(
                         route = route,
@@ -900,7 +906,7 @@ class G2RayVpnService : VpnService() {
                     if (route.success || liveResponsesResumed) {
                         withContext(Dispatchers.Main) {
                             if (
-                                isTunnelCurrent(token, tun) &&
+                                verificationIsCurrent() &&
                                 !routeRecoveryInProgress &&
                                 routeRecoveryJob?.isActive != true
                             ) {
@@ -966,12 +972,22 @@ class G2RayVpnService : VpnService() {
     }
 
     private suspend fun verifyRouteAfterTransition(): RunningRouteResult {
+        val networkGeneration = underlyingNetworkGeneration.get()
+        fun networkIsCurrent(): Boolean = !waitingForUnderlyingNetwork &&
+            networkGeneration == underlyingNetworkGeneration.get()
+        val obsolete = RunningRouteResult(
+            false, "Physical network changed during route verification",
+            failureScope = RouteFailureScope.DialerBinding
+        )
+        if (!networkIsCurrent()) return obsolete
         var route = diagnoseVpnRoute(resetConnections = true)
+        if (!networkIsCurrent()) return obsolete
         if (shouldConfirmTransitionRouteFailure(route)) {
             delay(TRANSITION_ROUTE_CONFIRM_DELAY_MS)
+            if (!networkIsCurrent()) return obsolete
             route = diagnoseVpnRoute(resetConnections = true)
         }
-        return route
+        return if (networkIsCurrent()) route else obsolete
     }
 
     private suspend fun diagnoseVpnRoute(resetConnections: Boolean): RunningRouteResult {
@@ -2625,6 +2641,10 @@ class G2RayVpnService : VpnService() {
         }
         if (triggerVerification) {
             underlyingNetworkGeneration.incrementAndGet()
+            // A prompt probe on the old network must release the lifecycle
+            // mutex instead of delaying the replacement network's verification.
+            routeReverifyJob?.cancel()
+            routeReverifyJob = null
         }
         val underlyingNetworksAccepted = runCatching {
             setUnderlyingNetworks(network?.let { arrayOf(it) } ?: emptyArray())
