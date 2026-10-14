@@ -87,6 +87,30 @@ This APK was built, not installed. Older physical-device results are not
 attributed to this revision. Source changes do not update an already installed
 phone application.
 
+### Hosted And Live Follow-Up
+
+Both hosted workflows passed for the exact implementation commit
+`8a613a3e935065509a5032f90a550d335f009277`:
+
+- [Android Tests 38526848747](https://github.com/z2roozsh/G2rayXCodeLeafy/actions/runs/38526848747).
+- [Static Tests 38526848757](https://github.com/z2roozsh/G2rayXCodeLeafy/actions/runs/38526848757).
+
+The downloaded Android JUnit XML independently confirms 441 cases in 35
+suites, with zero failures, errors, or skips. Resolver cases include modern
+API 29, 34, and 35 and legacy API 24 and 28. The four extra cases versus the
+cached-SDK local run are the API 29/34 modern query variants and the two API 28
+legacy variants. Hosted lint XML has zero errors and 26 warnings; its extra
+warning versus the local report is an Android Gradle plugin version advisory,
+not a DNS API compatibility error.
+
+The live checkout fast-forwarded to this exact tested commit without an engine
+restart. Engine PID 258 and script/config/UUID/export hashes remained
+unchanged. Xray remained 26.7.28 / `5ca6f4b` / Go 1.26.5, origin TFO remained
+false, and local XHTTP OPTIONS returned HTTP 200. These checks establish live
+source synchronization and local listener readiness, not new phone, public-edge
+payload, media, or throughput acceptance. This report-only follow-up changes
+no production code. Direct-GitHub wake preferences were not modified.
+
 ## Acceptance Boundaries
 
 No new phone, media, sustained-throughput, loaded-latency, or handoff test was
