@@ -217,6 +217,9 @@ class LiveVpnDeviceTest {
     fun selectedAccountControlPlaneWorksWhileVpnIsActive() = runLiveTest(controlPlaneCheck = true)
 
     @Test
+    fun selectedProfileStartsWithSmallProbes() = runLiveTest(startupOnly = true)
+
+    @Test
     fun selectedProfileRecoversAfterRepeatedCoreFailures() {
         assumeTrue(
             "Core failure injection requires -e liveCoreRecovery true",
@@ -235,7 +238,8 @@ class LiveVpnDeviceTest {
     private fun runLiveTest(
         coreFailureCycles: Int = 0,
         uiStart: Boolean = false,
-        controlPlaneCheck: Boolean = false
+        controlPlaneCheck: Boolean = false,
+        startupOnly: Boolean = false
     ) = runBlocking {
         val args = InstrumentationRegistry.getArguments()
         assumeTrue("Live network tests require -e liveVpn true", args.getString("liveVpn") == "true")
@@ -264,6 +268,7 @@ class LiveVpnDeviceTest {
         val idleSeconds = (args.getString("idleSeconds")?.toLongOrNull() ?: 60L).coerceIn(60L, 600L)
         val resumeVpnActivity = args.getString("resumeVpnActivity") != "false"
         val smallProbesOnly = args.getString("smallProbesOnly") == "true"
+        require(!startupOnly || smallProbesOnly) { "Startup timing tests require -e smallProbesOnly true" }
         val screenOff = args.getString("screenOff") == "true"
         require(!screenOff || !resumeVpnActivity) {
             "Controlled screen-off tests require -e resumeVpnActivity false"
@@ -350,6 +355,10 @@ class LiveVpnDeviceTest {
                 assertEquals(TunnelTrafficSource.Unavailable, VpnStateRepository.state.value.tunnelTrafficSource)
             }
 
+            if (startupOnly) {
+                report("startup_only_acceptance=true")
+                return@runBlocking
+            }
             if (controlPlaneCheck) {
                 verifyActiveControlPlane(context)
                 return@runBlocking

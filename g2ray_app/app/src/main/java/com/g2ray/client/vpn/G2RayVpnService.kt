@@ -199,7 +199,11 @@ class G2RayVpnService : VpnService() {
         }
     }
     private val core = XrayCoreManager()
-    private val fullVpnDataPathProbe: VpnDataPathProbe = OkHttpVpnDataPathProbe()
+    private val fullVpnDataPathProbe: VpnDataPathProbe = OkHttpVpnDataPathProbe {
+        val connectivity = getSystemService(CONNECTIVITY_SERVICE) as? ConnectivityManager
+        connectivity?.getNetworkCapabilities(connectivity.activeNetwork)
+            ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+    }
     private val secureStore by lazy { (application as G2RayApplication).secureStore }
     private val vpnPreferences by lazy { VpnEnginePreferences(secureStore) }
     private val accountRepository by lazy { (application as G2RayApplication).accountRepository }

@@ -454,6 +454,30 @@ Internet requests; do not publish the bundle. Preserve UUID/config and an old
 binary rollback copy during any approved upgrade. Passing these checks does
 not close phone idle-resume acceptance or the aggregate resource-budget gap.
 
+## Warm-start timing isolation
+
+With a saved working profile, VPN permission granted, and the Codespace already
+available, run a small-response startup-only check:
+
+```bash
+adb shell am instrument -w -r -e liveVpn true -e engine xray_native -e transport xhttp -e smallProbesOnly true -e class com.g2ray.client.vpn.LiveVpnDeviceTest#selectedProfileStartsWithSmallProbes com.g2ray.client.test/androidx.test.runner.AndroidJUnitRunner
+adb logcat -d -v threadtime -s G2RayVpnService:I G2RayVpnProbe:I '*:S'
+```
+
+Repeat with `hev`, and then the saved matching `ws` profile. Require a terminal
+instrumentation result, the actual requested engine, verified default-VPN
+startup, and the unchanged complete-HTTPS quorum. This test explicitly stops
+after startup checks and does not certify idle survival or cold-host wake.
+It refuses to run without `smallProbesOnly=true`.
+
+Debug builds record bounded per-request DNS, connect, TLS, and response-header
+event times plus default-VPN status at the start/end of the probe. Event
+callbacks capture timing only; diagnostic logging occurs outside those
+callbacks. A pending or truncated trace is labeled, not treated as completed.
+Connect time contains TLS time; do not sum nested intervals as independent
+latency. No credentials, complete URLs, addresses, or exception messages enter
+the timing record. Release builds do not attach this timing listener.
+
 ## v2rayNG A/B comparison
 
 For each client, run three alternating 15-minute rounds with the same config and physical network. Record median and p95 for:
