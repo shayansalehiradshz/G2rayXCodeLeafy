@@ -477,7 +477,10 @@ callbacks capture timing only; diagnostic logging occurs outside those
 callbacks. A pending or truncated trace is labeled, not treated as completed.
 Connect time contains TLS time; do not sum nested intervals as independent
 latency. No credentials, complete URLs, addresses, or exception messages enter
-the timing record. Release builds do not attach this timing listener.
+the timing record. The terminal `call_cancelled` flag distinguishes cancellation
+from an uncancelled failure; it does not by itself identify the cancellation
+reason. The quorum intentionally cancels remaining requests after it decides.
+Release builds do not attach this timing listener.
 If the phone suppresses the new tag, record its old property value and
 temporarily enable capture using `adb shell setprop log.tag.G2RayVpnProbe I`.
 Restore the previous value afterwards; for an originally empty value use

@@ -27,6 +27,7 @@ internal class VpnProbeTimingTrace(private val nowMs: () -> Long) {
         @Volatile private var startedAt: Long? = null
         @Volatile private var finishedAt: Long? = null
         @Volatile private var outcome = "pending"
+        @Volatile private var terminalCallCancelled: Boolean? = null
         @Volatile private var dnsLastIpv4Count: Int? = null
         @Volatile private var dnsLastIpv6Count: Int? = null
         @Volatile private var connectLastFamily = "unknown"
@@ -62,8 +63,15 @@ internal class VpnProbeTimingTrace(private val nowMs: () -> Long) {
 
         override fun requestHeadersEnd(call: Call, request: okhttp3.Request) = record("request_sent")
         override fun responseHeadersStart(call: Call) = record("response_headers")
-        override fun callEnd(call: Call) = finish("completed")
-        override fun callFailed(call: Call, ioe: IOException) = finish("failed_${ioe.javaClass.simpleName}")
+        override fun callEnd(call: Call) {
+            terminalCallCancelled = call.isCanceled()
+            finish("completed")
+        }
+
+        override fun callFailed(call: Call, ioe: IOException) {
+            terminalCallCancelled = call.isCanceled()
+            finish("failed_${ioe.javaClass.simpleName}")
+        }
 
         private fun timeOrNull(): Long? = try { nowMs() } catch (_: Exception) { null }
 
@@ -87,6 +95,7 @@ internal class VpnProbeTimingTrace(private val nowMs: () -> Long) {
             val elapsed = if (start == null || end == null) "unknown" else (end - start).coerceAtLeast(0L).toString()
             val stages = events.joinToString(",")
             return "endpoint=$endpoint outcome=$outcome elapsed_ms=$elapsed " +
+                "call_cancelled=${terminalCallCancelled ?: "unknown"} " +
                 "dns_last_ipv4_count=${dnsLastIpv4Count ?: "unknown"} " +
                 "dns_last_ipv6_count=${dnsLastIpv6Count ?: "unknown"} connect_last_family=$connectLastFamily " +
                 "events_truncated=${eventCount.get() > MAX_EVENTS_PER_REQUEST} stages=$stages"

@@ -281,9 +281,12 @@ class LiveVpnDeviceTest {
         assertNotNull("No matching saved transport profile exists on the selected edge", profile)
         assertTrue("UI startup uses the selected profile, not a transport override",
             !uiStart || transport == null || transport == selected!!.transport)
-        val mode = if (uiStart) VpnEnginePreferences(context).getMode() else {
+        val settings = VpnEnginePreferences(context.secureStore).readSettings()
+        val mode = if (uiStart) settings.mode else {
             engineFromTestArgument(args.getString("engine"))
         }
+        report("event=startup_settings fast_dns=${settings.fastDnsEnabled} ipv4_only=${settings.ipv4OnlyEnabled} " +
+            "dpi_compatibility=${settings.dpiCompatibilityEnabled} seamless_failover=${settings.seamlessFailoverEnabled}")
         val idleSeconds = (args.getString("idleSeconds")?.toLongOrNull() ?: 60L).coerceIn(60L, 600L)
         val resumeVpnActivity = args.getString("resumeVpnActivity") != "false"
         val smallProbesOnly = args.getString("smallProbesOnly") == "true"

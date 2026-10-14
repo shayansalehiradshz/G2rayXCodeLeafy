@@ -47,6 +47,19 @@ class VpnProbeTimingTraceTest {
     }
 
     @Test
+    fun labelsExplicitCancellationWithoutInferringAnEndpointFailure() {
+        val trace = VpnProbeTimingTrace { 0L }
+        val listener = trace.listenerFor("www.gstatic.com")
+        listener.callStart(call)
+        call.cancel()
+        listener.callFailed(call, IOException("Canceled"))
+
+        val result = trace.summaries().single()
+        assertTrue(result.contains("call_cancelled=true"))
+        assertTrue(result.contains("outcome=failed_IOException"))
+    }
+
+    @Test
     fun recordsAddressFamilyCountsWithoutLoggingAddresses() {
         val ipv4 = InetAddress.getByAddress(byteArrayOf(192.toByte(), 0, 2, 1))
         val ipv6 = InetAddress.getByAddress(ByteArray(16).apply { this[15] = 1 })
