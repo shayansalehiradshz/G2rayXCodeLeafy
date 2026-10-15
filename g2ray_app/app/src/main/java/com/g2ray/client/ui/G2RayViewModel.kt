@@ -1306,7 +1306,8 @@ class G2RayViewModel internal constructor(
                         // seconds. Prefer a short accurate direct check over
                         // needlessly waking an already-running Codespace.
                         timeoutSeconds = 4,
-                        dpiCompatibilityEnabled = dpiCompatibilityEnabled.value
+                        dpiCompatibilityEnabled = dpiCompatibilityEnabled.value,
+                        checkActive = { coroutineContext.ensureActive() }
                     )
                 }
                 if (result.success) {
@@ -2141,7 +2142,8 @@ class G2RayViewModel internal constructor(
                                 manager.measureDelayQuick(
                                     profile = profile,
                                     datDir = datDir,
-                                    dpiCompatibilityEnabled = dpiCompatibilityEnabled.value
+                                    dpiCompatibilityEnabled = dpiCompatibilityEnabled.value,
+                                    checkActive = { coroutineContext.ensureActive(); checkMeasurementNetwork(measurement) }
                                 )
                             }
                         } catch (cancelled: CancellationException) {

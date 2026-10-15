@@ -47,7 +47,43 @@ A physical-network DNS race is retryable recovery, not an Auto packet-engine
 fallback. Disabling seamless failover must retain the single-route behavior.
 Native batch scans must observe cancellation and queued VPN ownership between
 completed calls, skip optional retries, and release the lease and tempfiles.
+Single-profile probes must make the same checks inside port retries and before
+another endpoint. Summary, quick-scan fallback, and direct-start callers must
+forward cancellation/network checks through every completed native call.
 Never force-stop an in-flight JNI call to make VPN startup appear faster.
+
+If no compatible live group resolves, startup must return a retryable
+EndpointResolution result so ordinary unmeasured saved IP profiles remain
+reachable. Scan at most six backup candidates; skip DNS-only/config-rejection
+failures without increasing the one actual route attempt before wake. Preserve
+ranking for that single attempt. A physical-network race must return before
+another packet engine, backup, or Worker/GitHub wake is attempted.
+
+Both full-VPN and SOCKS health checks must consume complete small successful
+responses within the existing call/quorum deadlines. Truncation, early EOF,
+and bodies over 64 KiB (including unknown-length bodies) must fail; complete
+small bodies and empty HTTP 204 must pass. These probes establish endpoint
+health, not complete Google pages, AI streams, or video playback.
+The full-VPN check must also wait until Android selects VPN default routing,
+including that wait in its unchanged 4.5-second budget. Physical/unknown
+default routing must send no health requests or produce verified success.
+Losing VPN default routing before the check completes must reject its result.
+This routing requirement applies to debug and release builds.
+Owned loopback responses that stall after success headers must honor read
+deadlines and cancellation. Complete known/unknown-length responses at the
+64 KiB boundary and empty unknown-length responses must remain valid.
+
+Successful startup, recovery, and Native startup-confirmation results must
+carry the physical-network generation they tested. Recheck it atomically with
+network callbacks at final verified-state publication, including while the
+result waits in the main queue. Reject an obsolete result and verify the new
+path without restarting a healthy core. A fresh successful handoff must also
+verify an already unverified connected core. Do not attribute an old network's
+late socket-bind/protection error to its replacement or let it mask a real
+current failure. Reject dialer/control-plane binds that finish across handoff.
+Publishing a replacement network must not clear its first genuine dialer error.
+Descriptor ordering fixtures simulate binding; real descriptor protection and
+duplication still require packaged-core/device acceptance.
 
 ## Isolated Linux retained-flow diagnosis
 

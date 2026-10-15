@@ -707,18 +707,66 @@ class XrayCoreManagerTest {
     }
 
     @Test
+    fun singleDelayPortRetryYieldsToAWaitingVpnAndRemovesItsConfig() = runTest {
+        val bridge = FakeXrayBridge(available = true).apply {
+            pingResults += XrayPingResult(false, null, "address already in use")
+            pingResults += XrayPingResult(true, 100L, null)
+        }
+        val manager = XrayCoreManager(bridge)
+        val runtime = XrayCoreManager::class.java.getDeclaredMethod("getNativeRuntime")
+            .apply { isAccessible = true }.invoke(manager) as NativeRuntimeCoordinator
+        var waiting: kotlinx.coroutines.Deferred<NativeRuntimeCoordinator.Lease>? = null
+        bridge.onPing = {
+            if (waiting == null) waiting = async(start = CoroutineStart.UNDISPATCHED) { runtime.acquireVpn() }
+        }
+        try {
+            val failure = runCatching {
+                manager.measureDelay(sampleProfile(), System.getProperty("java.io.tmpdir") ?: ".")
+            }.exceptionOrNull()
+            assertTrue("Single-profile retries must yield the native lease to VPN startup", failure is CancellationException)
+            assertEquals(1, bridge.pingRequests.size)
+            val request = JSONObject(String(android.util.Base64.decode(bridge.pingRequest, android.util.Base64.DEFAULT)))
+            assertFalse(java.io.File(request.getString("configPath")).exists())
+        } finally {
+            waiting?.await()?.close()
+        }
+        assertTrue(runtime.tryAcquireProbe()?.also { it.close() } != null)
+    }
+
+    @Test
+    fun detailedDelayDoesNotRetryAPortOnAnObsoleteNetwork() {
+        val bridge = FakeXrayBridge(available = true).apply {
+            pingResults += XrayPingResult(false, null, "address already in use")
+            pingResults += XrayPingResult(true, 100L, null)
+        }
+        var networkChanged = false
+        bridge.onPing = { networkChanged = true }
+        val manager = XrayCoreManager(bridge)
+        val failure = runCatching {
+            manager.measureDelaySummary(
+                sampleProfile(), System.getProperty("java.io.tmpdir") ?: ".",
+                checkActive = { if (networkChanged) throw java.io.IOException("Fixture handoff") }
+            )
+        }.exceptionOrNull()
+        assertTrue(failure is java.io.IOException)
+        assertEquals("A completed native call must be followed by a context check before retry", 1, bridge.pingRequests.size)
+        val request = JSONObject(String(android.util.Base64.decode(bridge.pingRequest, android.util.Base64.DEFAULT)))
+        assertFalse(java.io.File(request.getString("configPath")).exists())
+    }
+
+    @Test
     fun detailedDelayStopsBetweenNativeSamplesWhenItsMeasurementContextChanges() {
         val bridge = FakeXrayBridge(available = true).apply {
             pingResult = XrayPingResult(true, 100L, null)
         }
         val manager = XrayCoreManager(bridge)
-        var checks = 0
+        var networkChanged = false
+        bridge.onPing = { networkChanged = true }
         val failure = runCatching {
             manager.measureDelaySummary(
                 sampleProfile(), System.getProperty("java.io.tmpdir") ?: ".", sampleCount = 3,
                 checkActive = {
-                    checks++
-                    if (checks > 1) throw java.io.IOException("Physical network changed")
+                    if (networkChanged) throw java.io.IOException("Physical network changed")
                 }
             )
         }.exceptionOrNull()
@@ -882,6 +930,7 @@ class XrayCoreManagerTest {
         var pingResult = XrayPingResult(success = true, delayMs = 123, error = null)
         var pingResults = mutableListOf<XrayPingResult>()
         var pingFailure: RuntimeException? = null
+        var onPing: (() -> Unit)? = null
         var invokeAvailable = false
         var batchConfigs = emptyList<XrayPingBatchConfig>()
         var batchResult = XrayPingBatchResult(false, emptyList(), "batch unavailable")
@@ -950,6 +999,7 @@ class XrayCoreManagerTest {
             val requestJson = String(android.util.Base64.decode(base64Request, android.util.Base64.DEFAULT))
             val request = JSONObject(requestJson)
             pingConfigJson = java.io.File(request.getString("configPath")).readText()
+            onPing?.invoke()
             return if (pingResults.isNotEmpty()) {
                 pingResults.removeAt(0)
             } else {

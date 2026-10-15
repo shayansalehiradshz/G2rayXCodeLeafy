@@ -5,6 +5,7 @@ import android.util.Log
 import com.g2ray.client.BuildConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -35,8 +36,16 @@ class OkHttpVpnDataPathProbe(
     override suspend fun probe(): RunningRouteResult {
         val startedAtMs = SystemClock.elapsedRealtime()
         val trace = if (BuildConfig.DEBUG) VpnProbeTimingTrace(SystemClock::elapsedRealtime) else null
-        val defaultVpnAtStart = if (trace != null) runCatching { defaultNetworkIsVpn() }.getOrNull() else null
+        val defaultVpnAtStart = runCatching { defaultNetworkIsVpn() }.getOrNull()
+        var selectedVpn = defaultVpnAtStart
         val result = withTimeoutOrNull(FULL_PATH_PROBE_TIMEOUT_MS) {
+            // Establishing TUN and selecting it as this app's default route
+            // are asynchronous. A direct physical-network reply is not proof
+            // of VPN health. Include selection wait in the existing deadline.
+            while (selectedVpn != true) {
+                delay(VPN_SELECTION_CHECK_INTERVAL_MS)
+                selectedVpn = runCatching { defaultNetworkIsVpn() }.getOrNull()
+            }
             SocksRunningRouteProbe.probeUntilDecided(SocksRunningRouteProbe.HEALTH_URLS) { url ->
                 probeOne(client(), url, trace)
             }
@@ -46,17 +55,20 @@ class OkHttpVpnDataPathProbe(
             failureScope = RouteFailureScope.PacketEngine
         )
         val finishedAtMs = SystemClock.elapsedRealtime()
+        val defaultVpnAtEnd = runCatching { defaultNetworkIsVpn() }.getOrNull()
+        val checkedResult = if (result.success && defaultVpnAtEnd != true) {
+            result.copy(success = false, error = "Android stopped using VPN default routing during health verification")
+        } else result
         if (trace != null) {
-            val defaultVpnAtEnd = runCatching { defaultNetworkIsVpn() }.getOrNull()
             trace.summaries().forEach { timing ->
                 Log.i("G2RayVpnProbe", "default_vpn_start=${defaultVpnAtStart ?: "unknown"} " +
                     "default_vpn_end=${defaultVpnAtEnd ?: "unknown"} $timing")
             }
         }
-        return result.copy(
-            error = result.error?.let { "Full VPN data path: $it" },
+        return checkedResult.copy(
+            error = checkedResult.error?.let { "Full VPN data path: $it" },
             latencyMs = (finishedAtMs - startedAtMs).coerceAtLeast(0L),
-            failureScope = if (result.success) RouteFailureScope.None else RouteFailureScope.PacketEngine
+            failureScope = if (checkedResult.success) RouteFailureScope.None else RouteFailureScope.PacketEngine
         )
     }
 
@@ -116,13 +128,8 @@ class OkHttpVpnDataPathProbe(
                 }
 
                 override fun onResponse(call: Call, response: Response) {
-                    val code = response.use { it.code }
                     continuation.resume(
-                        if (code in 200..299) {
-                            SocksRunningRouteProbe.RouteProbeOutcome(success = true)
-                        } else {
-                            SocksRunningRouteProbe.RouteProbeOutcome(error = "$url: HTTP $code")
-                        },
+                        evaluateRouteProbeResponse(url, response),
                         onCancellation = { _, _, _ -> }
                     )
                 }
@@ -141,5 +148,6 @@ class OkHttpVpnDataPathProbe(
 
     private companion object {
         const val FULL_PATH_PROBE_TIMEOUT_MS = 4_500L
+        const val VPN_SELECTION_CHECK_INTERVAL_MS = 50L
     }
 }

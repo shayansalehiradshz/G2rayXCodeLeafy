@@ -5,15 +5,24 @@ import android.net.DnsResolver
 import android.net.VpnService
 import android.os.Build
 import android.os.CancellationSignal
+import android.os.ParcelFileDescriptor
+import java.io.FileDescriptor
+import java.io.File
 import java.io.IOException
 import java.net.Socket
 import java.net.SocketException
 import java.net.InetAddress
 import java.net.UnknownHostException
 import java.util.concurrent.Executor
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertThrows
@@ -30,7 +39,8 @@ import org.robolectric.shadow.api.Shadow
 @Config(sdk = [Build.VERSION_CODES.S], shadows = [
     SocketProtectorTest.ProtectionShadow::class,
     SocketProtectorTest.BindingShadow::class,
-    SocketProtectorTest.ResolverShadow::class
+    SocketProtectorTest.ResolverShadow::class,
+    SocketProtectorTest.DescriptorShadow::class
 ])
 class SocketProtectorTest {
     private lateinit var selectedNetwork: Network
@@ -40,17 +50,100 @@ class SocketProtectorTest {
         events.clear()
         protectionAllowed = true
         bindingFails = false
+        bindingAction = null
         resolvedAddresses = emptyArray()
         lookupNetwork = null
         SocketProtector.vpnService = G2RayVpnService()
         selectedNetwork = Shadow.newInstanceOf(Network::class.java)
         SocketProtector.updateUnderlyingNetwork(selectedNetwork)
+        SocketProtector.clearDialerFailure()
+        duplicateFiles.forEach { it.delete() }
+        duplicateFiles.clear()
     }
 
     @After
     fun tearDown() {
         SocketProtector.vpnService = null
         SocketProtector.updateUnderlyingNetwork(null)
+        SocketProtector.clearDialerFailure()
+        duplicateFiles.forEach { it.delete() }
+        duplicateFiles.clear()
+    }
+
+    @Test
+    fun aLateOldNetworkBindingFailureIsNotAHealthFailureOfItsReplacement() = withDescriptor { fd ->
+        bindingAction = {
+            SocketProtector.updateUnderlyingNetwork(org.robolectric.shadows.ShadowNetwork.newInstance(102))
+            throw IOException("Fixture obsolete physical network")
+        }
+        assertFalse(SocketProtector.protectAndBindDialer(fd))
+        assertNull("Old network errors must not restart the replacement tunnel", SocketProtector.consumeDialerFailure())
+    }
+
+    @Test
+    fun aLateOldFailureCannotHideARealFailureOnTheNewNetwork() = withDescriptor { fd ->
+        bindingAction = {
+            SocketProtector.updateUnderlyingNetwork(org.robolectric.shadows.ShadowNetwork.newInstance(102))
+            throw IOException("Fixture obsolete physical network")
+        }
+        assertFalse(SocketProtector.protectAndBindDialer(fd))
+        bindingAction = { throw IOException("Fixture current physical network") }
+        assertFalse(SocketProtector.protectAndBindDialer(fd))
+        assertTrue(SocketProtector.consumeDialerFailure()?.contains("Fixture current physical network") == true)
+    }
+
+    @Test
+    fun stableNetworkBindingFailuresRemainVisibleExactlyOnce() = withDescriptor { fd ->
+        bindingAction = { throw IOException("Fixture current physical network") }
+        assertFalse(SocketProtector.protectAndBindDialer(fd))
+        assertTrue(SocketProtector.consumeDialerFailure()?.contains("Fixture current physical network") == true)
+        assertNull(SocketProtector.consumeDialerFailure())
+    }
+
+    @Test
+    fun aSuccessfulBindToAnObsoletePhysicalNetworkCannotStartADialer() = withDescriptor { fd ->
+        bindingAction = {
+            SocketProtector.updateUnderlyingNetwork(org.robolectric.shadows.ShadowNetwork.newInstance(102))
+        }
+        assertFalse(SocketProtector.protectAndBindDialer(fd))
+        assertNull(SocketProtector.consumeDialerFailure())
+    }
+
+    @Test
+    fun aControlPlaneSocketBoundDuringHandoffIsRetriedOnTheCurrentNetwork() {
+        bindingAction = {
+            SocketProtector.updateUnderlyingNetwork(org.robolectric.shadows.ShadowNetwork.newInstance(102))
+        }
+        TrackingSocket().use { socket -> assertFalse(SocketProtector.protectControlPlane(socket)) }
+    }
+
+    @Test
+    fun serviceHandoffDoesNotEraseAReplacementNetworksFirstDialerFailure() = runBlocking {
+        val observer = launch(Dispatchers.Unconfined, start = CoroutineStart.UNDISPATCHED) {
+            SocketProtector.underlyingNetworks.drop(1).collect {
+                protectionAllowed = false
+                try {
+                    assertFalse(SocketProtector.protectAndBindDialer(-1))
+                } finally {
+                    protectionAllowed = true
+                }
+            }
+        }
+        try {
+            G2RayVpnService::class.java.getDeclaredMethod(
+                "applyUnderlyingNetwork", Network::class.java, Boolean::class.javaPrimitiveType
+            ).apply { isAccessible = true }.invoke(
+                SocketProtector.vpnService, org.robolectric.shadows.ShadowNetwork.newInstance(102), false
+            )
+            assertTrue(SocketProtector.consumeDialerFailure()?.contains("Android rejected VPN protection") == true)
+        } finally {
+            observer.cancel()
+        }
+    }
+
+    private fun withDescriptor(block: (Int) -> Unit) {
+        val pipe = ParcelFileDescriptor.createPipe()
+        try { block(pipe[0].fd) } finally { pipe.forEach { it.close() } }
     }
 
     @Test
@@ -170,9 +263,28 @@ class SocketProtectorTest {
     @Implements(VpnService::class)
     class ProtectionShadow {
         @Implementation
+        fun protect(fd: Int): Boolean = protectionAllowed
+
+        @Implementation
         fun protect(socket: Socket): Boolean {
             events += "protect"
             return protectionAllowed && (socket as TrackingSocket).initialized
+        }
+    }
+
+    // Robolectric does not implement Android's raw-int fromFd path on the
+    // JVM. These tests exercise handoff ordering, using independently closed
+    // file-backed duplicates; real socket duplication still needs a device.
+    @Implements(ParcelFileDescriptor::class)
+    class DescriptorShadow : org.robolectric.shadows.ShadowParcelFileDescriptor() {
+        companion object {
+            @JvmStatic
+            @Implementation
+            fun fromFd(fd: Int): ParcelFileDescriptor {
+                val file = File.createTempFile("g2ray-dialer-fixture-", ".tmp")
+                duplicateFiles += file
+                return ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_WRITE)
+            }
         }
     }
 
@@ -188,7 +300,14 @@ class SocketProtectorTest {
         fun bindSocket(socket: Socket) {
             events += "bind"
             check((socket as TrackingSocket).initialized)
+            bindingAction?.invoke()
             if (bindingFails) throw IOException("Network was lost")
+        }
+
+        @Implementation
+        fun bindSocket(fd: FileDescriptor) {
+            events += "bind_fd"
+            bindingAction?.invoke()
         }
     }
 
@@ -213,7 +332,9 @@ class SocketProtectorTest {
         val events = mutableListOf<String>()
         var protectionAllowed = true
         var bindingFails = false
+        var bindingAction: (() -> Unit)? = null
         var resolvedAddresses = emptyArray<InetAddress>()
         var lookupNetwork: Network? = null
+        val duplicateFiles = mutableListOf<File>()
     }
 }

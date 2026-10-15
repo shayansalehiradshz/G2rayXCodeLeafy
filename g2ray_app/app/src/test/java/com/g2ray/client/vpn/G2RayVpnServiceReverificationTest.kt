@@ -63,6 +63,21 @@ class G2RayVpnServiceReverificationTest {
     }
 
     @Test
+    fun aSuccessfulDirectHandoffVerifiesAnAlreadyUnverifiedConnectedCore() = runTest {
+        val probe = CountingProbe()
+        withConnectedService(probe) { service, bridge ->
+            assertFalse(VpnStateRepository.state.value.tunnelVerified)
+            applyNetwork(service, ShadowNetwork.newInstance(101))
+            advanceTimeBy(2_500L)
+            runCurrent()
+            assertEquals(1, probe.calls)
+            assertEquals(0, bridge.stops)
+            assertTrue(VpnStateRepository.state.value.tunnelVerified)
+            assertTrue(VpnStateRepository.state.value.routeReady)
+        }
+    }
+
+    @Test
     fun promptFailureFromAnObsoleteNetworkDoesNotConfirmOrRestartTheTunnel() = runTest {
         val probe = CountingProbe()
         withConnectedService(probe) { service, bridge ->

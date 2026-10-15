@@ -38,7 +38,10 @@ data class RunningRouteResult(
     val latencyMs: Long? = null,
     val failureScope: RouteFailureScope = if (success) RouteFailureScope.None else RouteFailureScope.Unknown,
     val retryAllowed: Boolean = true,
-    val retryAfterMs: Long? = null
+    val retryAfterMs: Long? = null,
+    // Set by VpnService after a successful full-path check. Publication must
+    // still match this generation after waiting for the main dispatcher.
+    val verifiedNetworkGeneration: Long? = null
 )
 
 enum class RouteFailureScope {
@@ -46,6 +49,7 @@ enum class RouteFailureScope {
     Configuration,
     PacketEngine,
     XrayRoute,
+    EndpointResolution,
     DialerBinding,
     Unknown
 }
@@ -114,12 +118,7 @@ class SocksRunningRouteProbe : RunningRouteProbe {
                 }
 
                 override fun onResponse(call: Call, response: Response) {
-                    val responseCode = response.use { it.code }
-                    val outcome = if (responseCode in 200..299) {
-                        RouteProbeOutcome(success = true)
-                    } else {
-                        RouteProbeOutcome(error = "$url: HTTP $responseCode")
-                    }
+                    val outcome = evaluateRouteProbeResponse(url, response)
                     continuation.resume(outcome, onCancellation = { _, _, _ -> })
                 }
             })
@@ -364,11 +363,13 @@ class XrayCoreManager : TunnelCore {
         datDir: String,
         timeoutSeconds: Int = 8,
         testUrl: String = "https://www.google.com/generate_204",
-        dpiCompatibilityEnabled: Boolean = false
+        dpiCompatibilityEnabled: Boolean = false,
+        checkActive: () -> Unit = {}
     ): XrayPingResult {
+        checkActive()
         val lease = nativeRuntime.tryAcquireProbe()
             ?: return XrayPingResult(false, null, "VPN owns the native runtime; delay test deferred")
-        return lease.use { measureDelayOwned(profile, datDir, timeoutSeconds, testUrl, dpiCompatibilityEnabled) }
+        return lease.use { measureDelayOwned(profile, datDir, timeoutSeconds, testUrl, dpiCompatibilityEnabled, checkActive) }
     }
 
     private fun measureDelayOwned(
@@ -376,7 +377,8 @@ class XrayCoreManager : TunnelCore {
         datDir: String,
         timeoutSeconds: Int = 8,
         testUrl: String = "https://www.google.com/generate_204",
-        dpiCompatibilityEnabled: Boolean = false
+        dpiCompatibilityEnabled: Boolean = false,
+        checkActive: () -> Unit = {}
     ): XrayPingResult {
         if (!canMeasureDelay()) {
             return XrayPingResult(success = false, delayMs = null, error = "libXray ping is not available in this build.")
@@ -388,6 +390,7 @@ class XrayCoreManager : TunnelCore {
             error = "Delay test could not reserve a local port"
         )
         for (attempt in 0 until DELAY_PORT_ATTEMPTS) {
+            ensureOptionalProbeActive(checkActive)
             var configFile: File? = null
             val result = try {
                 val localPort = portAllocator()
@@ -415,6 +418,7 @@ class XrayCoreManager : TunnelCore {
             } finally {
                 configFile?.let { file -> runCatching { file.delete() } }
             }
+            ensureOptionalProbeActive(checkActive)
             lastResult = result
             if (result.success || !isAddressInUse(result.error) || attempt + 1 >= DELAY_PORT_ATTEMPTS) {
                 return result
@@ -428,7 +432,8 @@ class XrayCoreManager : TunnelCore {
         datDir: String,
         timeoutSeconds: Int = 5,
         testUrls: List<String> = DEFAULT_PREFLIGHT_URLS,
-        dpiCompatibilityEnabled: Boolean = false
+        dpiCompatibilityEnabled: Boolean = false,
+        checkActive: () -> Unit = {}
     ): XrayPingResult {
         if (!canMeasureDelay()) {
             return XrayPingResult(success = false, delayMs = null, error = "libXray ping is not available in this build.")
@@ -442,7 +447,8 @@ class XrayCoreManager : TunnelCore {
                 datDir = datDir,
                 timeoutSeconds = if (index == 0) timeoutSeconds.coerceIn(2, 4) else timeoutSeconds.coerceIn(2, 3),
                 testUrl = url,
-                dpiCompatibilityEnabled = dpiCompatibilityEnabled
+                dpiCompatibilityEnabled = dpiCompatibilityEnabled,
+                checkActive = checkActive
             )
             if (result.success) {
                 return result
@@ -482,7 +488,8 @@ class XrayCoreManager : TunnelCore {
                 datDir = datDir,
                 timeoutSeconds = timeoutSeconds.coerceIn(2, 8),
                 testUrl = url,
-                dpiCompatibilityEnabled = dpiCompatibilityEnabled
+                dpiCompatibilityEnabled = dpiCompatibilityEnabled,
+                checkActive = checkActive
             )
             checkActive()
             val delay = result.delayMs?.takeIf { result.success && it in 1..9999 }
@@ -513,14 +520,16 @@ class XrayCoreManager : TunnelCore {
         datDir: String,
         timeoutSeconds: Int = 3,
         testUrl: String = DEFAULT_PREFLIGHT_URLS.first(),
-        dpiCompatibilityEnabled: Boolean = false
+        dpiCompatibilityEnabled: Boolean = false,
+        checkActive: () -> Unit = {}
     ): XrayDelaySummary {
         val result = measureDelay(
             profile = profile,
             datDir = datDir,
             timeoutSeconds = timeoutSeconds.coerceIn(2, 4),
             testUrl = testUrl,
-            dpiCompatibilityEnabled = dpiCompatibilityEnabled
+            dpiCompatibilityEnabled = dpiCompatibilityEnabled,
+            checkActive = checkActive
         )
         val delay = result.delayMs?.takeIf { result.success && it in 1..9999 }
         return if (delay != null) {
@@ -578,12 +587,7 @@ class XrayCoreManager : TunnelCore {
         dpiCompatibilityEnabled: Boolean = false,
         checkActive: () -> Unit = {}
     ): List<XrayDelaySummary>? {
-        fun checkProbeActive() {
-            checkActive()
-            if (nativeRuntime.hasWaitingVpnStart()) {
-                throw CancellationException("VPN startup superseded optional delay probing")
-            }
-        }
+        fun checkProbeActive() = ensureOptionalProbeActive(checkActive)
         checkProbeActive()
         if (profiles.isEmpty()) return emptyList()
         if (profiles.size > 5) return null
@@ -701,6 +705,13 @@ class XrayCoreManager : TunnelCore {
             null
         } finally {
             configFiles.forEach { file -> runCatching { file.delete() } }
+        }
+    }
+
+    private fun ensureOptionalProbeActive(checkActive: () -> Unit) {
+        checkActive()
+        if (nativeRuntime.hasWaitingVpnStart()) {
+            throw CancellationException("VPN startup superseded optional delay probing")
         }
     }
 

@@ -27,7 +27,18 @@ import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.async
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestDispatcher
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.test.resetMain
+import kotlin.coroutines.CoroutineContext
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -63,6 +74,7 @@ class G2RayVpnServiceStartupTest {
             val result = invokeRoute(service, "startEngineAndVerify", profile(), tun, ActiveVpnEngine.XrayNative, 0L)
 
             assertTrue(result.success)
+            assertEquals(0L, result.verifiedNetworkGeneration)
             assertEquals(2, probes)
             assertEquals(1, bridge.starts)
             assertTrue(bridge.running)
@@ -156,6 +168,395 @@ class G2RayVpnServiceStartupTest {
             assertTrue(error is CancellationException)
             assertEquals(2, probes)
             assertEquals(1, bridge.starts)
+        }
+    }
+
+
+    @Test
+    fun fullPathSuccessOnAnObsoleteStartupNetworkCannotVerifyTheTunnel() = runTest {
+        withRejectedConfigService { service, tun, bridge ->
+            bridge.rejectedAddresses = emptySet()
+            val generation = G2RayVpnService::class.java.getDeclaredField("underlyingNetworkGeneration")
+                .apply { isAccessible = true }.get(service) as java.util.concurrent.atomic.AtomicLong
+            setField(service, "fullVpnDataPathProbe", object : VpnDataPathProbe {
+                override suspend fun probe(): RunningRouteResult {
+                    generation.incrementAndGet()
+                    return RunningRouteResult(true)
+                }
+            })
+            val result = invokeRoute(service, "startEngineAndVerify", profile(), tun,
+                ActiveVpnEngine.XrayNative, 0L)
+            assertFalse("A route tested on the old network must not be accepted", result.success)
+            assertEquals(RouteFailureScope.DialerBinding, result.failureScope)
+            assertEquals(1, bridge.starts)
+        }
+    }
+
+    @Test
+    fun fullPathFailureOnAnObsoleteStartupNetworkDoesNotProbeSocks() = runTest {
+        withRejectedConfigService { service, tun, bridge ->
+            bridge.rejectedAddresses = emptySet()
+            val generation = G2RayVpnService::class.java.getDeclaredField("underlyingNetworkGeneration")
+                .apply { isAccessible = true }.get(service) as java.util.concurrent.atomic.AtomicLong
+            setField(service, "fullVpnDataPathProbe", object : VpnDataPathProbe {
+                override suspend fun probe(): RunningRouteResult {
+                    generation.incrementAndGet()
+                    return RunningRouteResult(false, "Fixture old-network failure")
+                }
+            })
+            val result = invokeRoute(service, "startEngineAndVerify", profile(), tun,
+                ActiveVpnEngine.XrayNative, 0L)
+            assertFalse(result.success)
+            assertEquals(RouteFailureScope.DialerBinding, result.failureScope)
+            assertEquals(1, bridge.starts)
+        }
+    }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun recoveredRouteCannotPublishVerifiedAfterItsNetworkChangesInTheMainQueue() = runTest {
+        checkQueuedRecovery(changedNetwork = true)
+    }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun recoveredRouteOnAnUnchangedNetworkPublishesVerifiedFromTheMainQueue() = runTest {
+        checkQueuedRecovery(changedNetwork = false)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private suspend fun TestScope.checkQueuedRecovery(changedNetwork: Boolean) {
+        val main = HoldFirstDispatch(StandardTestDispatcher(testScheduler))
+        Dispatchers.setMain(main)
+        try {
+            withRejectedConfigService { service, _, bridge ->
+                bridge.rejectedAddresses = emptySet()
+                setField(service, "requestedEngineMode", VpnEngineMode.XrayNative)
+                setField(service, "activeProfile", profile())
+                setField(service, "desiredConnected", true)
+                // runInterruptible uses a real IO thread. Keep the recovery
+                // deadline in real time so virtual time cannot race that thread.
+                setField(service, "scope", kotlinx.coroutines.CoroutineScope(
+                    kotlinx.coroutines.SupervisorJob() + Dispatchers.Unconfined
+                ))
+                var probes = 0
+                setField(service, "fullVpnDataPathProbe", object : VpnDataPathProbe {
+                    override suspend fun probe(): RunningRouteResult {
+                        probes++
+                        return RunningRouteResult(true)
+                    }
+                })
+                G2RayVpnService::class.java.getDeclaredMethod("scheduleRouteRecovery",
+                    String::class.java, Long::class.javaPrimitiveType, RouteFailureScope::class.java)
+                    .apply { isAccessible = true }.invoke(service, "Fixture recovery", 0L, RouteFailureScope.XrayRoute)
+                main.held.await()
+                if (changedNetwork) {
+                    (G2RayVpnService::class.java.getDeclaredField("underlyingNetworkGeneration")
+                        .apply { isAccessible = true }.get(service) as java.util.concurrent.atomic.AtomicLong)
+                        .incrementAndGet()
+                }
+                main.release()
+                runCurrent()
+                assertEquals("Recovery must reach the route before its publication: " +
+                    com.g2ray.client.model.VpnStateRepository.state.value.message, 1, bridge.starts)
+                assertEquals(!changedNetwork, com.g2ray.client.model.VpnStateRepository.state.value.tunnelVerified)
+                assertEquals(!changedNetwork, com.g2ray.client.model.VpnStateRepository.state.value.routeReady)
+                if (changedNetwork) {
+                    val handoff = G2RayVpnService::class.java.getDeclaredField("networkHandoffJob")
+                        .apply { isAccessible = true }.get(service) as kotlinx.coroutines.Job
+                    handoff.join()
+                    assertTrue(com.g2ray.client.model.VpnStateRepository.state.value.tunnelVerified)
+                    assertEquals("Reverify the new path without restarting its healthy core", 1, bridge.starts)
+                }
+                assertEquals(if (changedNetwork) 2 else 1, probes)
+            }
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    private class HoldFirstDispatch(private val delegate: TestDispatcher) : CoroutineDispatcher() {
+        val held = CompletableDeferred<Unit>()
+        private var task: Pair<CoroutineContext, Runnable>? = null
+        override fun dispatch(context: CoroutineContext, block: Runnable) {
+            if (!held.isCompleted) {
+                task = context to block
+                held.complete(Unit)
+            } else delegate.dispatch(context, block)
+        }
+        fun release() {
+            val (context, block) = checkNotNull(task)
+            task = null
+            delegate.dispatch(context, block)
+        }
+    }
+
+    @Test
+    fun unresolvedPrimaryReturnsARetryableRouteFailureBeforeCoreStartup() = runTest {
+        withRejectedConfigService { service, tun, bridge ->
+            SocketProtector.vpnService = service
+            SocketProtector.updateUnderlyingNetwork(Shadow.newInstanceOf(Network::class.java))
+            endpointLookupAction = { throw java.net.UnknownHostException("Fixture DNS unavailable") }
+            try {
+                val result = invokeRoute(
+                    service, "startEngineAndVerify", profile("front.example"), tun,
+                    ActiveVpnEngine.XrayNative, 0L
+                )
+                assertFalse(result.success)
+                assertTrue(result.retryAllowed)
+                assertEquals("EndpointResolution", result.failureScope.name)
+                assertTrue(result.error?.contains("Fixture DNS unavailable") == true)
+                assertEquals(0, bridge.starts)
+            } finally {
+                endpointLookupAction = null
+                SocketProtector.vpnService = null
+                SocketProtector.updateUnderlyingNetwork(null)
+            }
+        }
+    }
+
+    @Test
+    fun unresolvedPrimaryDoesNotRepeatDnsWithAnotherPacketEngine() = runTest {
+        withRejectedConfigService { service, tun, bridge ->
+            SocketProtector.vpnService = service
+            SocketProtector.updateUnderlyingNetwork(Shadow.newInstanceOf(Network::class.java))
+            setField(service, "requestedEngineMode", VpnEngineMode.Auto)
+            var lookups = 0
+            endpointLookupAction = {
+                lookups++
+                throw java.net.UnknownHostException("Fixture DNS unavailable")
+            }
+            try {
+                val result = invokeRoute(
+                    service, "startBestEngineAndVerify", profile("front.example"), tun,
+                    0L, ActiveVpnEngine.Hev
+                )
+                assertFalse(result.success)
+                assertTrue(result.retryAllowed)
+                assertEquals(1, lookups)
+                assertEquals(0, bridge.starts)
+            } finally {
+                endpointLookupAction = null
+                SocketProtector.vpnService = null
+                SocketProtector.updateUnderlyingNetwork(null)
+            }
+        }
+    }
+
+    @Test
+    fun primaryDnsFailureTriesAnUnmeasuredIpBackupBeforeWake() = runTest {
+        withRejectedConfigService { service, tun, bridge ->
+            val repository = backupRepository(service, withWorkingBackup = false)
+            bridge.rejectedAddresses = emptySet()
+            setField(service, "requestedEngineMode", VpnEngineMode.XrayNative)
+            setField(service, "fullVpnDataPathProbe", object : VpnDataPathProbe {
+                override suspend fun probe() = RunningRouteResult(true)
+            })
+            setField(service, "codespaceWakeCoordinator\$delegate", lazyOf(CodespaceWakeCoordinator(
+                workerWake = { _, _ -> error("Working IP backup must precede Worker wake") },
+                githubWake = { _, _ -> error("Working IP backup must precede GitHub wake") }
+            )))
+            SocketProtector.vpnService = service
+            SocketProtector.updateUnderlyingNetwork(Shadow.newInstanceOf(Network::class.java))
+            endpointLookupAction = { throw java.net.UnknownHostException("Fixture DNS unavailable") }
+            try {
+                val result = invokeRoute(
+                    service, "recoverRouteWithWorkerAttempt", profile("front.example"), tun, 0L,
+                    "Primary DNS unavailable", RouteFailureScope.XrayRoute,
+                    WakeRetryCooldown(SystemClock::elapsedRealtime)
+                )
+                assertTrue(result.success)
+                assertEquals(listOf("203.0.113.2"), bridge.addresses)
+                assertEquals("203.0.113.2", repository.profiles.value.single {
+                    it.id == repository.activeSelection.value.profileId
+                }.address)
+            } finally {
+                endpointLookupAction = null
+                SocketProtector.vpnService = null
+                SocketProtector.updateUnderlyingNetwork(null)
+            }
+        }
+    }
+
+    @Test
+    fun unresolvedBackupDoesNotPreventTryingTheNextIpProfile() = runTest {
+        withRejectedConfigService { service, tun, bridge ->
+            val repository = AccountRepository(InMemorySecureStore())
+            val account = repository.addAccount("Fixture", "", "fixture-space")
+            listOf(profile("unresolved.example"), profile("203.0.113.3")).forEach { backup ->
+                repository.importProfile(account.id, backup.address, backup.rawUri, backup)
+            }
+            setField(service, "accountRepository\$delegate", lazyOf(repository))
+            setField(service, "activeAccountId", account.id)
+            setField(service, "requestedEngineMode", VpnEngineMode.XrayNative)
+            bridge.rejectedAddresses = emptySet()
+            setField(service, "fullVpnDataPathProbe", object : VpnDataPathProbe {
+                override suspend fun probe() = RunningRouteResult(true)
+            })
+            SocketProtector.vpnService = service
+            SocketProtector.updateUnderlyingNetwork(Shadow.newInstanceOf(Network::class.java))
+            endpointLookupAction = { throw java.net.UnknownHostException("Fixture DNS unavailable") }
+            try {
+                val result = invokeOptionalRoute(service, "tryAlternativeStoredProfiles", profile(), tun, 0L, 6)
+                assertTrue(result?.success == true)
+                assertEquals(listOf("203.0.113.3"), bridge.addresses)
+            } finally {
+                endpointLookupAction = null
+                SocketProtector.vpnService = null
+                SocketProtector.updateUnderlyingNetwork(null)
+            }
+        }
+    }
+
+    @Test
+    fun cancelledEndpointResolutionNeverStartsOrRecoversAnotherEngine() = runTest {
+        withRejectedConfigService { service, tun, bridge ->
+            SocketProtector.vpnService = service
+            SocketProtector.updateUnderlyingNetwork(Shadow.newInstanceOf(Network::class.java))
+            val startup = async(start = kotlinx.coroutines.CoroutineStart.LAZY) {
+                invokeRoute(service, "startBestEngineAndVerify", profile("front.example"), tun,
+                    0L, ActiveVpnEngine.Hev)
+            }
+            endpointLookupAction = { startup.cancel(kotlinx.coroutines.CancellationException("Fixture stop")) }
+            try {
+                startup.start()
+                val failure = runCatching { startup.await() }.exceptionOrNull()
+                assertTrue(failure is kotlinx.coroutines.CancellationException)
+            } finally {
+                assertEquals(0, bridge.starts)
+                endpointLookupAction = null
+                SocketProtector.vpnService = null
+                SocketProtector.updateUnderlyingNetwork(null)
+            }
+        }
+    }
+
+    @Test
+    fun preWakeRouteBudgetSkipsUnresolvedBackupsAndReachesTheIpRoute() = runTest {
+        withRejectedConfigService { service, tun, bridge ->
+            val repository = wakeConfiguredBackupRepository(service, withIpBackup = true)
+            bridge.rejectedAddresses = emptySet()
+            setField(service, "fullVpnDataPathProbe", object : VpnDataPathProbe {
+                override suspend fun probe() = RunningRouteResult(true)
+            })
+            SocketProtector.vpnService = service
+            SocketProtector.updateUnderlyingNetwork(Shadow.newInstanceOf(Network::class.java))
+            endpointLookupAction = { throw java.net.UnknownHostException("Fixture DNS unavailable") }
+            try {
+                val result = invokeRoute(
+                    service, "recoverRouteWithWorkerAttempt", profile("front.example"), tun, 0L,
+                    "Primary DNS unavailable", RouteFailureScope.EndpointResolution,
+                    WakeRetryCooldown(SystemClock::elapsedRealtime)
+                )
+                assertTrue(result.success)
+                assertEquals(listOf("203.0.113.3"), bridge.addresses)
+                assertEquals("203.0.113.3", repository.profiles.value.single {
+                    it.id == repository.activeSelection.value.profileId
+                }.address)
+            } finally {
+                endpointLookupAction = null
+                SocketProtector.vpnService = null
+                SocketProtector.updateUnderlyingNetwork(null)
+            }
+        }
+    }
+
+    @Test
+    fun networkChangeWhileResolvingABackupReturnsBeforeWake() = runTest {
+        withRejectedConfigService { service, tun, bridge ->
+            wakeConfiguredBackupRepository(service, withIpBackup = false)
+            SocketProtector.vpnService = service
+            SocketProtector.updateUnderlyingNetwork(Shadow.newInstanceOf(Network::class.java))
+            val generation = G2RayVpnService::class.java.getDeclaredField("underlyingNetworkGeneration")
+                .apply { isAccessible = true }.get(service) as java.util.concurrent.atomic.AtomicLong
+            var lookups = 0
+            endpointLookupAction = {
+                lookups++
+                if (lookups == 2) generation.incrementAndGet()
+                throw java.net.UnknownHostException("Fixture DNS unavailable")
+            }
+            try {
+                val result = invokeRoute(
+                    service, "recoverRouteWithWorkerAttempt", profile("front.example"), tun, 0L,
+                    "Primary DNS unavailable", RouteFailureScope.EndpointResolution,
+                    WakeRetryCooldown(SystemClock::elapsedRealtime)
+                )
+                assertFalse(result.success)
+                assertTrue(result.retryAllowed)
+                assertEquals(RouteFailureScope.DialerBinding, result.failureScope)
+                assertEquals(2, lookups)
+                assertEquals(0, bridge.starts)
+            } finally {
+                endpointLookupAction = null
+                SocketProtector.vpnService = null
+                SocketProtector.updateUnderlyingNetwork(null)
+            }
+        }
+    }
+
+    private fun wakeConfiguredBackupRepository(
+        service: G2RayVpnService, withIpBackup: Boolean
+    ): AccountRepository {
+        val repository = AccountRepository(InMemorySecureStore())
+        val account = repository.addAccount("Fixture", "", "fixture-space", wakeMode = CodespaceWakeMode.GITHUB_DIRECT)
+        repository.addApiKey(account.id, "Fixture", "fixture-only-token", kind = ApiKeyKind.GITHUB_TOKEN)
+        val backups = listOfNotNull(profile("unresolved.example"), profile("203.0.113.3").takeIf { withIpBackup })
+        backups.forEach { backup -> repository.importProfile(account.id, backup.address, backup.rawUri, backup) }
+        setField(service, "accountRepository\$delegate", lazyOf(repository))
+        setField(service, "activeAccountId", account.id)
+        setField(service, "requestedEngineMode", VpnEngineMode.XrayNative)
+        setField(service, "codespaceWakeCoordinator\$delegate", lazyOf(CodespaceWakeCoordinator(
+            workerWake = { _, _ -> error("Route/DNS recovery must precede Worker wake") },
+            githubWake = { _, _ -> error("Route/DNS recovery must precede GitHub wake") }
+        )))
+        return repository
+    }
+
+    @Test
+    fun skippedDnsBackupDoesNotIncreaseTheActualPreWakeRouteAttemptLimit() = runTest {
+        withRejectedConfigService { service, tun, bridge ->
+            val repository = wakeConfiguredBackupRepository(service, withIpBackup = true)
+            val next = profile("203.0.113.4")
+            repository.importProfile(repository.activeSelection.value.accountId!!, "Next", next.rawUri, next)
+            bridge.rejectedAddresses = setOf("203.0.113.3")
+            bridge.rejectionError = "Fixture temporary network failure"
+            SocketProtector.vpnService = service
+            SocketProtector.updateUnderlyingNetwork(Shadow.newInstanceOf(Network::class.java))
+            endpointLookupAction = { throw java.net.UnknownHostException("Fixture DNS unavailable") }
+            try {
+                val result = invokeOptionalRoute(service, "tryAlternativeStoredProfiles", profile(), tun, 0L, 1)
+                assertFalse(result?.success == true)
+                assertTrue(result?.retryAllowed == true)
+                assertEquals("Only one actual route may be tried before wake", listOf("203.0.113.3"), bridge.addresses)
+            } finally {
+                endpointLookupAction = null
+                SocketProtector.vpnService = null
+                SocketProtector.updateUnderlyingNetwork(null)
+            }
+        }
+    }
+
+    @Test
+    fun singlePreWakeAttemptKeepsTheHighestRankedRouteWhenAllBackupsUseWs() = runTest {
+        withRejectedConfigService { service, tun, bridge ->
+            val repository = AccountRepository(InMemorySecureStore())
+            val account = repository.addAccount("Fixture", "", "fixture-space")
+            listOf("203.0.113.3", "203.0.113.4").forEach { address ->
+                val backup = VlessUriParser.parse(
+                    profile(address).rawUri.replace("type=xhttp", "type=ws").replace("alpn=h2", "alpn=http%2F1.1")
+                ).getOrThrow()
+                repository.importProfile(account.id, address, backup.rawUri, backup)
+            }
+            setField(service, "accountRepository\$delegate", lazyOf(repository))
+            setField(service, "activeAccountId", account.id)
+            setField(service, "requestedEngineMode", VpnEngineMode.XrayNative)
+            bridge.rejectedAddresses = emptySet()
+            setField(service, "fullVpnDataPathProbe", object : VpnDataPathProbe {
+                override suspend fun probe() = RunningRouteResult(true)
+            })
+            val result = invokeOptionalRoute(service, "tryAlternativeStoredProfiles", profile(), tun, 0L, 1)
+            assertTrue(result?.success == true)
+            assertEquals(listOf("203.0.113.3"), bridge.addresses)
         }
     }
 
@@ -326,6 +727,7 @@ class G2RayVpnServiceStartupTest {
         runningRouteProbe: RunningRouteProbe = RunningRouteProbe { error("A rejected config must not probe the network") },
         block: suspend (G2RayVpnService, ParcelFileDescriptor, RejectingBridge) -> Unit
     ) {
+        val previousVpnState = com.g2ray.client.model.VpnStateRepository.state.value
         val service = Robolectric.buildService(G2RayVpnService::class.java).create().get()
         val pipe = ParcelFileDescriptor.createPipe()
         val bridge = RejectingBridge()
@@ -345,6 +747,7 @@ class G2RayVpnServiceStartupTest {
             core.stop()
             service.onDestroy()
             pipe.forEach { it.close() }
+            com.g2ray.client.model.VpnStateRepository.state.value = previousVpnState
         }
     }
 
@@ -383,6 +786,7 @@ class G2RayVpnServiceStartupTest {
         var starts = 0
         val addresses = mutableListOf<String>()
         var rejectedAddresses: Set<String>? = null
+        var rejectionError = "infra/conf: Failed to build transport config"
         var running = false
         override fun isAvailable() = true
         override fun capabilities(): XrayRuntimeCapabilities = error("Unexpected capability check")
@@ -396,7 +800,7 @@ class G2RayVpnServiceStartupTest {
                 .getJSONObject("settings").getJSONArray("vnext").getJSONObject(0).getString("address")
             addresses += address
             running = rejectedAddresses?.contains(address) == false
-            return XrayCallResult(running, if (running) null else "infra/conf: Failed to build transport config")
+            return XrayCallResult(running, if (running) null else rejectionError)
         }
         override fun ping(base64Request: String): XrayPingResult = error("Unexpected ping")
         override fun stop(): XrayCallResult {

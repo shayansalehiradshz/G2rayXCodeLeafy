@@ -25,7 +25,8 @@ object SocketProtector {
 
     fun underlyingNetworkGeneration(): Long = networkGeneration.get()
 
-    private val lastDialerFailure = AtomicReference<String?>(null)
+    private data class DialerFailure(val generation: Long, val message: String)
+    private val lastDialerFailure = AtomicReference<DialerFailure?>(null)
     private val dnsResolver = NetworkDnsResolver()
 
     @JvmStatic
@@ -43,20 +44,22 @@ object SocketProtector {
     @JvmStatic
     fun protectAndBindDialer(fd: Int): Boolean {
         val service = vpnService ?: return true
+        val (network, generation) = networkSnapshot()
         if (!service.protect(fd)) {
-            return recordDialerFailure("Android rejected VPN protection for an Xray dialer socket")
+            return recordDialerFailure("Android rejected VPN protection for an Xray dialer socket", generation)
         }
-        val network = underlyingNetwork
-            ?: return recordDialerFailure("No physical network was selected for an Xray dialer socket")
+        if (network == null) {
+            return recordDialerFailure("No physical network was selected for an Xray dialer socket", generation)
+        }
         return runCatching {
             ParcelFileDescriptor.fromFd(fd).use { duplicate ->
                 network.bindSocket(duplicate.fileDescriptor)
             }
-            true
+            generation == networkGeneration.get()
         }.getOrElse { error ->
             recordDialerFailure(
                 "Could not bind an Xray dialer socket to the selected network: " +
-                    (error.localizedMessage ?: error.javaClass.simpleName)
+                    (error.localizedMessage ?: error.javaClass.simpleName), generation
             )
         }
     }
@@ -77,9 +80,21 @@ object SocketProtector {
     }
 
     fun consumeDialerFailure(): String? = lastDialerFailure.getAndSet(null)
+        ?.takeIf { it.generation == networkGeneration.get() }?.message
 
-    private fun recordDialerFailure(message: String): Boolean {
-        lastDialerFailure.compareAndSet(null, message)
+    @Synchronized
+    private fun networkSnapshot(): Pair<Network?, Long> = underlyingNetwork to networkGeneration.get()
+
+    @Synchronized
+    private fun recordDialerFailure(message: String, generation: Long): Boolean {
+        // A late bind/protect callback from a retired network must neither
+        // restart its replacement nor mask a real failure on that replacement.
+        if (generation == networkGeneration.get()) {
+            val previous = lastDialerFailure.get()
+            if (previous == null || previous.generation != generation) {
+                lastDialerFailure.set(DialerFailure(generation, message))
+            }
+        }
         return false
     }
 
@@ -90,14 +105,15 @@ object SocketProtector {
      */
     fun protectControlPlane(socket: Socket): Boolean {
         val service = vpnService ?: return true
-        val network = underlyingNetwork ?: return false
+        val (network, generation) = networkSnapshot()
+        if (network == null) return false
         return runCatching {
             // Android creates Socket's native FD lazily. Read an option before
             // protect(), without binding or connecting through the dead VPN.
             socket.soLinger
             if (!service.protect(socket)) return@runCatching false
             network.bindSocket(socket)
-            true
+            generation == networkGeneration.get()
         }.getOrDefault(false)
     }
 

@@ -273,6 +273,7 @@ class G2RayVpnService : VpnService() {
         private const val ACTIVE_STALL_CONFIRM_DELAY_MS = 2_000L
         private const val MAX_LOCAL_ROUTE_RECOVERY_ATTEMPTS = 1
         private const val PRE_WAKE_ALTERNATIVE_ATTEMPTS = 1
+        private const val MAX_BACKUP_ROUTE_CANDIDATES = 6
         private const val WORKER_ROUTE_RECOVERY_TIMEOUT_MS = 3 * 60 * 1000L
         private const val DIRECT_ROUTE_SETTLE_TIMEOUT_MS = 2 * 60 * 1000L
         private const val DIRECT_ROUTE_PROBE_INTERVAL_MS = 3_000L
@@ -420,7 +421,8 @@ class G2RayVpnService : VpnService() {
             maxCandidates: Int = 6,
             sessionHealth: Map<String, SessionProfileHealth> = emptyMap(),
             networkKey: String? = null,
-            nowMs: Long = System.currentTimeMillis()
+            nowMs: Long = System.currentTimeMillis(),
+            reserveAlternateTransport: Boolean = true
         ): List<StoredG2RayProfile> {
             if (accountId.isNullOrBlank() || maxCandidates <= 0) return emptyList()
             val ranked = profiles
@@ -459,7 +461,7 @@ class G2RayVpnService : VpnService() {
             val selectedIds = HashSet<String>()
             val seenRoutes = HashSet<String>()
             val currentTransport = VlessUriParser.parse(currentRawUri).getOrNull()?.transport
-            val alternate = if (maxCandidates > 1 && currentTransport != null) {
+            val alternate = if (reserveAlternateTransport && maxCandidates > 1 && currentTransport != null) {
                 ranked.firstOrNull {
                     VlessUriParser.parse(it.rawUri).getOrNull()?.transport?.let { transport ->
                         transport != currentTransport
@@ -925,7 +927,8 @@ class G2RayVpnService : VpnService() {
                                         "VPN route reverified"
                                     } else {
                                         "VPN route verified by live traffic"
-                                    }
+                                    },
+                                    verificationNetworkGeneration
                                 )
                             }
                         }
@@ -1000,14 +1003,30 @@ class G2RayVpnService : VpnService() {
             route = diagnoseVpnRoute(resetConnections = true)
             currentCoroutineContext().ensureActive()
         }
-        return if (networkIsCurrent()) route else obsolete
+        return if (networkIsCurrent()) routeOnCurrentNetwork(route, networkGeneration) else obsolete
     }
 
+    private fun routeNetworkIsCurrent(generation: Long): Boolean =
+        !waitingForUnderlyingNetwork && generation == underlyingNetworkGeneration.get()
+
+    private fun routeOnCurrentNetwork(route: RunningRouteResult, generation: Long): RunningRouteResult =
+        if (!routeNetworkIsCurrent(generation)) {
+            RunningRouteResult(false, "Physical network changed during route verification",
+                failureScope = RouteFailureScope.DialerBinding)
+        } else if (route.success) {
+            route.copy(verifiedNetworkGeneration = generation)
+        } else route
+
     private suspend fun diagnoseVpnRoute(resetConnections: Boolean): RunningRouteResult {
+        currentCoroutineContext().ensureActive()
+        val generation = underlyingNetworkGeneration.get()
+        if (!routeNetworkIsCurrent(generation)) return routeOnCurrentNetwork(RunningRouteResult(false), generation)
         if (resetConnections) {
             fullVpnDataPathProbe.reset()
         }
         val fullPath = fullVpnDataPathProbe.probe()
+        currentCoroutineContext().ensureActive()
+        if (!routeNetworkIsCurrent(generation)) return routeOnCurrentNetwork(fullPath, generation)
         val xrayRoute = if (fullPath.success) {
             RunningRouteResult(success = true, latencyMs = fullPath.latencyMs)
         } else {
@@ -1016,11 +1035,12 @@ class G2RayVpnService : VpnService() {
             }
             core.verifyRunningRoute()
         }
-        return classifyVpnRouteHealth(
+        currentCoroutineContext().ensureActive()
+        return routeOnCurrentNetwork(classifyVpnRouteHealth(
             fullPath = fullPath,
             xrayRoute = xrayRoute,
             dialerFailure = SocketProtector.consumeDialerFailure()
-        )
+        ), generation)
     }
 
     private fun restartTunnelAfterAppResume() {
@@ -1154,7 +1174,7 @@ class G2RayVpnService : VpnService() {
                             return@withContext
                         }
                         if (route.success) {
-                            markTunnelVerified("VPN connected and route verified")
+                            markTunnelVerified("VPN connected and route verified", route.verifiedNetworkGeneration)
                         } else {
                             if (route.retryAllowed) {
                                 schedulePersistentReconnect(route.error ?: core.lastError.value ?: "Tunnel route check failed", route.retryAfterMs)
@@ -1671,9 +1691,19 @@ class G2RayVpnService : VpnService() {
         screenOffAtMs.set(0L)
     }
 
-    private fun markTunnelVerified(message: String) {
-        if (vpnInterface == null || core.state.value != TunnelCoreState.Connected) {
-            return
+    @Synchronized
+    private fun markTunnelVerified(message: String, expectedNetworkGeneration: Long?): Boolean {
+        if (vpnInterface == null || cleanupJob?.isActive == true) return false
+        if (core.state.value != TunnelCoreState.Connected || expectedNetworkGeneration == null ||
+            !routeNetworkIsCurrent(expectedNetworkGeneration)
+        ) {
+            // Startup and recovery can wait in the main queue across a handoff.
+            // Recheck the current route after their mutex is released, without
+            // accepting the old result or blindly restarting a healthy core.
+            if (!waitingForUnderlyingNetwork && networkHandoffJob?.isActive != true) {
+                queueNetworkVerification(wasWaiting = true)
+            }
+            return false
         }
         speedSampler = null
         reconnectRetryJob?.cancel()
@@ -1688,6 +1718,7 @@ class G2RayVpnService : VpnService() {
         )
         startTrafficUpdates()
         startCoreHealthMonitor()
+        return true
     }
 
     private fun markTunnelUnverified(message: String) {
@@ -1722,6 +1753,7 @@ class G2RayVpnService : VpnService() {
             firstResult.success ||
             !firstResult.retryAllowed ||
             firstResult.failureScope == RouteFailureScope.DialerBinding ||
+            firstResult.failureScope == RouteFailureScope.EndpointResolution ||
             !VpnEngineSelector.shouldFallbackToNative(
                 mode = requestedEngineMode,
                 active = selectedEngine,
@@ -1756,18 +1788,35 @@ class G2RayVpnService : VpnService() {
         hevTunnelRunning = false
         val resolutionStartedAt = SystemClock.elapsedRealtime()
         val resolutionNetworkGeneration = underlyingNetworkGeneration.get()
-        val runtimeProfiles = interruptibleDnsLookup {
-            resolveRuntimeProfiles(
-                liveRouteProfilesFor(profile),
-                maxProfiles = if (seamlessFailoverEnabled) MAX_LIVE_ROUTE_PROFILES else 1
-            ) { address -> SocketProtector.resolveTunnelEndpoints(address, MAX_LIVE_ROUTE_PROFILES) }
+        val runtimeProfiles = try {
+            interruptibleDnsLookup {
+                resolveRuntimeProfiles(
+                    liveRouteProfilesFor(profile),
+                    maxProfiles = if (seamlessFailoverEnabled) MAX_LIVE_ROUTE_PROFILES else 1
+                ) { address -> SocketProtector.resolveTunnelEndpoints(address, MAX_LIVE_ROUTE_PROFILES) }
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: IOException) {
+            logStartupPhase("endpoint_resolution", engine, resolutionStartedAt, false)
+            if (!isTunnelCurrent(lifecycleToken, tun)) {
+                return RunningRouteResult(false, "VPN lifecycle changed during endpoint resolution")
+            }
+            // Return a normal route failure so recovery can reach saved IP
+            // profiles even when none qualified as verified live standbys.
+            return RunningRouteResult(
+                false, "Endpoint resolution failed: ${error.localizedMessage ?: error.javaClass.simpleName}",
+                failureScope = if (waitingForUnderlyingNetwork || resolutionNetworkGeneration != underlyingNetworkGeneration.get()) {
+                    RouteFailureScope.DialerBinding
+                } else RouteFailureScope.EndpointResolution
+            )
         }
         currentCoroutineContext().ensureActive()
         logStartupPhase("endpoint_resolution", engine, resolutionStartedAt, true)
         if (!isTunnelCurrent(lifecycleToken, tun)) {
             return RunningRouteResult(false, "VPN lifecycle changed during endpoint resolution")
         }
-        if (resolutionNetworkGeneration != underlyingNetworkGeneration.get()) {
+        if (!routeNetworkIsCurrent(resolutionNetworkGeneration)) {
             return RunningRouteResult(
                 false, "Physical network changed during endpoint resolution",
                 failureScope = RouteFailureScope.DialerBinding
@@ -1792,6 +1841,10 @@ class G2RayVpnService : VpnService() {
         if (!isTunnelCurrent(lifecycleToken, tun)) {
             return RunningRouteResult(false, "VPN lifecycle changed while Xray was starting")
         }
+        currentCoroutineContext().ensureActive()
+        if (!routeNetworkIsCurrent(resolutionNetworkGeneration)) {
+            return routeOnCurrentNetwork(RunningRouteResult(false), resolutionNetworkGeneration)
+        }
         if (core.state.value != TunnelCoreState.Connected) {
             return core.startupFailureResult()
         }
@@ -1815,6 +1868,9 @@ class G2RayVpnService : VpnService() {
                 if (!isTunnelCurrent(lifecycleToken, tun)) {
                     return RunningRouteResult(false, "VPN lifecycle changed while HEV was starting")
                 }
+                if (!routeNetworkIsCurrent(resolutionNetworkGeneration)) {
+                    return routeOnCurrentNetwork(RunningRouteResult(false), resolutionNetworkGeneration)
+                }
                 if (HevTunController.statsOrNull() == null) {
                     stopActivePacketEngine()
                     return RunningRouteResult(false, "HEV TUN started but did not expose a healthy native statistics channel")
@@ -1837,17 +1893,32 @@ class G2RayVpnService : VpnService() {
         logStartupPhase("probe_reset", engine, probeResetStartedAt, true)
         val fullPathStartedAt = SystemClock.elapsedRealtime()
         var fullPath = fullVpnDataPathProbe.probe()
+        currentCoroutineContext().ensureActive()
+        if (!routeNetworkIsCurrent(resolutionNetworkGeneration)) {
+            return routeOnCurrentNetwork(fullPath, resolutionNetworkGeneration)
+        }
         if (!fullPath.success && engine == ActiveVpnEngine.Hev) {
             delay(400)
+            if (!routeNetworkIsCurrent(resolutionNetworkGeneration)) {
+                return routeOnCurrentNetwork(fullPath, resolutionNetworkGeneration)
+            }
             fullVpnDataPathProbe.reset()
             fullPath = fullVpnDataPathProbe.probe()
         }
+        currentCoroutineContext().ensureActive()
+        if (!routeNetworkIsCurrent(resolutionNetworkGeneration)) {
+            return routeOnCurrentNetwork(fullPath, resolutionNetworkGeneration)
+        }
         logStartupPhase("full_path", engine, fullPathStartedAt, fullPath.success)
-        if (fullPath.success) return fullPath
+        if (fullPath.success) return routeOnCurrentNetwork(fullPath, resolutionNetworkGeneration)
         // A successful TUN proof already includes SOCKS/core/remote transport.
         // Probe SOCKS separately only to diagnose a failed full-device path.
         val socksDiagnosisStartedAt = SystemClock.elapsedRealtime()
         val xrayRoute = core.verifyRunningRoute()
+        currentCoroutineContext().ensureActive()
+        if (!routeNetworkIsCurrent(resolutionNetworkGeneration)) {
+            return routeOnCurrentNetwork(xrayRoute, resolutionNetworkGeneration)
+        }
         logStartupPhase("socks_diagnosis", engine, socksDiagnosisStartedAt, xrayRoute.success)
         var diagnosed = classifyVpnRouteHealth(
             fullPath = fullPath,
@@ -1857,21 +1928,21 @@ class G2RayVpnService : VpnService() {
         if (
             shouldConfirmNativeStartupPacketFailure(engine, diagnosed) &&
             isTunnelCurrent(lifecycleToken, tun) && core.state.value == TunnelCoreState.Connected &&
-            resolutionNetworkGeneration == underlyingNetworkGeneration.get()
+            routeNetworkIsCurrent(resolutionNetworkGeneration)
         ) {
             // A newly usable SOCKS path can outlive the first TUN/TLS timeout.
             // Require one fresh full-device proof before replacing this core.
             val confirmationStartedAt = SystemClock.elapsedRealtime()
             fullVpnDataPathProbe.reset()
             currentCoroutineContext().ensureActive()
-            if (!isTunnelCurrent(lifecycleToken, tun) || resolutionNetworkGeneration != underlyingNetworkGeneration.get()) {
+            if (!isTunnelCurrent(lifecycleToken, tun) || !routeNetworkIsCurrent(resolutionNetworkGeneration)) {
                 return RunningRouteResult(false, "VPN lifecycle or physical network changed during startup confirmation",
                     failureScope = RouteFailureScope.DialerBinding)
             }
             val confirmed = fullVpnDataPathProbe.probe()
             logStartupPhase("startup_packet_confirm", engine, confirmationStartedAt, confirmed.success)
             currentCoroutineContext().ensureActive()
-            if (!isTunnelCurrent(lifecycleToken, tun) || resolutionNetworkGeneration != underlyingNetworkGeneration.get()) {
+            if (!isTunnelCurrent(lifecycleToken, tun) || !routeNetworkIsCurrent(resolutionNetworkGeneration)) {
                 return RunningRouteResult(false, "VPN lifecycle or physical network changed during startup confirmation",
                     failureScope = RouteFailureScope.DialerBinding)
             }
@@ -1880,7 +1951,7 @@ class G2RayVpnService : VpnService() {
         if (!diagnosed.success && diagnosed.failureScope == RouteFailureScope.PacketEngine && engine == ActiveVpnEngine.Hev) {
             stopActivePacketEngine()
         }
-        return diagnosed
+        return routeOnCurrentNetwork(diagnosed, resolutionNetworkGeneration)
     }
 
     private fun logStartupPhase(phase: String, engine: ActiveVpnEngine?, startedAt: Long, success: Boolean) {
@@ -1981,9 +2052,12 @@ class G2RayVpnService : VpnService() {
         if (!isTunnelCurrent(lifecycleToken, tun)) {
             return RunningRouteResult(false, "VPN lifecycle changed during route recovery")
         }
+        val generation = underlyingNetworkGeneration.get()
         val route = startBestEngineAndVerify(profile, tun, lifecycleToken)
-        if (isTunnelCurrent(lifecycleToken, tun)) {
-            recordSessionProfileHealth(profile.rawUri, route)
+        synchronized(this) {
+            if (isTunnelCurrent(lifecycleToken, tun) && routeNetworkIsCurrent(generation)) {
+                recordSessionProfileHealth(profile.rawUri, route)
+            }
         }
         return route
     }
@@ -1992,6 +2066,7 @@ class G2RayVpnService : VpnService() {
         tun: ParcelFileDescriptor,
         lifecycleToken: Long
     ): RunningRouteResult {
+        val generation = underlyingNetworkGeneration.get()
         if (
             activeEngine != ActiveVpnEngine.Hev ||
             !isTunnelCurrent(lifecycleToken, tun) ||
@@ -2037,6 +2112,8 @@ class G2RayVpnService : VpnService() {
             }
             fullVpnDataPathProbe.reset()
             val fullPath = fullVpnDataPathProbe.probe()
+            currentCoroutineContext().ensureActive()
+            if (!routeNetworkIsCurrent(generation)) return routeOnCurrentNetwork(fullPath, generation)
             val diagnosed = classifyVpnRouteHealth(
                 fullPath = fullPath,
                 xrayRoute = RunningRouteResult(success = true),
@@ -2046,7 +2123,7 @@ class G2RayVpnService : VpnService() {
                 stopActivePacketEngine()
                 diagnosed
             } else {
-                diagnosed
+                routeOnCurrentNetwork(diagnosed, generation)
             }
         } catch (error: CancellationException) {
             stopActivePacketEngine()
@@ -2094,18 +2171,23 @@ class G2RayVpnService : VpnService() {
         lifecycleToken: Long,
         maxCandidates: Int = 6
     ): RunningRouteResult? {
+        val attemptLimit = maxCandidates.coerceIn(0, MAX_BACKUP_ROUTE_CANDIDATES)
+        if (attemptLimit == 0) return null
         val accountId = activeAccountId ?: accountRepository.activeSelection.value.accountId
         val candidates = selectAlternativeProfiles(
             profiles = accountRepository.profiles.value,
             accountId = accountId,
             currentRawUri = currentProfile.rawUri,
-            maxCandidates = maxCandidates,
+            maxCandidates = MAX_BACKUP_ROUTE_CANDIDATES,
             sessionHealth = sessionProfileHealthSnapshot(),
-            networkKey = (application as G2RayApplication).routeMeasurementContext.keyFor(underlyingNetwork)
+            networkKey = (application as G2RayApplication).routeMeasurementContext.keyFor(underlyingNetwork),
+            reserveAlternateTransport = attemptLimit > 1
         )
 
         var lastFailure: RunningRouteResult? = null
+        var routeAttempts = 0
         for (stored in candidates) {
+            if (routeAttempts >= attemptLimit) break
             if (!isTunnelCurrent(lifecycleToken, tun)) {
                 return RunningRouteResult(false, "VPN lifecycle changed while selecting a backup route")
             }
@@ -2115,6 +2197,14 @@ class G2RayVpnService : VpnService() {
             // A malformed backup must not overwrite the original route's
             // retry policy or prevent trying the next compatible profile.
             if (!route.retryAllowed) continue
+            if (route.failureScope == RouteFailureScope.DialerBinding) return route
+            if (route.failureScope == RouteFailureScope.EndpointResolution) {
+                // No core or remote route was attempted. Scan only the bounded
+                // candidate list without spending the pre-wake traffic budget.
+                lastFailure = route
+                continue
+            }
+            routeAttempts++
             if (route.success) {
                 activeProfile = parsed
                 rememberLastProfileContext(stored.rawUri, accountId)
@@ -2189,7 +2279,7 @@ class G2RayVpnService : VpnService() {
                 break
             }
             val recoveryNetworkGeneration = underlyingNetworkGeneration.get()
-            val route = recoverRouteWithWorkerAttempt(
+            val recovered = recoverRouteWithWorkerAttempt(
                 profile = profile,
                 tun = tun,
                 lifecycleToken = lifecycleToken,
@@ -2197,6 +2287,9 @@ class G2RayVpnService : VpnService() {
                 initialFailureScope = initialFailureScope,
                 retryCooldown = retryCooldown
             )
+            val route = if (recovered.success) routeOnCurrentNetwork(
+                recovered, recovered.verifiedNetworkGeneration ?: recoveryNetworkGeneration
+            ) else recovered
             if (route.success || !route.retryAllowed || route.retryAfterMs != null) return route
             if (
                 !shouldRetryAfterNetworkChange(
@@ -2241,15 +2334,17 @@ class G2RayVpnService : VpnService() {
         }
 
         // If only the selected phone-to-edge path failed, a measured backup
-        // can recover immediately. One backup replaces the redundant second
-        // restart, so a genuine Codespace cold start is not made longer.
+        // can recover immediately. Keep one actual route attempt before wake;
+        // unresolved or invalid candidates are skipped within a bounded scan.
         val fastAlternative = tryAlternativeStoredProfiles(
             currentProfile = profile,
             tun = tun,
             lifecycleToken = lifecycleToken,
             maxCandidates = PRE_WAKE_ALTERNATIVE_ATTEMPTS
         )
-        if (fastAlternative?.success == true) return fastAlternative
+        if (fastAlternative != null &&
+            (fastAlternative.success || fastAlternative.failureScope == RouteFailureScope.DialerBinding)
+        ) return fastAlternative
         lastError = fastAlternative?.error ?: lastError
 
         val wake = activeWakeRecoveryConfig(activeAccountId)
@@ -2388,7 +2483,7 @@ class G2RayVpnService : VpnService() {
                     withContext(Dispatchers.Main) {
                         if (isTunnelCurrent(lifecycleToken, tun)) {
                             if (route.success) {
-                                markTunnelVerified("VPN reconnected and route verified")
+                                markTunnelVerified("VPN reconnected and route verified", route.verifiedNetworkGeneration)
                             } else if (!route.retryAllowed) {
                                 failAndStop(route.error ?: "VPN needs configuration changes")
                             } else if (waitingForUnderlyingNetwork && route.retryAfterMs == null) {
@@ -2448,8 +2543,10 @@ class G2RayVpnService : VpnService() {
                     withContext(Dispatchers.Main) {
                         if (!desiredConnected || !isTunnelCurrent(token, tun)) return@withContext
                         if (route.success) {
-                            reconnectRetryJob = null
-                            markTunnelVerified("VPN automatically reconnected and route verified")
+                            synchronized(this@G2RayVpnService) {
+                                reconnectRetryJob = null
+                                markTunnelVerified("VPN automatically reconnected and route verified", route.verifiedNetworkGeneration)
+                            }
                         } else if (!route.retryAllowed) {
                             failAndStop(route.error ?: "VPN needs configuration changes")
                         } else {
@@ -2669,7 +2766,8 @@ class G2RayVpnService : VpnService() {
         underlyingNetwork = network
         waitingForUnderlyingNetwork = network == null
         SocketProtector.updateUnderlyingNetwork(network)
-        SocketProtector.clearDialerFailure()
+        // Socket errors are generation-scoped. Clearing here can erase a
+        // replacement network's first real failure after it is published.
         if (previous != network) {
             // Serialized transition verification resets probe connections on
             // the new network. A separate reset job could retire a newer client.
@@ -2723,6 +2821,11 @@ class G2RayVpnService : VpnService() {
         if (!shouldVerify || startJob?.isActive == true) {
             return
         }
+        queueNetworkVerification(wasWaiting)
+    }
+
+    @Synchronized
+    private fun queueNetworkVerification(wasWaiting: Boolean) {
         networkHandoffJob?.cancel()
         val handoffNetworkGeneration = underlyingNetworkGeneration.get()
         networkHandoffJob = scope.launch {
@@ -2755,11 +2858,11 @@ class G2RayVpnService : VpnService() {
                         val route = verifyRouteAfterTransition()
                         if (!handoffIsCurrent()) return@withLock
                         if (route.success) {
-                            if (wasWaiting) {
+                            if (wasWaiting || !VpnStateRepository.state.value.tunnelVerified) {
                                 withContext(Dispatchers.Main) {
                                     synchronized(this@G2RayVpnService) {
                                         if (handoffIsCurrent()) {
-                                            markTunnelVerified("VPN connected after network handoff")
+                                            markTunnelVerified("VPN connected after network handoff", handoffNetworkGeneration)
                                         }
                                     }
                                 }
