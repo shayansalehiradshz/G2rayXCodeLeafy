@@ -167,6 +167,12 @@ but even that cannot dictate every third party's country data.
 
 ## Primary Sources
 
+Subsequent authorized live rollout: [Live Codespace verification](LIVE_CODESPACE_VERIFICATION_2026-10-16.md).
+The current host was confirmed in EastUs2; both transports matched the measured
+US exit in both providers. Source/configuration/UUID/engine continuity checks
+passed. This later result resolves the host-access limitation recorded above,
+but does not replace pending phone acceptance.
+
 - [Android Builder: family blocking, bypass, replacement and close](https://developer.android.com/reference/android/net/VpnService.Builder)
 - [Android VPN: always-on and blocking non-VPN connections](https://developer.android.com/develop/connectivity/vpn)
 - [GitHub: choosing a default Codespaces region](https://docs.github.com/en/codespaces/setting-your-user-preferences/setting-your-default-region-for-github-codespaces)
