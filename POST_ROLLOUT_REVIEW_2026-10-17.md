@@ -69,6 +69,22 @@ Built artifact SHA-256 values:
 - App: `a9b5a426972922c3429fe74655561eff3a4fb8d7c4e3f45cb79b6261b1278924`
 - Instrumentation: `187e613e383f87cf5a9db0dcdcdf3d20512c737a7bb80db9159250a5b4b77e76`
 
+### Hosted Fixture Follow-up
+
+The first Android CI run at `253c309` executed all 631 tests but failed the
+existing legacy-DNS saturation fixture; the new lifecycle cases passed. The
+separate Linux/server/Worker workflow passed all three jobs at that revision.
+The initial red Android run is not counted as a passing gate.
+
+The DNS fixture assumed that a completed warm-up Future meant its single
+SynchronousQueue worker could accept another lookup. A controlled JDK
+reproduction held `afterExecute` after Future completion and reproduced the
+legitimate admission rejection. The fixture now synchronizes actual entry into
+its intentionally stuck DNS call before starting the 100 ms Future wait. It
+still uses the real bounded executor and retains the timeout, rejection, pool
+ceiling, zero-queue and call-count assertions. Production DNS code and deadlines
+are unchanged. The revised DNS class passed locally.
+
 These fixtures use real Android Builder configuration and simulated descriptor,
 network and service boundaries. They establish source behavior, not actual
 packet routing, OEM process scheduling or native descriptor behavior on a phone.
