@@ -6882,8 +6882,85 @@ bench_json() {
     bench_json_impl "$mock"
 }
 
+server_exit_observation() {
+    local provider="$1" url response ip country
+    case "$provider" in
+        ipinfo) url='https://ipinfo.io/json' ;;
+        country_is) url='https://api.country.is/' ;;
+        *) return 1 ;;
+    esac
+    # Match the generated server freedom outbound's UseIPv4 policy. Ignore
+    # shell proxies/curlrc so this measures this host, not an unrelated proxy.
+    if response=$(curl -q --ipv4 --noproxy '*' --fail --silent --show-error \
+        --proto '=https' --connect-timeout 3 --max-time 5 --max-filesize 16384 \
+        --header 'Cache-Control: no-cache' "$url" 2>/dev/null) && \
+        [[ ${#response} -le 16384 ]] && \
+        jq -e 'type == "object" and (.ip | type == "string") and
+            (.country | type == "string")' <<< "$response" >/dev/null 2>&1; then
+        ip=$(jq -r '.ip' <<< "$response")
+        country=$(jq -r '.country' <<< "$response")
+        if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && valid_ipv4 "$ip" &&
+            [[ "$country" =~ ^[A-Z]{2}$ && "$country" != XX && "$country" != ZZ ]]; then
+            jq -c --arg provider "$provider" '
+                def detail($key): if (.[$key] | type) == "string" then
+                    .[$key][0:120] | gsub("[\u0000-\u001f\u007f]"; " ") else null end;
+                {provider:$provider, available:true, ip:.ip, country:.country,
+                 city:detail("city"), org:detail("org")}' <<< "$response"
+            return
+        fi
+    fi
+    jq -cn --arg provider "$provider" \
+        '{provider:$provider, available:false, ip:null, country:null}'
+}
+
+server_exit_location_json() {
+    command -v jq >/dev/null 2>&1 || { printf 'jq is required for exit diagnostics.\n' >&2; return 1; }
+    local first second
+    first=$(server_exit_observation ipinfo) || return 1
+    second=$(server_exit_observation country_is) || return 1
+    jq -cn --arg checked_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --argjson first "$first" --argjson second "$second" '
+        [$first,$second] as $observations |
+        [$observations[] | select(.available)] as $valid |
+        [$valid[].country] | unique as $countries |
+        [$valid[].ip] | unique as $ips |
+        {checked_at_utc:$checked_at, scope:"server_ipv4_egress", expected_country:"US",
+         status:(if ($valid|length) == 0 then "unavailable"
+             elif ($valid|length) < 2 then "partial"
+             elif ($countries|length) > 1 then "country_disagreement"
+             elif $countries == ["US"] then "us_observed"
+             else "non_us_observed" end),
+         multiple_exit_ips:(($ips|length) > 1), observations:$observations}'
+}
+
+show_server_exit_location() {
+    local report
+    report=$(server_exit_location_json) || return 1
+    printf '  Server IPv4 exit (not the ingress/route IP)\n'
+    jq -r '.observations[] | "  \(.provider): " +
+        (if .available then "\(.ip) country=\(.country)" else "unavailable or invalid response" end)' <<< "$report"
+    jq -r '.observations[] | select(.available and .provider == "ipinfo") |
+        (if .city != null then "  IPinfo city estimate: " + .city else empty end),
+        (if .org != null then "  ISP/host: " + .org else empty end)' <<< "$report"
+    printf '  US country check: %s\n' "$(jq -r '.status' <<< "$report")"
+    if [[ "$(jq -r '.multiple_exit_ips' <<< "$report")" == true ]]; then
+        printf '  Different destinations observed different exit IPs; this is not by itself a phone-IP leak.\n'
+    fi
+    printf '  Country labels are database observations, not a guarantee for every website.\n'
+    printf '  Compare these with a browser IP check through your active VPN.\n'
+}
+
 if [[ "${G2RAY_SOURCE_ONLY:-}" == "1" ]]; then
     return 0 2>/dev/null || exit 0
+fi
+
+if [[ "${1:-}" == "--exit-location" ]]; then
+    case "${2:-}" in
+        --json) server_exit_location_json ;;
+        '') show_server_exit_location ;;
+        *) printf 'Usage: bash ./g2ray.sh --exit-location [--json]\n' >&2; exit 2 ;;
+    esac
+    exit $?
 fi
 
 reset_logs_on_code_change
@@ -7321,20 +7398,7 @@ while true; do
         12)
             refresh_screen
             echo -e "\n  ${DIM}Fetching server details...${NC}\n"
-            if command -v jq >/dev/null 2>&1; then
-                _RES=$(curl -sf -m 5 https://ipinfo.io/json 2>/dev/null || echo "{}")
-                _IP=$(printf '%s' "$_RES" | jq -r '.ip // empty' 2>/dev/null || true)
-                if [[ -z "$_IP" ]]; then
-                    echo -e "  ${RED}✖ Could not fetch location.${NC}"
-                else
-                    echo -e "  ${GREEN}● Server Location${NC}"
-                    echo -e "  IP       : ${GREEN}$(printf '%s' "$_RES" | jq -r '.ip')${NC}"
-                    echo -e "  Location : ${WHITE}$(printf '%s' "$_RES" | jq -r '.city'), $(printf '%s' "$_RES" | jq -r '.country')${NC}"
-                    echo -e "  ISP/Host : ${WHITE}$(printf '%s' "$_RES" | jq -r '.org')${NC}"
-                fi
-            else
-                echo -e "  ${RED}✖ jq not installed.${NC}"
-            fi
+            show_server_exit_location || true
             echo ""; echo -ne "  ${DIM}Press Enter to return...${NC}"; read -r
             ;;
         13)

@@ -13,6 +13,37 @@ import org.robolectric.RobolectricTestRunner
 
 @RunWith(RobolectricTestRunner::class)
 class XrayConfigBuilderTest {
+    @Test
+    fun vpnIngressAndDnsHaveNoDirectOutboundAcrossEngineAndRoutingModes() {
+        val selected = testXhttpProfile().copy(address = "203.0.113.1")
+        for (transport in Transport.entries) for (engine in ActiveVpnEngine.entries) for (fakeDns in listOf(false, true))
+            for (ipv4Only in listOf(false, true)) for (balanced in listOf(false, true)) {
+                val profile = selected.copy(transport = transport,
+                    mode = if (transport == Transport.XHTTP) "packet-up" else null,
+                    alpn = if (transport == Transport.XHTTP) listOf("h2") else listOf("http/1.1"))
+                val root = JSONObject(XrayConfigBuilder.buildVpnConfig(profile, engine = engine,
+                    fakeDnsEnabled = fakeDns, ipv4Only = ipv4Only,
+                    fallbackProfiles = if (balanced) listOf(profile.copy(address = "203.0.113.2")) else emptyList()))
+                val outbounds = root.getJSONArray("outbounds")
+                for (i in 0 until outbounds.length()) {
+                    assertTrue(outbounds.getJSONObject(i).getString("protocol") in setOf("vless", "dns", "blackhole"))
+                }
+                val rules = root.getJSONObject("routing").getJSONArray("rules")
+                for (i in 0 until rules.length()) assertFalse(rules.getJSONObject(i).optString("outboundTag") == "direct")
+                assertEquals("https://1.1.1.1/dns-query", root.getJSONObject("dns").getJSONArray("servers")
+                    .getJSONObject(if (fakeDns) 1 else 0).getString("address"))
+                assertEquals("proxy", outbounds.getJSONObject(0).getString("tag").substringBefore('-'))
+                // Optional handoff to the real pinned-core config validator;
+                // never exports user configuration or performs network IO.
+                System.getProperty("g2ray.configFixtureDir")?.let { directory ->
+                    val file = java.io.File(directory,
+                        "$transport-$engine-fake$fakeDns-v4$ipv4Only-balanced$balanced.json")
+                    file.parentFile?.mkdirs()
+                    file.writeText(root.toString(2))
+                }
+            }
+    }
+
 
     @Test
     fun buildConfigs_wsEarlyData_preservesSupportedPathSyntaxAcrossEngines() {
@@ -273,12 +304,11 @@ class XrayConfigBuilderTest {
         val outbounds = root.getJSONArray("outbounds")
         assertEquals("proxy", outbounds.getJSONObject(0).getString("tag"))
         assertEquals("vless", outbounds.getJSONObject(0).getString("protocol"))
-        assertEquals("direct", outbounds.getJSONObject(1).getString("tag"))
-        assertEquals("freedom", outbounds.getJSONObject(1).getString("protocol"))
-        assertEquals("block", outbounds.getJSONObject(2).getString("tag"))
-        assertEquals("blackhole", outbounds.getJSONObject(2).getString("protocol"))
-        assertEquals("dns-out", outbounds.getJSONObject(3).getString("tag"))
-        assertEquals("dns", outbounds.getJSONObject(3).getString("protocol"))
+        assertEquals(3, outbounds.length())
+        assertEquals("block", outbounds.getJSONObject(1).getString("tag"))
+        assertEquals("blackhole", outbounds.getJSONObject(1).getString("protocol"))
+        assertEquals("dns-out", outbounds.getJSONObject(2).getString("tag"))
+        assertEquals("dns", outbounds.getJSONObject(2).getString("protocol"))
 
         val socketSettings = outbounds.getJSONObject(0)
             .getJSONObject("streamSettings")

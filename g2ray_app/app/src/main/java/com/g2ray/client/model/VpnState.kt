@@ -15,7 +15,8 @@ enum class TunnelState {
     Starting,
     Connected,
     Stopping,
-    Error
+    Error,
+    Blocked
 }
 
 data class AppConnectionState(

@@ -50,6 +50,106 @@ import java.util.concurrent.atomic.AtomicBoolean
 @Config(application = G2RayApplication::class, sdk = [31])
 class SavedDataRecoveryViewModelTest {
     @Test
+    fun duplicateStartCannotReplaceAConnectedStateWhenUiCoreAvailabilityIsStale() {
+        withViewModel(repositoryWithProfile(), InMemorySecureStore()) { viewModel, application ->
+            @Suppress("UNCHECKED_CAST")
+            val availability = G2RayViewModel::class.java.getDeclaredField("_isVpnCoreAvailable")
+                .apply { isAccessible = true }.get(viewModel) as MutableStateFlow<Boolean>
+            availability.value = false
+            VpnStateRepository.state.value = VpnStateRepository.state.value.copy(
+                tunnelState = TunnelState.Connected, tunnelVerified = true, routeReady = true)
+            val context = RecordingServiceContext(application)
+            viewModel.startVpn(context)
+            assertEquals(0, context.starts)
+            assertEquals(TunnelState.Connected, VpnStateRepository.state.value.tunnelState)
+            assertTrue(VpnStateRepository.state.value.tunnelVerified)
+        }
+    }
+
+    @Test
+    fun startCancelsUiWakeAndOptionalProbesBeforeServiceRecovery() {
+        withViewModel(repositoryWithProfile(), InMemorySecureStore()) { viewModel, application ->
+            @Suppress("UNCHECKED_CAST")
+            val availability = G2RayViewModel::class.java.getDeclaredField("_isVpnCoreAvailable")
+                .apply { isAccessible = true }.get(viewModel) as MutableStateFlow<Boolean>
+            availability.value = true
+            val jobs = listOf("currentWakeJob", "currentDelayProbeJob", "routeOptimizationJob").map { name ->
+                kotlinx.coroutines.Job().also { job ->
+                    G2RayViewModel::class.java.getDeclaredField(name).apply { isAccessible = true }.set(viewModel, job)
+                }
+            }
+            val context = RecordingServiceContext(application)
+            viewModel.startVpn(context)
+            assertEquals(1, context.starts)
+            assertTrue(jobs.all { it.isCancelled })
+        }
+    }
+
+    @Test
+    fun repeatedStartDoesNotLaunchAnotherServiceOrProbe() {
+        withViewModel(repositoryWithProfile(), InMemorySecureStore()) { viewModel, application ->
+            @Suppress("UNCHECKED_CAST")
+            val availability = G2RayViewModel::class.java.getDeclaredField("_isVpnCoreAvailable")
+                .apply { isAccessible = true }.get(viewModel) as MutableStateFlow<Boolean>
+            availability.value = true
+            val context = RecordingServiceContext(application)
+            viewModel.startVpn(context)
+            viewModel.startVpn(context)
+            assertEquals(1, context.starts)
+            assertEquals(TunnelState.Starting, VpnStateRepository.state.value.tunnelState)
+        }
+    }
+
+    @Test
+    fun failedServiceLaunchPreservesBlockedState() {
+        withViewModel(repositoryWithProfile(), InMemorySecureStore()) { viewModel, application ->
+            @Suppress("UNCHECKED_CAST")
+            val availability = G2RayViewModel::class.java.getDeclaredField("_isVpnCoreAvailable")
+                .apply { isAccessible = true }.get(viewModel) as MutableStateFlow<Boolean>
+            availability.value = true
+            VpnStateRepository.state.value = VpnStateRepository.state.value.copy(tunnelState = TunnelState.Blocked)
+            viewModel.startVpn(RecordingServiceContext(application, rejectStart = true))
+            assertEquals(TunnelState.Blocked, VpnStateRepository.state.value.tunnelState)
+            assertFalse(VpnStateRepository.state.value.tunnelVerified)
+            assertTrue(viewModel.statusMessage.value.startsWith("Could not start VPN:"))
+        }
+    }
+
+    @Test
+    fun stopInAlwaysOnModeLeavesDisconnectControlToAndroid() {
+        withViewModel(repositoryWithProfile(), InMemorySecureStore()) { viewModel, application ->
+            val context = RecordingServiceContext(application)
+            VpnStateRepository.state.value = VpnStateRepository.state.value.copy(alwaysOnVpn = true)
+            viewModel.stopVpn(context)
+            assertEquals(0, context.starts)
+            assertTrue(viewModel.statusMessage.value.contains("Android VPN settings"))
+        }
+    }
+
+    @Test
+    fun startWithWakeConfiguredHandsOffToTheServiceBeforeAnyNetworkPreflight() {
+        val repository = repositoryWithProfile()
+        val accountId = repository.activeSelection.value.accountId!!
+        repository.addApiKey(accountId, "Fixture", "fixture-not-a-real-token",
+            kind = com.g2ray.client.model.ApiKeyKind.GITHUB_TOKEN)
+        val dispatcher = kotlinx.coroutines.test.StandardTestDispatcher()
+        withViewModel(repository, InMemorySecureStore(), dispatcher) { viewModel, application ->
+            @Suppress("UNCHECKED_CAST")
+            val availability = G2RayViewModel::class.java.getDeclaredField("_isVpnCoreAvailable")
+                .apply { isAccessible = true }.get(viewModel) as MutableStateFlow<Boolean>
+            availability.value = true
+            val context = RecordingServiceContext(application)
+
+            viewModel.startVpn(context)
+
+            // The scheduler is deliberately paused: no DNS, JNI ping, or
+            // Worker/GitHub request is allowed before the capture service.
+            assertEquals(G2RayVpnService.ACTION_START, context.startedIntent?.action)
+            assertEquals(accountId, context.startedIntent?.getStringExtra(G2RayVpnService.EXTRA_ACCOUNT_ID))
+        }
+    }
+
+    @Test
     fun startUsesStoredSelectionWithoutUiCollectors() {
         exerciseStartFromStoredSelection(staleUi = false)
     }
@@ -169,7 +269,7 @@ class SavedDataRecoveryViewModelTest {
     }
 
     @Test
-    fun reloadRecoversAllPreferencesAndKeepsSavedProfileIds() {
+    fun reloadRecoversAllPreferencesAndProfileIdsWithoutReleasingBlockedState() {
         val preferencesStore = InMemorySecureStore()
         val preferences = VpnEnginePreferences(preferencesStore)
         preferences.setMode(VpnEngineMode.XrayNative)
@@ -184,9 +284,11 @@ class SavedDataRecoveryViewModelTest {
         val profiles = repository.profiles.value
         withViewModel(repository, unreadableStore(preferencesStore, failReads)) { viewModel, _ ->
             assertFalse(viewModel.savedDataReady.value)
+            VpnStateRepository.state.value = VpnStateRepository.state.value.copy(tunnelState = TunnelState.Blocked)
             failReads.set(false)
             viewModel.reloadSavedData()
             awaitReload(viewModel)
+            assertEquals(TunnelState.Blocked, VpnStateRepository.state.value.tunnelState)
 
             assertTrue(viewModel.savedDataReady.value)
             assertNull(viewModel.repositoryLoadError.value)
@@ -343,10 +445,13 @@ class SavedDataRecoveryViewModelTest {
         }
     }
 
-    private class RecordingServiceContext(base: Context) : ContextWrapper(base) {
+    private class RecordingServiceContext(base: Context, private val rejectStart: Boolean = false) : ContextWrapper(base) {
         var startedIntent: Intent? = null
+        var starts = 0
         override fun getApplicationContext(): Context = this
         override fun startService(service: Intent): ComponentName {
+            if (rejectStart) throw SecurityException("Fixture service start rejected")
+            starts++
             startedIntent = service
             return ComponentName(this, G2RayVpnService::class.java)
         }

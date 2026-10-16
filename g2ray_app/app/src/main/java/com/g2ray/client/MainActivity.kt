@@ -38,6 +38,10 @@ class MainActivity : ComponentActivity() {
             startService(Intent(this, G2RayVpnService::class.java).apply {
                 action = G2RayVpnService.ACTION_REVERIFY
             })
+        } else if (VpnStateRepository.state.value.tunnelState in setOf(TunnelState.Starting, TunnelState.Blocked)) {
+            startService(Intent(this, G2RayVpnService::class.java).apply {
+                action = G2RayVpnService.ACTION_REFRESH_POLICY
+            })
         } else {
             viewModel.autoOptimizeRoutesIfNeeded()
         }

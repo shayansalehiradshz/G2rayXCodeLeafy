@@ -191,9 +191,13 @@ class NetworkDnsResolverTest {
     @Config(sdk = [24, 28])
     fun stuckLegacyLookupCannotGrowTheWorkerPoolOrQueueMoreLookups() {
         val executor = NetworkDnsResolver.createLegacyExecutor(1)
-        legacyRelease = CountDownLatch(1)
         try {
             val network = Shadow.newInstanceOf(Network::class.java)
+            // Load the legacy Android shadow on the worker before imposing the
+            // short fault deadline; cold JVM class loading is not stuck DNS.
+            assertEquals(answers, NetworkDnsResolver(legacyExecutor = executor).lookup(network, "warm.example"))
+            legacyCalls.set(0)
+            legacyRelease = CountDownLatch(1)
             val resolver = NetworkDnsResolver(timeoutMs = 100, legacyExecutor = executor)
             val timeout = assertThrows(UnknownHostException::class.java) { resolver.lookup(network, "stalled.example") }
             assertTrue(timeout.cause is TimeoutException)

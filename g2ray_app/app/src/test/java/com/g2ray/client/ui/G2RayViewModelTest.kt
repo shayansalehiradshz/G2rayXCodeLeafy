@@ -15,7 +15,6 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
-import java.net.SocketTimeoutException
 
 @RunWith(RobolectricTestRunner::class)
 class G2RayViewModelTest {
@@ -166,12 +165,6 @@ class G2RayViewModelTest {
     }
 
     @Test
-    fun vpnStartRequestBusy_blocksASecondRequestBeforeItCanReplaceThePendingProfile() {
-        assertTrue(G2RayViewModel.vpnStartRequestBusyVisibleForTesting(routeProbeActive = true))
-        assertFalse(G2RayViewModel.vpnStartRequestBusyVisibleForTesting(routeProbeActive = false))
-    }
-
-    @Test
     fun configurationMutations_areBlockedDuringTunnelLifecycleTransitions() {
         assertFalse(G2RayViewModel.configurationMutationAllowedVisibleForTesting(TunnelState.Starting))
         assertFalse(G2RayViewModel.configurationMutationAllowedVisibleForTesting(TunnelState.Connected))
@@ -184,87 +177,6 @@ class G2RayViewModelTest {
         )
         assertTrue(G2RayViewModel.configurationMutationAllowedVisibleForTesting(TunnelState.Disconnected))
         assertTrue(G2RayViewModel.configurationMutationAllowedVisibleForTesting(TunnelState.Error))
-    }
-
-    @Test
-    fun vpnStartPlan_checksTheActiveRouteBeforeWakingWheneverWorkerIsConfigured() {
-        assertEquals(
-            G2RayViewModel.VpnStartPlan.DirectProbeThenWake,
-            G2RayViewModel.vpnStartPlanVisibleForTesting(workerConfigured = true, routeReady = true)
-        )
-        assertEquals(
-            G2RayViewModel.VpnStartPlan.DirectProbeThenWake,
-            G2RayViewModel.vpnStartPlanVisibleForTesting(workerConfigured = true, routeReady = false)
-        )
-        assertEquals(
-            G2RayViewModel.VpnStartPlan.StartDirect,
-            G2RayViewModel.vpnStartPlanVisibleForTesting(workerConfigured = false, routeReady = true)
-        )
-        assertEquals(
-            G2RayViewModel.VpnStartPlan.StartDirect,
-            G2RayViewModel.vpnStartPlanVisibleForTesting(workerConfigured = false, routeReady = false)
-        )
-    }
-
-    @Test
-    fun workerNetworkFailure_fallsBackOnlyForAPendingVpnStart() {
-        assertEquals(
-            G2RayViewModel.WorkerNetworkFailureAction.DirectVpnFallback,
-            G2RayViewModel.workerNetworkFailureActionVisibleForTesting(
-                pendingVpnStart = true,
-                throwable = SocketTimeoutException("timed out")
-            )
-        )
-        assertEquals(
-            G2RayViewModel.WorkerNetworkFailureAction.ReportFailure,
-            G2RayViewModel.workerNetworkFailureActionVisibleForTesting(
-                pendingVpnStart = false,
-                throwable = SocketTimeoutException("timed out")
-            )
-        )
-        assertEquals(
-            G2RayViewModel.WorkerNetworkFailureAction.ReportFailure,
-            G2RayViewModel.workerNetworkFailureActionVisibleForTesting(
-                pendingVpnStart = true,
-                throwable = IllegalArgumentException("bad URL")
-            )
-        )
-    }
-
-    @Test
-    fun workerTransientHttpFailure_triesTheActiveRouteButNeverMasksQuotaOrAuth() {
-        assertEquals(
-            G2RayViewModel.WorkerNetworkFailureAction.DirectVpnFallback,
-            G2RayViewModel.workerHttpFailureActionVisibleForTesting(
-                pendingVpnStart = true,
-                httpCode = 503,
-                body = com.g2ray.client.network.WorkerWakeResponse(ok = false)
-            )
-        )
-        assertEquals(
-            G2RayViewModel.WorkerNetworkFailureAction.ReportFailure,
-            G2RayViewModel.workerHttpFailureActionVisibleForTesting(
-                pendingVpnStart = true,
-                httpCode = 402,
-                body = com.g2ray.client.network.WorkerWakeResponse(ok = false, quota_blocked = true)
-            )
-        )
-        assertEquals(
-            G2RayViewModel.WorkerNetworkFailureAction.ReportFailure,
-            G2RayViewModel.workerHttpFailureActionVisibleForTesting(
-                pendingVpnStart = true,
-                httpCode = 401,
-                body = com.g2ray.client.network.WorkerWakeResponse(ok = false)
-            )
-        )
-        assertEquals(
-            G2RayViewModel.WorkerNetworkFailureAction.ReportFailure,
-            G2RayViewModel.workerHttpFailureActionVisibleForTesting(
-                pendingVpnStart = false,
-                httpCode = 503,
-                body = com.g2ray.client.network.WorkerWakeResponse(ok = false)
-            )
-        )
     }
 
     @Test

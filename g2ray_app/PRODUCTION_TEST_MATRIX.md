@@ -599,6 +599,30 @@ the observation is not a pass. No video resolution, app settings, account
 data, or lock policy is changed. Repeat controlled visual/video acceptance
 separately before claiming smooth high-resolution or long-session playback.
 
+## US Exit and Capture Retention
+
+The desired country is US; no wrong-country incident was reported in this review.
+On each selected Codespace compare option 12 / `--exit-location --json` with
+browser observations through the VPN. Record the IP and country per provider,
+separately for IPv4/IPv6 when available. Different country labels for the same IP
+must not be called a phone-IP leak. Never use an ingress edge address, DNS/CDN
+address, browser language or account region as proof of the source exit country.
+
+From an independent application, observe the physical network during startup,
+wake, terminal configuration failure, native/HEV repair, retry, and deliberate
+disconnect. While capture is retained, ordinary traffic must forward via the
+configured VPN or fail, never fall back to the physical exit. A Blocked state
+must offer Retry and explicit disconnect; editing/reloading saved settings must
+not release the guard. Test Stop/revoke/destruction during startup/replacement
+and both unchanged and changed IPv4-only settings. Source/pipe-descriptor tests
+do not establish real Android routing or native descriptor ownership.
+
+Repeat with Always-on + Block connections without VPN through process death and
+reboot. Without that OS policy, no app guard survives process death. Verify wake
+and physical bootstrap remain usable, and distinguish those authorized control
+connections from application browsing. No physical-device pass is claimed yet
+for the capture-retention revision.
+
 ## v2rayNG A/B comparison
 
 For each client, run three alternating 15-minute rounds with the same config and physical network. Record median and p95 for:

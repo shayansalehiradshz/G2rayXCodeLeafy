@@ -1,5 +1,11 @@
 # IP and DNS leak protection: scope, fixes, and acceptance
 
+Follow-up: the user clarified that the goal is consistent **US egress**, not VPN
+invisibility, and reported no observed wrong-country incident. See
+[US exit consistency and the patch review](US_EXIT_REVIEW_2026-10-16.md) for the
+later capture-retention fixes and current verification. The results below are
+the earlier baseline, not test results for that follow-up.
+
 Reviewed 16 October 2026 against the user's active `z3roozsh/G2rayXCodeLeafy`
 fork. Its `main` and the local baseline were both `525fc08` before this work.
 No live Codespace restart, Windows route/firewall change, phone installation,

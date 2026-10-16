@@ -73,7 +73,7 @@ fun SettingsScreen(
                 SavedDataNotice(
                     message = savedDataError ?: "Reloading saved settings...",
                     reloading = isReloading,
-                    retryEnabled = vpnState.tunnelState in setOf(TunnelState.Disabled, TunnelState.Disconnected, TunnelState.Error),
+                    retryEnabled = vpnState.tunnelState in setOf(TunnelState.Disabled, TunnelState.Disconnected, TunnelState.Error, TunnelState.Blocked),
                     onRetry = viewModel::reloadSavedData,
                     onCopyOriginal = originalConfig?.let { raw ->
                         {

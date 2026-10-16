@@ -741,7 +741,25 @@ fun HomeScreen(
                         )
                     }
                     Spacer(modifier = Modifier.height(12.dp))
-                    if (isVpnRunning) {
+                    if (vpnUiState.tunnelState == TunnelState.Blocked) {
+                        Button(
+                            onClick = { startVpnWithPermissions() },
+                            modifier = Modifier.fillMaxWidth(),
+                            enabled = savedSettingsUsable && activeProfile != null && isVpnCoreAvailable
+                        ) { Text("Retry VPN") }
+                        TextButton(
+                            onClick = {
+                                if (vpnUiState.alwaysOnVpn == true) {
+                                    if (!openVpnProtectionSettings(context)) {
+                                        Toast.makeText(context, "Android VPN settings are unavailable", Toast.LENGTH_SHORT).show()
+                                    }
+                                } else viewModel.stopVpn(context)
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(if (vpnUiState.alwaysOnVpn == true) "Manage always-on VPN" else "Disconnect VPN")
+                        }
+                    } else if (isVpnRunning) {
                         Button(
                             onClick = {
                                 if (vpnUiState.alwaysOnVpn == true) {

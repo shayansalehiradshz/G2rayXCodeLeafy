@@ -64,6 +64,9 @@ jobs:
       - name: Run behavior regression tests
         run: bash ./tests/g2ray_behavior_tests.sh
 
+      - name: Verify exit-country diagnostics without Internet requests
+        run: bash ./tests/exit_location_tests.sh
+
       - name: Run Worker behavior tests
         working-directory: worker/codespace-waker
         run: npm test

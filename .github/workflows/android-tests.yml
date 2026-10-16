@@ -58,11 +58,36 @@ jobs:
           packages: "platform-tools platforms;android-36.1 build-tools;36.0.0"
           log-accepted-android-sdk-licenses: false
       - name: Test source and verify native build inputs
+        env:
+          JAVA_TOOL_OPTIONS: -Dg2ray.configFixtureDir=${{ github.workspace }}/g2ray_app/app/build/vpn-config-fixtures
         run: >-
           bash ./gradlew :app:testDebugUnitTest :app:lintDebug
           :app:compileDebugAndroidTestKotlin
           :app:verifyHevBundle :app:verifyLibXrayBuildContract
           --no-daemon --console=plain
+      - name: Validate all generated VPN variants with the real pinned core
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -nE 's/^ARG XRAY_VERSION=(v[0-9]+\.[0-9]+\.[0-9]+)$/\1/p' ../.devcontainer/Dockerfile)
+          [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          tmp=$(mktemp -d)
+          trap 'rm -rf -- "$tmp"' EXIT
+          curl --fail --location --retry 2 --max-time 180 --silent --show-error \
+            "https://github.com/XTLS/Xray-core/releases/download/${version}/Xray-linux-64.zip" -o "$tmp/release.zip"
+          curl --fail --location --retry 2 --max-time 60 --silent --show-error \
+            "https://github.com/XTLS/Xray-core/releases/download/${version}/Xray-linux-64.zip.dgst" -o "$tmp/release.zip.dgst"
+          hash=$(awk -F'= ' '/^SHA2-256=/{print $2}' "$tmp/release.zip.dgst")
+          [[ "$hash" =~ ^[0-9a-fA-F]{64}$ ]]
+          printf '%s  %s\n' "$hash" "$tmp/release.zip" | sha256sum -c -
+          unzip -q "$tmp/release.zip" -d "$tmp/core"
+          chmod +x "$tmp/core/xray"
+          shopt -s nullglob
+          fixtures=(app/build/vpn-config-fixtures/*.json)
+          [[ ${#fixtures[@]} -eq 32 ]]
+          for config in "${fixtures[@]}"; do
+            "$tmp/core/xray" run -test -config "$config"
+          done
       - name: Test release-schema mapping verifier
         run: bash ./gradlew -p buildSrc test --no-daemon --console=plain
       - name: Preserve Android test and lint evidence

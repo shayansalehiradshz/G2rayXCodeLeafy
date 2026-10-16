@@ -48,6 +48,13 @@ profile list; Home keeps its previous active selection until you change it.
 
 ### Blocking traffic outside the VPN
 
+Start VPN hands connection ownership to the service immediately, without a
+UI-side ping/wake preflight. Capture is installed before settings/native/wake
+waits. Repairs retain the capture interface; terminal errors stop forwarding
+and show **Blocked** with **Retry VPN** and **Disconnect VPN** controls. They
+must not silently restore the phone's direct Internet exit. OS blocking remains
+necessary if the process dies or Android cannot create/retain the interface.
+
 On Home, open **VPN protection settings**, select G2Ray in Android's VPN settings,
 then enable **Always-on VPN** and **Block connections without VPN**. Both are
 system-controlled settings: the app cannot silently enable them. Without OS

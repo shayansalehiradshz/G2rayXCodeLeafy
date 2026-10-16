@@ -139,10 +139,8 @@ object XrayConfigBuilder {
                     })
                 })
             }
-            put(JSONObject().apply {
-                put("tag", "direct")
-                put("protocol", "freedom")
-            })
+            // There is deliberately no direct/freedom outbound in a VPN
+            // configuration, including as a future fallback target.
             put(JSONObject().apply {
                 put("tag", "block")
                 put("protocol", "blackhole")

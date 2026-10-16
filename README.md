@@ -59,6 +59,13 @@ The checked-in native HEV libraries have pinned checksum metadata. The large `li
 
 For protection when the VPN stops or crashes, enable Android's **Always-on VPN** and **Block connections without VPN** through Home **VPN protection settings**. Importing a VLESS link alone does not enforce device-wide routing or a kill switch in another client. See the [Android and Windows leak-protection checklist](IP_LEAK_PROTECTION_2026-10-16.md); VPN use cannot be guaranteed undetectable.
 
+For a **US exit**, choose a US Codespaces region before creation, then use
+**12) Server Location** or `bash ./g2ray.sh --exit-location --json` on that Codespace.
+The check compares two small IPv4 exit observations and labels disagreement or
+incomplete evidence. Also check the public IP in a browser through the active VPN.
+An ingress edge IP, a DNS resolver's country, and a website's language are not
+the VPN exit country. See the [US-exit claim review](US_EXIT_REVIEW_2026-10-16.md).
+
 See the [physical-device verification record](g2ray_app/DEVICE_VERIFICATION_2026-10-12.md) for tested behavior and remaining limits. Auto/HEV is the normal path, but retained HTTP connections stalled in Native idle testing and a HEV screen-off test. Idle-resume stability is not yet certified.
 The [13 October follow-up](DEVICE_RECOVERY_FOLLOWUP_2026-10-13.md) records the installed recovery-socket fix, direct-GitHub wake verification, and remaining Native/WebSocket failures.
 The [retained-flow investigation](PERFORMANCE_INVESTIGATION_2026-10-13.md) records the origin Fast Open A/B results and current release gates. Source tests and server checks do not certify phone or long-video performance.
