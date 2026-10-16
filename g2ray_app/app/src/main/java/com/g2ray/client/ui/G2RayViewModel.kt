@@ -826,7 +826,7 @@ class G2RayViewModel internal constructor(
                             }
                         }
                         if (outcome.routeReady) {
-                            _statusMessage.value = "Codespace route is ready. Starting VPN..."
+                            _statusMessage.value = "Codespace route is ready."
                             publishRouteState(
                                 routeState = RouteState.Ready,
                                 message = "Codespace route ready",

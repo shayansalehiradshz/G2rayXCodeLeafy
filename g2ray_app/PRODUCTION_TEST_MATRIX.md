@@ -623,6 +623,20 @@ and physical bootstrap remain usable, and distinguish those authorized control
 connections from application browsing. No physical-device pass is claimed yet
 for the capture-retention revision.
 
+While Blocked, manually wake the selected Codespace via Worker and direct
+GitHub separately. The retained capture must keep the physical-network callback
+and protected control-plane binding, even if profile/preference validation
+failed before core startup. Losing/replacing that network must update the wake
+binding without publishing Starting, starting an implicit retry, or releasing
+capture. Explicit Stop/revoke must still unregister the callback and close TUN.
+
+Exercise service replacement while the retired instance's cleanup is delayed.
+Its eventual completion must not clear the replacement's socket binding,
+notification, OS policy status or connection state. The source fixtures cover
+both Android 7 and Android 12; real process death/system restart remains a
+separate device gate. A successful manual wake alone must not claim that the
+VPN has started or that the full data path is verified.
+
 ## v2rayNG A/B comparison
 
 For each client, run three alternating 15-minute rounds with the same config and physical network. Record median and p95 for:

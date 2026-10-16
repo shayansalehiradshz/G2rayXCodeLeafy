@@ -15,6 +15,9 @@ import com.g2ray.client.model.RouteState
 import com.g2ray.client.model.TunnelState
 import com.g2ray.client.model.VpnStateRepository
 import com.g2ray.client.model.VpnEngineMode
+import com.g2ray.client.network.CodespaceWakeCoordinator
+import com.g2ray.client.network.WorkerRouteOutcome
+import com.g2ray.client.network.WorkerWakeResponse
 import kotlinx.coroutines.flow.MutableStateFlow
 import com.g2ray.client.parser.VlessUriParser
 import com.g2ray.client.vpn.G2RayVpnService
@@ -168,6 +171,31 @@ class SavedDataRecoveryViewModelTest {
 
             assertEquals("Configure the shared Worker or add a GitHub token for this Codespace.", viewModel.statusMessage.value)
             assertFalse(viewModel.isWakingUp.value)
+        }
+    }
+
+    @Test
+    fun manualWakeReportsReadyWithoutClaimingVpnStartup() {
+        val repository = repositoryWithProfile()
+        repository.setWorkerControlPlane("https://worker.example/", null, "fixture-not-a-real-key")
+        val preferences = InMemorySecureStore()
+        VpnEnginePreferences(preferences).setAutoRouteOptimizationEnabled(false)
+        withViewModel(repository, preferences) { viewModel, _ ->
+            val wake = CodespaceWakeCoordinator(
+                workerWake = { _, _ -> WorkerRouteOutcome.Ready("https://worker.example/",
+                    WorkerWakeResponse(ok = true, codespace = "fixture-space", route_ready = true)) },
+                githubWake = { _, _ -> error("Unexpected direct GitHub request") }
+            )
+            G2RayViewModel::class.java.getDeclaredField("codespaceWakeCoordinator\$delegate")
+                .apply { isAccessible = true }.set(viewModel, lazyOf(wake))
+
+            viewModel.wakeUpCodespace()
+
+            runBlocking {
+                withTimeout(10_000L) { viewModel.statusMessage.first { it == "Codespace route is ready." } }
+            }
+            assertEquals(TunnelState.Disconnected, VpnStateRepository.state.value.tunnelState)
+            assertFalse(VpnStateRepository.state.value.tunnelVerified)
         }
     }
 

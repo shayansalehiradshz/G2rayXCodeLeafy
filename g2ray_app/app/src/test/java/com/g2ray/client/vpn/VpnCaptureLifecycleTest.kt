@@ -1,6 +1,7 @@
 package com.g2ray.client.vpn
 
 import android.app.Service
+import android.app.NotificationManager
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
@@ -12,6 +13,8 @@ import com.g2ray.client.data.EncryptedPrefsStore
 import java.io.IOException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -32,6 +35,7 @@ import org.robolectric.annotation.Implementation
 import org.robolectric.annotation.Implements
 import org.robolectric.annotation.RealObject
 import org.robolectric.util.ReflectionHelpers
+import org.robolectric.shadows.ShadowNetwork
 
 @OptIn(ExperimentalCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
@@ -68,6 +72,98 @@ class VpnCaptureLifecycleTest {
             assertTrue(guard.fileDescriptor.valid())
             assertEquals(1, configs.size)
             assertEquals(TunnelState.Blocked, VpnStateRepository.state.value.tunnelState)
+        }
+    }
+
+    @Test fun terminalFailureKeepsThePhysicalNetworkForManualWake() = runTest {
+        withService { service ->
+            invoke(service, "installTunInterface", 0L)
+            invoke(service, "registerUnderlyingNetworkMonitor")
+            val callback = field(service, "underlyingNetworkCallback")
+            assertNotNull(callback)
+            val physical = ShadowNetwork.newInstance(101)
+            invoke(service, "applyUnderlyingNetwork", physical, false)
+            invoke(service, "failClosed", "Fixture configuration failure")
+            finishCleanup(service)
+
+            assertSame(callback, field(service, "underlyingNetworkCallback"))
+            assertEquals(physical, SocketProtector.underlyingNetworks.value)
+            assertEquals("203.0.113.1", SocketProtector.lookupControlPlane("203.0.113.1").single().hostAddress)
+            assertEquals(TunnelState.Blocked, VpnStateRepository.state.value.tunnelState)
+
+            service.onStartCommand(Intent(G2RayVpnService.ACTION_STOP), 0, 2)
+            finishCleanup(service)
+            assertNull(field(service, "underlyingNetworkCallback"))
+            assertNull(SocketProtector.underlyingNetworks.value)
+        }
+    }
+
+    @Test fun invalidStartupStillRegistersThePhysicalNetworkForWake() = runTest {
+        withService { service ->
+            service.onStartCommand(Intent(G2RayVpnService.ACTION_START)
+                .putExtra(G2RayVpnService.EXTRA_RAW_PROFILE_URI, "invalid-profile"), 0, 1)
+            finishCleanup(service)
+            assertEquals(TunnelState.Blocked, VpnStateRepository.state.value.tunnelState)
+            assertNotNull("Capture without a working profile must still allow manual wake",
+                field(service, "underlyingNetworkCallback"))
+        }
+    }
+
+    @Test fun blockedNetworkChangesKeepCaptureWithoutStartingRecovery() = runTest {
+        withService { service ->
+            val guard = invoke(service, "installTunInterface", 0L) as ParcelFileDescriptor
+            invoke(service, "failClosed", "Fixture terminal failure")
+            finishCleanup(service)
+            val blocked = VpnStateRepository.state.value
+            val first = ShadowNetwork.newInstance(101)
+            val replacement = ShadowNetwork.newInstance(102)
+            for (network in listOf(first, null, replacement)) {
+                invoke(service, "applyUnderlyingNetwork", network, true)
+                runCurrent()
+                assertEquals(network, SocketProtector.underlyingNetworks.value)
+                assertNull("An idle error guard must not retry implicitly", field(service, "networkHandoffJob"))
+                assertEquals(blocked, VpnStateRepository.state.value)
+                assertSame(guard, field(service, "vpnInterface"))
+                assertTrue(guard.fileDescriptor.valid())
+            }
+        }
+    }
+
+    @Test fun retiredCleanupCannotOverwriteAReplacementService() = runTest {
+        withService { retired ->
+            invoke(retired, "installTunInterface", 0L)
+            val entered = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            setField(retired, "fullVpnDataPathProbe", object : VpnDataPathProbe {
+                override suspend fun probe() = RunningRouteResult(false)
+                override suspend fun reset() { entered.complete(Unit); release.await() }
+            })
+            retired.onDestroy()
+            runCurrent()
+            assertTrue(entered.isCompleted)
+
+            withService { replacement ->
+                invoke(replacement, "installTunInterface", 0L)
+                val network = ShadowNetwork.newInstance(102)
+                invoke(replacement, "applyUnderlyingNetwork", network, false)
+                VpnStateRepository.state.value = VpnStateRepository.state.value.copy(
+                    tunnelState = TunnelState.Starting, message = "Replacement is starting")
+                invoke(replacement, "createNotificationChannel")
+                invoke(replacement, "updateNotification", "Replacement is starting")
+                val notifications = replacement.getSystemService(NotificationManager::class.java)
+                assertTrue(notifications.activeNotifications.any { it.id == G2RayVpnService.NOTIFICATION_ID })
+                val starting = VpnStateRepository.state.value
+                release.complete(Unit)
+                finishCleanup(retired)
+
+                assertSame(replacement, SocketProtector.vpnService)
+                assertEquals(network, SocketProtector.underlyingNetworks.value)
+                assertEquals("Retired cleanup must not publish Disconnected over a newer start",
+                    starting, VpnStateRepository.state.value)
+                assertTrue("Retired cleanup must not cancel the new service notification",
+                    notifications.activeNotifications.any { it.id == G2RayVpnService.NOTIFICATION_ID })
+                assertTrue((field(replacement, "vpnInterface") as ParcelFileDescriptor).fileDescriptor.valid())
+            }
         }
     }
 
@@ -328,7 +424,8 @@ class VpnCaptureLifecycleTest {
 
     private suspend fun TestScope.withService(block: suspend (G2RayVpnService) -> Unit) {
         val service = Robolectric.buildService(G2RayVpnService::class.java).create().get()
-        setField(service, "scope", backgroundScope)
+        setField(service, "scope", CoroutineScope(backgroundScope.coroutineContext +
+            SupervisorJob(backgroundScope.coroutineContext[Job])))
         setField(service, "secureStore\$delegate", lazyOf(fixtureStore(service)))
         setField(service, "fullVpnDataPathProbe", object : VpnDataPathProbe {
             override suspend fun probe() = RunningRouteResult(false, "Unexpected health request")
