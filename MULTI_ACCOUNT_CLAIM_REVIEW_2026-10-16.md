@@ -195,3 +195,23 @@ The final local debug APK SHA-256 is
 `2c50be7fb39ef3be0ed87f87d2cdf9ddc0ce63331c2195a6b1352af947e7bb7b`.
 It was not installed during this review. These results do not establish faster
 video buffering, a carrier-specific fix, or zero leaks.
+
+## Hosted verification
+
+Both workflows passed for the exact source revision
+`65e6ac6d8ca77cb2b30a3388d1845bac5e61930e`:
+
+- [Android Tests 38950876182](https://github.com/z3roozsh/G2rayXCodeLeafy/actions/runs/38950876182):
+  downloaded JUnit evidence confirms 582 tests / 46 suites, zero failures,
+  errors, or skips. Hosted lint has zero errors and 26 warnings. Native
+  payload/restart fixtures, build-logic tests, instrumentation compilation,
+  and pinned build-input checks also passed.
+- [Static Tests 38950890868](https://github.com/z3roozsh/G2rayXCodeLeafy/actions/runs/38950890868):
+  all three jobs passed, including 66 static, 197 server behavior, and 66 Worker
+  checks; real pinned-Xray configuration, upload-expiry/client-failure and
+  retained-flow loopback fixtures; diagnostic tests; ShellCheck critical checks;
+  deterministic mocked budgets; and Worker dry-run packaging.
+
+The subsequent evidence-recording commit changes only this document, not the
+tested app, server, Worker, dependencies, or workflows. Hosted validation remains
+separate from installation, real carrier/OEM behavior, and user acceptance.
