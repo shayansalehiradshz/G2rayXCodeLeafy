@@ -39,6 +39,7 @@ type probeResult struct {
 	Protocol    string            `json:"protocol"`
 	Usable      bool              `json:"usable"`
 	ElapsedMs   int64             `json:"elapsed_ms"`
+	FirstByteMs *int64            `json:"ttfb_ms,omitempty"`
 	Error       string            `json:"error,omitempty"`
 	Connections []connectionEvent `json:"connections"`
 }
@@ -63,23 +64,41 @@ func (t *connectionTracker) event(info httptrace.GotConnInfo) connectionEvent {
 }
 
 func probe(client *http.Client, tracker *connectionTracker, target endpoint, phase string) probeResult {
+	return probeRequest(client, tracker, target, phase, http.MethodGet, nil)
+}
+
+func probeRequest(client *http.Client, tracker *connectionTracker, target endpoint, phase, method string, body io.Reader) probeResult {
 	result := probeResult{Phase: phase, Endpoint: target.URL}
-	request, err := http.NewRequest(http.MethodGet, target.URL, nil)
+	request, err := http.NewRequest(method, target.URL, body)
 	if err != nil {
 		result.Error = err.Error()
 		return result
 	}
 	request.Header.Set("Cache-Control", "no-cache")
+	if method == http.MethodPost {
+		request.Header.Set("Content-Type", "application/json")
+	}
 	var eventsMu sync.Mutex
 	var events []connectionEvent
-	trace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) {
-		event := tracker.event(info)
-		eventsMu.Lock()
-		events = append(events, event)
-		eventsMu.Unlock()
-	}}
-	request = request.WithContext(httptrace.WithClientTrace(request.Context(), trace))
+	var firstByteMs *int64
 	startedAt := time.Now()
+	trace := &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			event := tracker.event(info)
+			eventsMu.Lock()
+			events = append(events, event)
+			eventsMu.Unlock()
+		},
+		GotFirstResponseByte: func() {
+			elapsed := time.Since(startedAt).Milliseconds()
+			eventsMu.Lock()
+			if firstByteMs == nil {
+				firstByteMs = &elapsed
+			}
+			eventsMu.Unlock()
+		},
+	}
+	request = request.WithContext(httptrace.WithClientTrace(request.Context(), trace))
 	response, err := client.Do(request)
 	if err == nil {
 		result.Status, result.Protocol = response.StatusCode, response.Proto
@@ -104,8 +123,58 @@ func probe(client *http.Client, tracker *connectionTracker, target endpoint, pha
 	}
 	eventsMu.Lock()
 	result.Connections = append([]connectionEvent(nil), events...)
+	result.FirstByteMs = firstByteMs
 	eventsMu.Unlock()
 	return result
+}
+
+const (
+	streamFixturePath  = "/g2ray-fixture-stream"
+	streamFixtureInput = `{"prompt":"owned delayed-response fixture"}`
+	streamFixtureFirst = "data: first\n\n"
+	streamFixtureFinal = "data: complete\n\n"
+)
+
+func loopbackHandler(gap time.Duration) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != streamFixturePath {
+			writer.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if request.Method != http.MethodPost || request.ProtoMajor != 2 {
+			http.Error(writer, "expected HTTP/2 POST", http.StatusBadRequest)
+			return
+		}
+		body, err := io.ReadAll(io.LimitReader(request.Body, int64(len(streamFixtureInput)+1)))
+		if err != nil || string(body) != streamFixtureInput {
+			http.Error(writer, "incomplete request body", http.StatusBadRequest)
+			return
+		}
+		// Request-body EOF (HTTP/2 END_STREAM) is not TCP EOF. Keep both a
+		// delayed first response and an idle streaming gap beyond 2/5 seconds.
+		wait := func() bool {
+			timer := time.NewTimer(gap)
+			defer timer.Stop()
+			select {
+			case <-request.Context().Done():
+				return false
+			case <-timer.C:
+				return true
+			}
+		}
+		if !wait() {
+			return
+		}
+		writer.Header().Set("Content-Type", "text/event-stream")
+		if _, err := io.WriteString(writer, streamFixtureFirst); err != nil {
+			return
+		}
+		writer.(http.Flusher).Flush()
+		if !wait() {
+			return
+		}
+		io.WriteString(writer, streamFixtureFinal)
+	}
 }
 
 func newTransport(socksAddress string) *http.Transport {
@@ -172,9 +241,7 @@ func loopbackTargets(ports []int) ([]endpoint, *x509.CertPool, func(), error) {
 		return nil, nil, cleanup, fmt.Errorf("owned loopback fixture requires three ports")
 	}
 	for index := range 3 {
-		server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-			writer.WriteHeader(http.StatusNoContent)
-		}))
+		server := httptest.NewUnstartedServer(loopbackHandler(7 * time.Second))
 		if len(ports) != 0 {
 			server.Listener.Close()
 			listener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", fmt.Sprint(ports[index])))
@@ -242,6 +309,14 @@ func run(socksAddress string, idle time.Duration, loopbackBaseline bool, originP
 	fresh := phase(clientFor(freshTransport), "fresh_socket")
 	if !retained || !fresh {
 		return fmt.Errorf("HTTP/2 quorum failed: retained=%t fresh=%t", retained, fresh)
+	}
+	if loopbackBaseline {
+		target := endpoint{targets[0].URL + streamFixturePath, http.StatusOK, streamFixtureFirst + streamFixtureFinal}
+		result := probeRequest(client, tracker, target, "delayed_post_stream", http.MethodPost, strings.NewReader(streamFixtureInput))
+		json.NewEncoder(os.Stdout).Encode(result)
+		if !result.Usable {
+			return fmt.Errorf("delayed HTTP/2 POST/stream failed: %s", result.Error)
+		}
 	}
 	return nil
 }

@@ -2,13 +2,88 @@ package main
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestProbeReportsFirstByteSeparatelyFromCompleteBody(t *testing.T) {
+	server := newHTTP2Server(t, func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusOK)
+		writer.(http.Flusher).Flush()
+		time.Sleep(100 * time.Millisecond)
+		writer.Write([]byte("complete body"))
+	})
+	result := probe(server.Client(), &connectionTracker{}, endpoint{server.URL, http.StatusOK, "complete body"}, "test")
+	if !result.Usable {
+		t.Fatalf("Expected a complete HTTP/2 response: %+v", result)
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var values map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &values); err != nil {
+		t.Fatal(err)
+	}
+	first, found := values["ttfb_ms"]
+	if !found || string(first) == "null" {
+		t.Fatalf("Complete-body time must not masquerade as TTFB: %s", encoded)
+	}
+	var firstMs int64
+	if err := json.Unmarshal(first, &firstMs); err != nil || firstMs < 0 || firstMs > result.ElapsedMs {
+		t.Fatalf("Invalid first-byte measurement: %s", encoded)
+	}
+	if result.ElapsedMs < 100 {
+		t.Fatalf("The response body was not awaited: %+v", result)
+	}
+	if result.ElapsedMs-firstMs < 75 {
+		t.Fatalf("TTFB must exclude the deliberately delayed body: %s", encoded)
+	}
+}
+
+func TestUnobservedFirstByteIsNotInventedAfterARequestFailure(t *testing.T) {
+	result := probe(&http.Client{}, &connectionTracker{}, endpoint{"://invalid", http.StatusOK, ""}, "test")
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Usable || result.Error == "" || result.FirstByteMs != nil || strings.Contains(string(encoded), "ttfb_ms") {
+		t.Fatalf("Failed requests must not report a fake zero TTFB: %s", encoded)
+	}
+}
+
+func TestCompletedHTTP2PostCanWaitForAResponseAndContinueStreaming(t *testing.T) {
+	server := newHTTP2Server(t, loopbackHandler(10*time.Millisecond))
+	target := endpoint{server.URL + streamFixturePath, http.StatusOK, streamFixtureFirst + streamFixtureFinal}
+	result := probeRequest(server.Client(), &connectionTracker{}, target, "stream", http.MethodPost, strings.NewReader(streamFixtureInput))
+	if !result.Usable || result.FirstByteMs == nil || *result.FirstByteMs > result.ElapsedMs || result.ElapsedMs < 20 {
+		t.Fatalf("Delayed POST/stream was not measured completely: %+v", result)
+	}
+	for _, input := range []string{"", "truncated", streamFixtureInput + "extra"} {
+		result := probeRequest(server.Client(), &connectionTracker{}, target, "invalid", http.MethodPost, strings.NewReader(input))
+		if result.Usable || result.Status != http.StatusBadRequest {
+			t.Fatalf("Fixture accepted the wrong request body: %+v", result)
+		}
+	}
+}
+
+func TestStreamingAcceptanceRejectsAPrefixWithoutTheFinalEvent(t *testing.T) {
+	server := newHTTP2Server(t, func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.Write([]byte(streamFixtureFirst))
+	})
+	target := endpoint{server.URL, http.StatusOK, streamFixtureFirst + streamFixtureFinal}
+	result := probeRequest(server.Client(), &connectionTracker{}, target, "truncated", http.MethodPost, strings.NewReader(streamFixtureInput))
+	if result.Usable || result.Error == "" || result.FirstByteMs == nil {
+		t.Fatalf("A first event alone cannot prove completed streaming: %+v", result)
+	}
+}
 
 func newHTTP2Server(t *testing.T, handler http.HandlerFunc) *httptest.Server {
 	t.Helper()

@@ -165,8 +165,22 @@ Neither exception is used for Internet pair tests or written to the live
 config. A zero-idle CI pass verifies startup and protocol plumbing, not idle
 recovery; the separate 310-second acceptance remains required.
 
-These commands contact real HTTPS endpoints. Do not publish the private bundle
-or raw runtime configs. The [13 October investigation](../PERFORMANCE_INVESTIGATION_2026-10-13.md)
+The retained helper reports `ttfb_ms` from the first response-byte trace event,
+separately from `elapsed_ms`, which includes reading and validating the complete
+bounded body. Missing first-byte observations are omitted, not reported as a
+fake zero. TTFB is not page-completion time or an AI model's time to first token.
+
+The owned loopback fixture also completes an HTTP/2 POST body, waits seven
+seconds before the first SSE event, and waits another seven seconds before the
+final event. Both events must arrive. This runs through each generated
+XHTTP/WebSocket server/client pair in CI, adding about 14 seconds per pair.
+It guards against treating an HTTP/2 request END_STREAM as TCP upload EOF;
+it does not test genuine TCP half-close behavior, a real AI provider, GitHub's
+edge, Android lifecycle, or media playback.
+
+The `--live` variants contact Internet HTTPS endpoints; `--loopback-baseline`
+uses owned local origins instead. Do not publish the private bundle or raw
+runtime configs. The [13 October investigation](../PERFORMANCE_INVESTIGATION_2026-10-13.md)
 records failures as well as passes; a passing direct or SOCKS check cannot
 certify the phone's mobile-data path, six-hour sessions, or video playback.
 
