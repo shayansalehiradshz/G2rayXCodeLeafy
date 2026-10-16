@@ -639,6 +639,14 @@ VPN has started or that the full data path is verified.
 
 ## v2rayNG A/B comparison
 
+For the browsing-first route-selection revision, also follow
+[the responsiveness review](RESPONSIVENESS_REVIEW_2026-10-17.md). Confirm that
+the optimizer uses repeated finalist samples, does not replace a stable route
+with a one-off quick winner, discards a mid-scan network change, and is cancelled
+by Start VPN. Ping All remains a quick scan, not a sustained-performance test.
+While Blocked, optional native ping tests must ask for Stop; protected manual
+wake must still work. Record real page/feed/video/AI-stream timings separately.
+
 For each client, run three alternating 15-minute rounds with the same config and physical network. Record median and p95 for:
 
 - time to first successful web page;

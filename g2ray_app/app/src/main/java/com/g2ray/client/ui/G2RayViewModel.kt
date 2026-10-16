@@ -277,6 +277,28 @@ class G2RayViewModel internal constructor(
             ranked.firstOrNull { it.transport != selected.transport }.let(::listOfNotNull) + ranked)
             .distinctBy(VlessUriParser::semanticRouteKey).take(3)
 
+        internal fun optimizationConfirmationCandidates(
+            selected: G2RayProfile?,
+            measured: List<Pair<G2RayProfile, XrayDelaySummary>>
+        ): List<G2RayProfile> {
+            val ranked = measured.filter { (_, summary) ->
+                summary.success && summary.medianMs?.let { it in 1..9999 } == true
+            }.sortedBy { (profile, summary) -> routeOptimizationScore(summary, profile.transport) }
+                .map { it.first }
+            val first = selected?.takeIf { current ->
+                ranked.any { VlessUriParser.semanticRouteKey(it) == VlessUriParser.semanticRouteKey(current) }
+            } ?: ranked.firstOrNull() ?: return emptyList()
+            return optimizationGuardCandidates(first, ranked)
+        }
+
+        internal fun optionalRouteTestsAllowed(tunnelState: TunnelState): Boolean =
+            tunnelState in setOf(TunnelState.Disabled, TunnelState.Disconnected, TunnelState.Error)
+
+        private fun routeIsConfirmed(summary: XrayDelaySummary): Boolean =
+            summary.success && summary.medianMs?.let { it in 1..9999 } == true &&
+                summary.totalSamples >= 3 &&
+                summary.successfulSamples in (summary.totalSamples / 2 + 1)..summary.totalSamples
+
         internal fun hasOptimizationReadinessEvidence(
             availableWakeAt: Long?,
             profiles: List<StoredG2RayProfile>,
@@ -455,6 +477,7 @@ class G2RayViewModel internal constructor(
             performance: RoutePerformanceSummary?,
             hasPerformanceEvidence: Boolean
         ): Long {
+            if (!routeIsConfirmed(summary)) return Long.MAX_VALUE
             val score = routeOptimizationScore(summary, transport, performance)
             if (score == Long.MAX_VALUE) return score
             return score + if (hasPerformanceEvidence && performance?.success != true) {
@@ -479,7 +502,7 @@ class G2RayViewModel internal constructor(
             busy: Boolean,
             availableWakeAt: Long? = null
         ): Boolean {
-            val stopped = tunnelState in setOf(TunnelState.Disabled, TunnelState.Disconnected, TunnelState.Error)
+            val stopped = optionalRouteTestsAllowed(tunnelState)
             val elapsed = now - lastAttemptAt
             val freshWakeAfterAttempt = availableWakeAt?.let {
                 it > lastAttemptAt && now - it in 0..OPTIMIZATION_WAKE_FRESHNESS_MS
@@ -1530,12 +1553,7 @@ class G2RayViewModel internal constructor(
             _statusMessage.value = XrayCoreManager.MISSING_CORE_MESSAGE
             return
         }
-        if (VpnStateRepository.state.value.tunnelState !in setOf(
-                TunnelState.Disabled,
-                TunnelState.Disconnected,
-                TunnelState.Error
-            )
-        ) {
+        if (!optionalRouteTestsAllowed(VpnStateRepository.state.value.tunnelState)) {
             _statusMessage.value = "Stop VPN before optimizing routes."
             return
         }
@@ -1560,12 +1578,7 @@ class G2RayViewModel internal constructor(
         job = viewModelScope.launch(start = CoroutineStart.LAZY) {
             if (!manual) delay(AUTO_ROUTE_OPTIMIZATION_START_DELAY_MS)
             if (repository.activeSelection.value.accountId != accountId) return@launch
-            if (VpnStateRepository.state.value.tunnelState !in setOf(
-                    TunnelState.Disabled,
-                    TunnelState.Disconnected,
-                    TunnelState.Error
-                )
-            ) {
+            if (!optionalRouteTestsAllowed(VpnStateRepository.state.value.tunnelState)) {
                 return@launch
             }
 
@@ -1680,7 +1693,27 @@ class G2RayViewModel internal constructor(
             _profileDelayStates.value = _profileDelayStates.value + (id to ProfileDelayState(testing = true))
         }
         _statusMessage.value = "Verifying ${probes.size} routes through libXray from this phone..."
-        val summaries = measureQuickProfiles(probes.map { it.profile }, measurement = measurement)
+        val quickSummaries = measureQuickProfiles(probes.map { it.profile }, measurement = measurement)
+        val finalists = optimizationConfirmationCandidates(
+            parsedProfiles.firstOrNull { it.first.id == selection.profileId }?.second,
+            probes.map { it.profile }.zip(quickSummaries)
+        )
+        val confirmationByRoute = if (finalists.isNotEmpty()) {
+            _statusMessage.value = "Confirming response consistency on ${finalists.size} route finalists..."
+            val confirmed = withContext(Dispatchers.IO) {
+                routeProbeManagerFactory().measureDelaySummaryBatch(
+                    profiles = finalists,
+                    datDir = getApplication<Application>().filesDir.absolutePath,
+                    dpiCompatibilityEnabled = dpiCompatibilityEnabled.value,
+                    checkActive = { coroutineContext.ensureActive(); checkMeasurementNetwork(measurement) }
+                )
+            }
+            checkMeasurementNetwork(measurement)
+            finalists.map(VlessUriParser::semanticRouteKey).zip(confirmed).toMap()
+        } else emptyMap()
+        val summaries = probes.zip(quickSummaries).map { (probe, quick) ->
+            confirmationByRoute[VlessUriParser.semanticRouteKey(probe.profile)] ?: quick
+        }
         val delayMeasuredAt = System.currentTimeMillis()
         val measured = probes.zip(summaries)
         val successful = measured.filter { (_, summary) ->
@@ -1743,9 +1776,7 @@ class G2RayViewModel internal constructor(
             MAX_AUTO_THROUGHPUT_PROBES
         }
         val performanceTargets = measuredStored.asSequence()
-            .filter { (_, _, summary) ->
-                summary.success && summary.medianMs?.let { it in 1..9999 } == true
-            }
+            .filter { (_, _, summary) -> routeIsConfirmed(summary) }
             .sortedWith(
                 compareBy<Triple<StoredG2RayProfile, G2RayProfile, XrayDelaySummary>> {
                     if (it.first.id == selection.profileId) 0 else 1
@@ -1789,7 +1820,7 @@ class G2RayViewModel internal constructor(
         val updates = measuredStored.mapNotNull { (stored, _, summary) ->
             val delayMs = summary.medianMs?.takeIf { summary.success && it in 1..9999 }
             val performance = measuredPerformance[stored.id]
-            val preserveFreshAccurateHistory = delayMs != null &&
+            val preserveFreshAccurateHistory = summary.totalSamples < 3 && delayMs != null &&
                 stored.lastDelaySampleCount >= 3 &&
                 stored.lastDelaySuccessfulSamples * 2 >= stored.lastDelaySampleCount &&
                 ProfileHealth.isDelayFresh(stored, networkKey = networkKey)
@@ -1849,12 +1880,12 @@ class G2RayViewModel internal constructor(
             hasPerformanceEvidence = hasPerformanceEvidence
         )
         val best = measuredStored.asSequence()
-            .filter { (_, _, summary) -> summary.success && summary.medianMs?.let { it in 1..9999 } == true }
+            .filter { (_, _, summary) -> routeIsConfirmed(summary) }
             .minByOrNull { (stored, profile, summary) ->
                 comparisonScore(stored, profile, summary)
             }
         val current = measuredStored.firstOrNull { it.first.id == selection.profileId }
-            ?.takeIf { (_, _, summary) -> summary.success && summary.medianMs?.let { it in 1..9999 } == true }
+            ?.takeIf { (_, _, summary) -> routeIsConfirmed(summary) }
         val chosen = when {
             best == null -> current
             current == null || current.first.id == best.first.id -> best
@@ -1879,6 +1910,7 @@ class G2RayViewModel internal constructor(
         val selectedDelay = chosen?.third?.medianMs
         _statusMessage.value = buildString {
             append("Route optimization verified ${successful.size}/${probes.size} configs")
+            append(", consistency-confirmed ${confirmationByRoute.values.count(::routeIsConfirmed)}/${finalists.size}")
             if (addedCount > 0) append(", added $addedCount")
             if (measuredPerformance.isNotEmpty()) {
                 append(", transfer-tested ${measuredPerformance.values.count { it.success }}/${measuredPerformance.size}")
@@ -1887,6 +1919,8 @@ class G2RayViewModel internal constructor(
                 append(if (chosen.first.id == selection.profileId) ", kept " else ", selected ")
                 append(chosen.first.displayName)
                 selectedDelay?.let { append(" (${it} ms)") }
+            } else {
+                append(", selection unchanged: no route passed repeated checks")
             }
             append('.')
         }
@@ -1966,7 +2000,7 @@ class G2RayViewModel internal constructor(
             _statusMessage.value = "Wait for the current route test to finish."
             return
         }
-        if (VpnStateRepository.state.value.tunnelState in setOf(TunnelState.Starting, TunnelState.Connected, TunnelState.Stopping)) {
+        if (!optionalRouteTestsAllowed(VpnStateRepository.state.value.tunnelState)) {
             _profileDelayStates.value = _profileDelayStates.value + (
                 profileId to ProfileDelayState(
                     error = "Stop VPN before running real-delay test.",
@@ -2089,7 +2123,7 @@ class G2RayViewModel internal constructor(
             _statusMessage.value = "Wait for the current route test to finish."
             return
         }
-        if (VpnStateRepository.state.value.tunnelState in setOf(TunnelState.Starting, TunnelState.Connected, TunnelState.Stopping)) {
+        if (!optionalRouteTestsAllowed(VpnStateRepository.state.value.tunnelState)) {
             _statusMessage.value = "Stop VPN before refreshing real delays."
             return
         }

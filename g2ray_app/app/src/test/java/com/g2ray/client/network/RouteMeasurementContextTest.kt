@@ -10,6 +10,7 @@ import com.g2ray.client.vpn.G2RayVpnService
 import com.g2ray.client.vpn.SocketProtector
 import com.g2ray.client.G2RayApplication
 import com.g2ray.client.data.AccountRepository
+import com.g2ray.client.data.ProfileDelayUpdate
 import com.g2ray.client.data.AccountRepositoryTest.InMemorySecureStore
 import com.g2ray.client.data.SecureKeyValueStore
 import com.g2ray.client.parser.VlessUriParser
@@ -22,8 +23,13 @@ import com.g2ray.client.vpn.XrayPingBatchResult
 import com.g2ray.client.vpn.XrayPingResult
 import com.g2ray.client.vpn.XrayRuntimeCapabilities
 import com.g2ray.client.vpn.VpnEnginePreferences
+import com.g2ray.client.model.AppConnectionState
+import com.g2ray.client.model.RouteState
+import com.g2ray.client.model.TunnelState
+import com.g2ray.client.model.VpnStateRepository
 import androidx.lifecycle.ViewModelStore
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -48,6 +54,11 @@ import org.robolectric.annotation.Implements
 import org.robolectric.shadows.ShadowNetwork
 import org.robolectric.shadows.ShadowNetworkCapabilities
 import org.robolectric.shadow.api.Shadow
+import okhttp3.OkHttpClient
+import okhttp3.Protocol
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
+import org.json.JSONObject
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [Build.VERSION_CODES.N, Build.VERSION_CODES.S], application = G2RayApplication::class, shadows = [RouteMeasurementContextTest.ConnectivityShadow::class])
@@ -237,6 +248,118 @@ class RouteMeasurementContextTest {
     }
 
     @Test
+    fun optimizerKeepsStableIncumbentWhenTheQuickWinnerHasSlowTailResponses() = runBlocking {
+        exerciseOptimization(listOf(40L, 900L, 800L), expectSecondary = false)
+    }
+
+    @Test
+    fun optimizerSelectsARepeatedlyFasterRouteAndPersistsItsActualSamples() = runBlocking {
+        exerciseOptimization(listOf(70L, 80L, 90L), expectSecondary = true)
+    }
+
+    @Test
+    fun optimizerLeavesSelectionAloneWhenNoRoutePassesRepeatedChecks() = runBlocking {
+        exerciseOptimization(listOf(40L, null, null), expectSecondary = false,
+            currentSamples = listOf(160L, null, null))
+    }
+
+    @Test
+    fun optimizerDiscardsConfirmationAcrossNetworkChangesWithoutMutatingProfiles() = runBlocking {
+        exerciseOptimization(listOf(70L, 80L, 90L), expectSecondary = false, changeNetwork = true)
+    }
+
+    private suspend fun exerciseOptimization(
+        secondarySamples: List<Long?>,
+        expectSecondary: Boolean,
+        currentSamples: List<Long?> = listOf(160L, 160L, 160L),
+        changeNetwork: Boolean = false
+    ) {
+        defaultNetwork = physical(100)
+        val repository = AccountRepository(InMemorySecureStore())
+        val account = repository.addAccount("Fixture", "", "fixture-space")
+        val imported = listOf("203.0.113.1", "203.0.113.2").map { address ->
+            val parsed = VlessUriParser.parse(
+                "vless://00000000-0000-4000-8000-000000000001@$address:443" +
+                    "?encryption=none&security=tls&sni=fixture.example&type=ws&host=fixture.example&path=%2Fws"
+            ).getOrThrow()
+            repository.importProfile(account.id, address, parsed.rawUri, parsed)
+        }
+        repository.selectProfile(imported.first().id)
+        val context = (application as G2RayApplication).routeMeasurementContext
+        val now = System.currentTimeMillis()
+        repository.recordProfileDelays(imported.map { stored ->
+            ProfileDelayUpdate(stored.id, true, 100L, null, 110L, 5L, 3, 3,
+                downloadBps = 4_000_000L, uploadBps = 1_000_000L, throughputTestedAt = now,
+                networkKey = context.currentKey())
+        })
+        val before = repository.profiles.value
+        val originalState = VpnStateRepository.state.value
+        VpnStateRepository.state.value = AppConnectionState(RouteState.Ready, TunnelState.Disconnected, "Fixture")
+        G2RayApplication::class.java.getDeclaredField("accountRepository\$delegate")
+            .apply { isAccessible = true }.set(application, lazyOf(repository))
+        val bridge = DelayBridge(delayFor = { config, batch ->
+            if (changeNetwork && batch == 3) {
+                defaultNetwork = physical(101)
+                callbacks.toList().forEach { it.onAvailable(defaultNetwork!!) }
+            }
+            val primary = JSONObject(java.io.File(config.configPath).readText()).getJSONArray("outbounds")
+                .getJSONObject(0).getJSONObject("settings").getJSONArray("vnext")
+                .getJSONObject(0).getString("address") == imported.first().address
+            if (batch <= 2) { if (primary) 160L else 40L }
+            else (if (primary) currentSamples else secondarySamples)[batch - 3]
+        }) {}
+        val client = OkHttpClient.Builder().addInterceptor { chain ->
+            Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+                .body("{\"Answer\":[]}".toResponseBody()).build()
+        }.build()
+        val dispatcher = UnconfinedTestDispatcher()
+        Dispatchers.setMain(dispatcher)
+        val store = ViewModelStore()
+        try {
+            val manager = XrayCoreManager(bridge)
+            val viewModel = G2RayViewModel(application, { manager }, VpnEnginePreferences(InMemorySecureStore()))
+            store.put("fixture", viewModel)
+            G2RayViewModel::class.java.getDeclaredField("routeCandidateDiscovery\$delegate")
+                .apply { isAccessible = true }.set(viewModel, lazyOf(RouteCandidateDiscovery(client) { emptyList() }))
+            withTimeout(10_000L) { viewModel.measurementNetworkKey.first { it != null } }
+
+            viewModel.autoOptimizeRoutesIfNeeded()
+            val job = G2RayViewModel::class.java.getDeclaredField("routeOptimizationJob")
+                .apply { isAccessible = true }.get(viewModel) as Job
+            dispatcher.scheduler.advanceTimeBy(1_500L)
+            dispatcher.scheduler.runCurrent()
+            withTimeout(10_000L) { job.join() }
+
+            assertEquals(if (expectSecondary) imported[1].id else imported[0].id,
+                repository.activeSelection.value.profileId)
+            assertFalse(viewModel.isRouteOptimizing.value)
+            if (changeNetwork) {
+                assertEquals(3, bridge.batchCalls)
+                assertEquals(before, repository.profiles.value)
+                assertTrue(viewModel.statusMessage.value.contains("Physical network changed"))
+            } else {
+                assertEquals(5, bridge.batchCalls)
+                assertTrue(viewModel.statusMessage.value.startsWith("Route optimization verified"))
+                assertTrue(repository.profiles.value.all { it.lastDelaySampleCount == 3 })
+                assertEquals(secondarySamples.filterNotNull().sorted().let { it[(it.size - 1) / 2] },
+                    repository.profiles.value.single { it.id == imported[1].id }.lastDelayMs)
+                assertEquals(secondarySamples.count { it != null },
+                    repository.profiles.value.single { it.id == imported[1].id }.lastDelaySuccessfulSamples)
+                if (currentSamples.count { it != null } < 2) {
+                    assertTrue(viewModel.statusMessage.value.contains("no route passed repeated checks"))
+                }
+            }
+        } finally {
+            store.clear()
+            Dispatchers.resetMain()
+            VpnStateRepository.state.value = originalState
+            client.dispatcher.cancelAll()
+            client.connectionPool.evictAll()
+            client.dispatcher.executorService.shutdown()
+        }
+    }
+
+    @Test
     fun unavailableCleanupUsesTheSelectedAccountWhenTheUiListIsStale() = runBlocking {
         defaultNetwork = physical(100)
         val repository = AccountRepository(InMemorySecureStore())
@@ -400,7 +523,10 @@ class RouteMeasurementContextTest {
         }
     }
 
-    private class DelayBridge(private val duringBatch: () -> Unit) : XrayBridge {
+    private class DelayBridge(
+        private val delayFor: (XrayPingBatchConfig, Int) -> Long? = { _, _ -> 100L },
+        private val duringBatch: () -> Unit
+    ) : XrayBridge {
         var batchCalls = 0
         override fun isAvailable() = true
         override fun capabilities() = XrayRuntimeCapabilities(
@@ -409,7 +535,10 @@ class RouteMeasurementContextTest {
         override fun pingBatch(configs: List<XrayPingBatchConfig>, timeoutSeconds: Int, testUrl: String): XrayPingBatchResult {
             batchCalls++
             duringBatch()
-            return XrayPingBatchResult(true, configs.map { XrayPingResult(true, 100L, null) }, null)
+            return XrayPingBatchResult(true, configs.map { config ->
+                val delay = delayFor(config, batchCalls)
+                XrayPingResult(delay != null, delay, if (delay == null) "Fixture unavailable" else null)
+            }, null)
         }
         override fun ping(base64Request: String): XrayPingResult = error("Unexpected sequential native fallback")
         override fun registerDialerController(protectFd: (Int) -> Boolean) = error("Unexpected VPN startup")

@@ -556,6 +556,155 @@ class XrayCoreManagerTest {
     }
 
     @Test
+    fun delayConfirmationResamplesSuccessfulRoutesInsteadOfSelectingOneLuckyResponse() {
+        val bridge = FakeXrayBridge(available = true).apply {
+            invokeAvailable = true
+            listOf(listOf(40L, 170L), listOf(900L, 180L), listOf(800L, 175L)).forEach { round ->
+                batchResults += XrayPingBatchResult(true, round.map { XrayPingResult(true, it, null) }, null)
+            }
+        }
+        val summaries = XrayCoreManager(bridge).measureDelaySummaryBatch(
+            listOf(sampleProfile(), sampleProfile().copy(address = "203.0.113.2")),
+            System.getProperty("java.io.tmpdir") ?: "."
+        )
+        assertEquals(800L, summaries[0].medianMs)
+        assertEquals(900L, summaries[0].p95Ms)
+        assertEquals(175L, summaries[1].medianMs)
+        assertTrue(summaries[0].jitterMs!! > summaries[1].jitterMs!!)
+        assertTrue(summaries.all { it.totalSamples == 3 && it.successfulSamples == 3 })
+        assertEquals(SocksRunningRouteProbe.HEALTH_URLS, bridge.batchRequests.map { it.second })
+        assertTrue(bridge.batchRequests.all { it.first.size == 2 })
+        assertTrue(bridge.batchRequests.flatMap { it.first }.all { !java.io.File(it.configPath).exists() })
+        assertTrue(bridge.pingRequests.isEmpty())
+    }
+
+    @Test
+    fun delayConfirmationCountsFailuresWithoutRetryingUntilTheyLookReliable() {
+        val bridge = FakeXrayBridge(available = true).apply {
+            invokeAvailable = true
+            batchResults += XrayPingBatchResult(true, listOf(
+                XrayPingResult(true, 40L, null), XrayPingResult(true, 170L, null)), null)
+            batchResults += XrayPingBatchResult(true, listOf(
+                XrayPingResult(false, null, "timeout"), XrayPingResult(true, 180L, null)), null)
+            batchResults += XrayPingBatchResult(true, listOf(
+                XrayPingResult(false, null, "timeout"), XrayPingResult(false, null, "timeout")), null)
+        }
+        val results = XrayCoreManager(bridge).measureDelaySummaryBatch(
+            listOf(sampleProfile(), sampleProfile()), System.getProperty("java.io.tmpdir") ?: "."
+        )
+        assertEquals(1, results[0].successfulSamples)
+        assertEquals(2, results[1].successfulSamples)
+        assertTrue(results.all { it.totalSamples == 3 && it.error?.contains("timeout") == true })
+        assertEquals(3, bridge.batchRequests.size)
+        assertTrue(bridge.pingRequests.isEmpty())
+    }
+
+    @Test
+    fun delayConfirmationSupportsOlderAarsWithTheSameSamplesAndCleanup() {
+        val bridge = FakeXrayBridge(available = true).apply {
+            listOf(100L, 200L, 300L, 210L, 150L, 220L).forEach {
+                pingResults += XrayPingResult(true, it, null)
+            }
+        }
+        val results = XrayCoreManager(bridge).measureDelaySummaryBatch(
+            listOf(sampleProfile(), sampleProfile()), System.getProperty("java.io.tmpdir") ?: "."
+        )
+        assertEquals(150L, results[0].medianMs)
+        assertEquals(210L, results[1].medianMs)
+        assertTrue(bridge.batchRequests.isEmpty())
+        val requests = bridge.pingRequests.map {
+            JSONObject(String(android.util.Base64.decode(it, android.util.Base64.DEFAULT)))
+        }
+        assertEquals(SocksRunningRouteProbe.HEALTH_URLS.flatMap { listOf(it, it) }, requests.map { it.getString("url") })
+        assertTrue(requests.all { !java.io.File(it.getString("configPath")).exists() })
+    }
+
+    @Test
+    fun malformedConfirmationBatchFallsBackOnceWithoutRepeatingNativeBatchFailures() {
+        val bridge = FakeXrayBridge(available = true).apply {
+            invokeAvailable = true
+            batchResult = XrayPingBatchResult(true, emptyList(), null)
+            pingResult = XrayPingResult(true, 120L, null)
+        }
+        val results = XrayCoreManager(bridge).measureDelaySummaryBatch(
+            listOf(sampleProfile(), sampleProfile()), System.getProperty("java.io.tmpdir") ?: "."
+        )
+        assertTrue(results.all { it.successfulSamples == 3 && it.totalSamples == 3 })
+        assertEquals(1, bridge.batchRequests.size)
+        assertEquals(6, bridge.pingRequests.size)
+        assertTrue(bridge.batchConfigs.all { !java.io.File(it.configPath).exists() })
+    }
+
+    @Test
+    fun confirmationUsesThreeProvidersAndToleratesOneUnreachableProvider() {
+        val bridge = FakeXrayBridge(available = true).apply {
+            invokeAvailable = true
+            listOf(100L, null, 150L).forEach { delay ->
+                batchResults += XrayPingBatchResult(true,
+                    listOf(XrayPingResult(delay != null, delay, if (delay == null) "Endpoint unreachable" else null)), null)
+            }
+        }
+        val summary = XrayCoreManager(bridge).measureDelaySummaryBatch(
+            listOf(sampleProfile()), System.getProperty("java.io.tmpdir") ?: ".", testUrls = emptyList()
+        ).single()
+        assertEquals(2, summary.successfulSamples)
+        assertEquals(3, summary.totalSamples)
+        assertEquals(listOf("cp.cloudflare.com", "www.gstatic.com", "www.apple.com"),
+            bridge.batchRequests.map { java.net.URI(it.second).host })
+    }
+
+    @Test
+    fun cancelledConfirmationCannotStartAnotherRoundOrFallback() {
+        val bridge = FakeXrayBridge(available = true).apply {
+            invokeAvailable = true
+            batchResult = XrayPingBatchResult(true, listOf(XrayPingResult(true, 80L, null)), null)
+        }
+        var cancelled = false
+        bridge.onBatch = { cancelled = true }
+        val manager = XrayCoreManager(bridge)
+        val error = runCatching {
+            manager.measureDelaySummaryBatch(listOf(sampleProfile()), System.getProperty("java.io.tmpdir") ?: ".",
+                checkActive = { if (cancelled) throw CancellationException("Start VPN superseded confirmation") })
+        }.exceptionOrNull()
+        assertTrue(error is CancellationException)
+        assertEquals(1, bridge.batchRequests.size)
+        assertTrue(bridge.pingRequests.isEmpty())
+        assertTrue(bridge.batchConfigs.all { !java.io.File(it.configPath).exists() })
+        assertTrue(manager.measureDelaySummaryBatch(listOf(sampleProfile()),
+            System.getProperty("java.io.tmpdir") ?: ".").single().success)
+    }
+
+    @Test
+    fun confirmationRejectsNetworkChangesBeforePublishingOrFallingBack() {
+        val bridge = FakeXrayBridge(available = true).apply {
+            invokeAvailable = true
+            batchResult = XrayPingBatchResult(true, listOf(XrayPingResult(true, 80L, null)), null)
+        }
+        var obsolete = false
+        bridge.onBatch = { obsolete = true }
+        val error = runCatching {
+            XrayCoreManager(bridge).measureDelaySummaryBatch(listOf(sampleProfile()),
+                System.getProperty("java.io.tmpdir") ?: ".",
+                checkActive = { if (obsolete) throw java.io.IOException("Physical network changed") })
+        }.exceptionOrNull()
+        assertTrue(error is java.io.IOException)
+        assertEquals(1, bridge.batchRequests.size)
+        assertTrue(bridge.pingRequests.isEmpty())
+        assertTrue(bridge.batchConfigs.all { !java.io.File(it.configPath).exists() })
+    }
+
+    @Test
+    fun confirmationRejectsOversizedWorkAndDoesNotProbeAnEmptyList() {
+        val bridge = FakeXrayBridge(available = true).apply { invokeAvailable = true }
+        val manager = XrayCoreManager(bridge)
+        assertTrue(manager.measureDelaySummaryBatch(emptyList(), ".").isEmpty())
+        assertTrue(runCatching { manager.measureDelaySummaryBatch(List(6) { sampleProfile() }, ".") }
+            .exceptionOrNull() is IllegalArgumentException)
+        assertTrue(bridge.batchRequests.isEmpty())
+        assertTrue(bridge.pingRequests.isEmpty())
+    }
+
+    @Test
     fun measureDelayQuickBatch_usesLibXrayBatchAndCleansTempFiles() {
         val bridge = FakeXrayBridge(available = true).apply {
             invokeAvailable = true

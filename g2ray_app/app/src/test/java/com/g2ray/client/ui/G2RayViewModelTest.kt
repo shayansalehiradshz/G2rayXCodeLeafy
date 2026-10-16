@@ -289,6 +289,22 @@ class G2RayViewModelTest {
     }
 
     @Test
+    fun routeOptimizationComparison_requiresRepeatedSuccessBeforeSelectingAQuickWinner() {
+        val quick = XrayDelaySummary(true, 40L, 40L, 0L, 1, 1, null)
+        val inconsistent = XrayDelaySummary(true, 40L, 40L, 0L, 1, 3, "two timeouts")
+        val confirmed = XrayDelaySummary(true, 150L, 180L, 15L, 3, 3, null)
+        fun score(summary: XrayDelaySummary) = G2RayViewModel.routeOptimizationComparisonScoreVisibleForTesting(
+            summary, Transport.XHTTP, performance = null, hasPerformanceEvidence = false
+        )
+
+        assertEquals(Long.MAX_VALUE, score(quick))
+        assertEquals(Long.MAX_VALUE, score(inconsistent))
+        assertTrue(score(confirmed) < Long.MAX_VALUE)
+        assertTrue(score(confirmed.copy(successfulSamples = 2)) < Long.MAX_VALUE)
+        assertEquals(Long.MAX_VALUE, score(confirmed.copy(success = false)))
+    }
+
+    @Test
     fun autoRouteOptimization_allowsOneAttemptAfterANewAvailableWake() {
         val now = 2_000_000L
         fun allowed(lastAttemptAt: Long) = G2RayViewModel.shouldAutoOptimizeRoutesVisibleForTesting(

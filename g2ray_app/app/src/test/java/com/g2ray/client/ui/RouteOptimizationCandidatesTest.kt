@@ -2,7 +2,9 @@ package com.g2ray.client.ui
 
 import com.g2ray.client.model.StoredG2RayProfile
 import com.g2ray.client.model.Transport
+import com.g2ray.client.model.TunnelState
 import com.g2ray.client.parser.VlessUriParser
+import com.g2ray.client.vpn.XrayDelaySummary
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -51,6 +53,42 @@ class RouteOptimizationCandidatesTest {
         val result = G2RayViewModel.optimizationGuardCandidates(selected, listOf(selected, otherXhttp, ws))
         assertEquals(listOf(selected, ws, otherXhttp), result)
         assertEquals(listOf(selected), G2RayViewModel.optimizationGuardCandidates(selected, listOf(selected, selected)))
+    }
+
+    @Test
+    fun confirmationIsBoundedAndIncludesTheIncumbentAndAlternateTransport() {
+        val selected = profile("xhttp", "20.85.77.10")
+        val fastest = profile("xhttp", "20.85.77.11")
+        val ws = profile("ws", "20.85.77.12")
+        val next = profile("xhttp", "20.85.77.13")
+        val summary = XrayDelaySummary(true, 120, 120, 0, 1, 1, null)
+        val candidates = G2RayViewModel.optimizationConfirmationCandidates(selected, listOf(
+            selected to summary.copy(medianMs = 350), fastest to summary.copy(medianMs = 80),
+            ws to summary.copy(medianMs = 130), next to summary.copy(medianMs = 90), fastest to summary
+        ))
+        assertEquals(listOf(selected, ws, fastest), candidates)
+    }
+
+    @Test
+    fun failedIncumbentAndInvalidDelaysDoNotConsumeConfirmationSlots() {
+        val selected = profile("xhttp")
+        val ws = profile("ws", "20.85.77.12")
+        val valid = XrayDelaySummary(true, 100, 100, 0, 1, 1, null)
+        val candidates = G2RayViewModel.optimizationConfirmationCandidates(selected, listOf(
+            selected to valid.copy(success = false), ws to valid,
+            profile("xhttp", "20.85.77.13") to valid.copy(medianMs = 0),
+            profile("xhttp", "20.85.77.14") to valid.copy(medianMs = 10_000)
+        ))
+        assertEquals(listOf(ws), candidates)
+        assertTrue(G2RayViewModel.optimizationConfirmationCandidates(null, emptyList()).isEmpty())
+    }
+
+    @Test
+    fun optionalNativeTestsRequireAFullyStoppedTunnel() {
+        val stopped = setOf(TunnelState.Disabled, TunnelState.Disconnected, TunnelState.Error)
+        TunnelState.entries.forEach { state ->
+            assertEquals(state.name, state in stopped, G2RayViewModel.optionalRouteTestsAllowed(state))
+        }
     }
 
     @Test

@@ -359,6 +359,36 @@ class SavedDataRecoveryViewModelTest {
     }
 
     @Test
+    fun retainedBlockedCaptureDoesNotRunPingAllOrChangeConnectionState() {
+        withViewModel(repositoryWithProfile(), InMemorySecureStore()) { viewModel, _ ->
+            val blocked = AppConnectionState(RouteState.Error, TunnelState.Blocked, "Fixture blocked")
+            VpnStateRepository.state.value = blocked
+
+            viewModel.refreshActiveCodespaceDelays()
+
+            assertEquals("Stop VPN before refreshing real delays.", viewModel.statusMessage.value)
+            assertTrue(viewModel.profileDelayStates.value.isEmpty())
+            assertEquals(blocked, VpnStateRepository.state.value)
+        }
+    }
+
+    @Test
+    fun retainedBlockedCaptureDoesNotRunIndividualNativePing() {
+        val repository = repositoryWithProfile()
+        val profileId = repository.activeSelection.value.profileId!!
+        withViewModel(repository, InMemorySecureStore()) { viewModel, _ ->
+            val blocked = AppConnectionState(RouteState.Error, TunnelState.Blocked, "Fixture blocked")
+            VpnStateRepository.state.value = blocked
+
+            viewModel.measureProfileDelay(profileId)
+
+            assertEquals("Stop VPN before running real-delay test.", viewModel.profileDelayStates.value[profileId]?.error)
+            assertFalse(viewModel.profileDelayStates.value[profileId]?.testing == true)
+            assertEquals(blocked, VpnStateRepository.state.value)
+        }
+    }
+
+    @Test
     fun repeatedReloadWhileBusyDoesNotCreateASpuriousPreferenceFailure() {
         val backing = InMemorySecureStore()
         val entered = CountDownLatch(1)
