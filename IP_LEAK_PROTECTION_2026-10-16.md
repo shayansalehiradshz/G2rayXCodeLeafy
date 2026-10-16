@@ -15,7 +15,8 @@ WebRTC/STUN, DNS, IPv6, and failure-time fallback need separate checks.
 
 Preventing bypasses cannot make a VPN undetectable. Sites can recognize a
 datacenter exit or infer VPN use, and can associate accounts/cookies, browser
-characteristics, or granted location permissions with a user. A Codespaces
+characteristics, or granted location permissions with a user. Android apps can
+also query the system's `TRANSPORT_VPN` network type. A Codespaces
 server change cannot enforce routing in a phone or third-party Windows client.
 
 ## Confirmed source behavior
@@ -119,8 +120,25 @@ Local verification completed:
 
 The Windows Git Bash server behavior attempt failed at the deadline/EXIT-cleanup
 test (`deadline reported 0 while exit cleanup exceeded its budget`). Server code
-was unchanged. This local result is not reported as a pass; Linux CI must be
-checked independently because Codespaces runs Linux, not Git Bash.
+was unchanged. This local result is not reported as a pass. The independent
+Linux run subsequently passed all 197 server behavior checks, including
+deadline cleanup, plus 66 static and 65 Worker checks. Codespaces runs Linux,
+not Git Bash; no server-runtime workaround or test weakening was applied.
+
+Hosted source verification also completed successfully:
+
+- [Android CI 38944954452](https://github.com/z3roozsh/G2rayXCodeLeafy/actions/runs/38944954452)
+  at `6c47974`: downloaded evidence confirms 562 tests / 43 suites with zero
+  failures, errors, or skips. Native payload/restart fixtures, build-logic tests,
+  instrumentation compilation, lint, and pinned build-input checks passed. Hosted
+  lint has zero errors and 26 warnings; the extra warning versus local lint is
+  `AndroidGradlePluginVersion`.
+- [Static/Linux CI 38945187786](https://github.com/z3roozsh/G2rayXCodeLeafy/actions/runs/38945187786)
+  at `2eb3edb`: all three jobs passed, including real pinned-Xray config/upload
+  expiry and retained-connection loopback fixtures, standalone diagnostic tests,
+  ShellCheck critical checks, mocked budgets, and Worker dry-run packaging.
+  The only change after the Android CI revision was a manual dispatch entrypoint
+  for the Linux workflow. These fixtures do not test the user's ISP or phone.
 
 The local functional debug APK SHA-256 is
 `faff1e3b55c8530f33f958a911103c79d69034462faf5081ac831e246a51f4de`.
@@ -151,5 +169,6 @@ made from passing source tests.
 - [Android VPN guide: routing, bypass, always-on, and lockdown](https://developer.android.com/develop/connectivity/vpn)
 - [VpnService.Builder: routes, family blocking, and interface lifecycle](https://developer.android.com/reference/android/net/VpnService.Builder)
 - [VpnService: `isAlwaysOn` and `isLockdownEnabled` API availability](https://developer.android.com/reference/android/net/VpnService)
+- [Android NetworkCapabilities: the VPN transport is visible to apps](https://developer.android.com/reference/android/net/NetworkCapabilities#TRANSPORT_VPN)
 - [AOSP system always-on start implementation](https://android.googlesource.com/platform/frameworks/base/+/refs/heads/main/services/core/java/com/android/server/connectivity/Vpn.java)
 - [sing-box TUN: Windows strict-route behavior](https://sing-box.sagernet.org/configuration/inbound/tun/)
