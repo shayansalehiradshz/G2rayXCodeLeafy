@@ -2,6 +2,10 @@
 
 Run these checks on the same physical Android phone and ISP used for daily traffic. Use the same VLESS URI for this app and v2rayNG; otherwise the comparison is not valid.
 
+The [17 October physical-device record](DEVICE_ACCEPTANCE_2026-10-17.md) identifies
+the installed build, completed checks, interrupted attempts, and remaining
+acceptance. Its small HTTPS probes do not replace the broader tests below.
+
 ## Automated gates
 
 ```powershell
