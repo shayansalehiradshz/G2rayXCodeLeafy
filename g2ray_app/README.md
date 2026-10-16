@@ -1,7 +1,7 @@
 # G2Ray Client
 
 This is the Android Studio project under `g2ray_app/` in the
-`z2roozsh/G2rayXCodeLeafy` repository. Open this directory as the project root.
+`G2rayXCodeLeafy` repository or your fork. Open this directory as the project root.
 
 An Android full-device VPN client for personal testing with G2Ray instances running on GitHub Codespaces.
 
@@ -31,6 +31,29 @@ Wake setup is optional for an imported profile whose server is already running.
 Start VPN tries that profile directly even when no Worker or GitHub token is
 configured. Automatic server wake requires a configured wake method only when
 the server actually needs recovery.
+
+### Blocking traffic outside the VPN
+
+On Home, open **VPN protection settings**, select G2Ray in Android's VPN settings,
+then enable **Always-on VPN** and **Block connections without VPN**. Both are
+system-controlled settings: the app cannot silently enable them. Without OS
+blocking, traffic may use the normal network after the VPN stops or its process
+dies. On Android 10+, Home displays the OS-reported blocking state while the
+service is running; older versions show **Check Android settings**, not an
+unverified protection claim.
+
+Android's always-on start restores the currently selected saved profile, including
+after a normal app Stop cleared the previous session cache. On Android 10+, the
+app defers an always-on Stop request to the system settings rather than closing
+the interface behind Android's policy. Change or disable always-on in those
+settings when you intentionally want to disconnect.
+
+Full-device routing is different from being undetectable: a datacenter exit,
+accounts, cookies, browser characteristics, and granted location permissions can
+still identify you or suggest VPN use. See the [leak-protection review and
+acceptance checklist](../IP_LEAK_PROTECTION_2026-10-16.md) for Android, Windows,
+WebRTC, IPv6, and failure-case checks. These checks have not yet been accepted on
+your phone with OS blocking enabled.
 
 ### Direct GitHub wake
 
@@ -108,10 +131,12 @@ By default the VPN captures the IPv4 and IPv6 default routes, intercepts ordinar
 traffic sent to port 53, and sends the built-in DNS-over-HTTPS requests through
 the VLESS route. This prevents the common DNS leak where an ISP resolver sees
 the domain names you look up outside the encrypted tunnel. It is strong
-protection, not an absolute guarantee: an app can use a hard-coded resolver,
-its own VPN/bypass API, or a device-specific private-DNS implementation that
-Android does not expose to this VPN. The app does not claim DNS protection is a
-replacement for a trusted network or a security audit.
+protection, not an absolute guarantee. Hard-coded DNS-over-HTTPS and DNS-over-TLS
+destinations are still subject to full-device routing; selecting another resolver
+does not by itself bypass the VPN. This app does not enable Android's bypass API
+or exclude other apps. Device/OEM behavior, boot, process death, Private DNS, and
+network transitions still require packet-level acceptance with OS blocking enabled.
+The app does not claim DNS protection is a replacement for a security audit.
 
 Home **Quick scan** uses one bounded real route sample per saved config and is
 intentionally fast. Modern libXray builds test up to five tagged configs in one

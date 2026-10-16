@@ -805,15 +805,29 @@ class G2RayVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        refreshSystemProtectionState()
         return when (intent?.action) {
-            ACTION_START -> {
+            ACTION_START, VpnService.SERVICE_INTERFACE -> {
                 desiredConnected = true
                 startTunnel(intent)
                 START_STICKY
             }
             ACTION_STOP -> {
-                stopTunnel()
-                START_NOT_STICKY
+                if (VpnStateRepository.state.value.alwaysOnVpn == true) {
+                    // Always-on lifecycle belongs to Android. Closing TUN here
+                    // would conflict with that policy and discard its profile.
+                    desiredConnected = true
+                    if (vpnInterface == null) {
+                        startTunnel(Intent(VpnService.SERVICE_INTERFACE))
+                    } else {
+                        createNotificationChannel()
+                        updateNotification("Always-on VPN is managed in Android VPN settings")
+                    }
+                    START_STICKY
+                } else {
+                    stopTunnel()
+                    START_NOT_STICKY
+                }
             }
             ACTION_REVERIFY -> {
                 when (
@@ -1106,17 +1120,23 @@ class G2RayVpnService : VpnService() {
                     dpiCompatibilityEnabled = vpnPreferences.isDpiCompatibilityEnabled()
                     seamlessFailoverEnabled = vpnPreferences.isSeamlessFailoverEnabled()
 
-                    val rawProfile = requestedRawProfile ?: restoreLastRawProfile()
-                        ?: throw IllegalStateException(
-                            "No valid active VLESS profile. Import and select a profile first."
-                        )
+                    val systemStart = intent?.action == VpnService.SERVICE_INTERFACE ||
+                        (intent == null && systemAlwaysOnEnabled() == true)
                     if (intent == null && secureStore
-                            .getString(PREF_DESIRED_CONNECTED, "true") == "false"
+                            .getString(PREF_DESIRED_CONNECTED, "true") == "false" && !systemStart
                     ) {
                         withContext(Dispatchers.Main) { stopTunnel() }
                         return@withLock
                     }
-                    activeAccountId = requestedAccountId ?: restoreLastAccountId()
+                    // Stop clears the old session cache, not saved profiles.
+                    // Android must still be able to start the current selection
+                    // when always-on is enabled later or after a reboot.
+                    val systemProfile = if (systemStart) selectedProfileForSystemStart() else null
+                    val rawProfile = requestedRawProfile ?: systemProfile?.rawUri ?: restoreLastRawProfile()
+                        ?: throw IllegalStateException(
+                            "No valid active VLESS profile. Import and select a profile first."
+                        )
+                    activeAccountId = requestedAccountId ?: systemProfile?.accountId ?: restoreLastAccountId()
                     val profile = VlessUriParser.parse(rawProfile).getOrElse {
                         throw IllegalStateException(
                             "No valid active VLESS profile. Import and select a profile first.",
@@ -1396,6 +1416,7 @@ class G2RayVpnService : VpnService() {
         message: String,
         tunnelVerified: Boolean = tunnelState == TunnelState.Connected
     ) {
+        refreshSystemProtectionState()
         val resetSpeed = tunnelState != TunnelState.Connected || !tunnelVerified
         val routeState = when {
             tunnelState == TunnelState.Error -> RouteState.Error
@@ -2925,6 +2946,32 @@ class G2RayVpnService : VpnService() {
         return runCatching {
             secureStore.getString(PREF_LAST_ACCOUNT_ID, null)
         }.getOrNull()
+    }
+
+    private fun selectedProfileForSystemStart(): StoredG2RayProfile {
+        check(accountRepository.savedDataReady.value) {
+            "Saved VPN settings are unavailable. Open the app to recover them."
+        }
+        val selection = accountRepository.activeSelection.value
+        return accountRepository.profiles.value.firstOrNull {
+            it.id == selection.profileId && it.accountId == selection.accountId
+        } ?: throw IllegalStateException(
+            "No valid active VLESS profile. Import and select a profile first."
+        )
+    }
+
+    private fun systemAlwaysOnEnabled(): Boolean? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        runCatching { isAlwaysOn }.getOrNull()
+    } else null
+
+    private fun refreshSystemProtectionState() {
+        val alwaysOn = systemAlwaysOnEnabled()
+        val lockdown = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            runCatching { isLockdownEnabled }.getOrNull()
+        } else null
+        VpnStateRepository.state.update {
+            it.copy(alwaysOnVpn = alwaysOn, blockConnectionsWithoutVpn = lockdown)
+        }
     }
 
     private fun clearLastRawProfile() {

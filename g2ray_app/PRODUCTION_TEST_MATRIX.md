@@ -441,6 +441,10 @@ Run this section on Android 8.1 or newer after saving a working profile.
 3. Repeat the screen-off, Wi-Fi/mobile handoff, app force-stop, and Codespace-wake cases with lockdown enabled.
 4. Verify the G2Ray app itself has normal network access after connection and that its control-plane requests do not loop through the tunnel.
 5. Remove or invalidate the saved profile. Always-on startup must show a clear configuration error rather than a false Connected state.
+6. Stop a normal, non-always-on session, leaving its saved profile selected. Enable always-on in Android settings without starting G2Ray manually. Android's `android.net.VpnService` start must restore that selection, even though the old session cache was cleared.
+7. On Android 10+, an in-app Stop command must not discard the always-on session. The Home action opens Android VPN settings; disabling always-on there restores normal manual Stop behavior. On older Android versions, verify the OEM's Stop behavior separately because the service cannot query `isAlwaysOn` or `isLockdownEnabled`.
+8. With blocking enabled, capture traffic on a controlled access point before startup, during core failure, after process death, through network handoff, and after reboot. No test-site IPv4/IPv6, DNS, or WebRTC/STUN packets may reach the physical network directly. Distinguish the VPN provider's outer connection and deliberate GitHub/Worker/bootstrap control-plane traffic from application bypasses. Repeat with both engines and both transports.
+9. On an IPv6-capable connection, repeat with IPv4-only compatibility both off and on. Unrouted IPv6 must remain blocked, not escape. A resolver or browser leak-test result alone is not sufficient to prove crash/boot-time containment.
 
 Do not advertise always-on/lockdown as production-tested until every case passes on at least one Google Android device and one target OEM device.
 

@@ -602,6 +602,21 @@ fun HomeScreen(
                         style = MaterialTheme.typography.labelLarge,
                         color = MaterialTheme.colorScheme.onPrimaryContainer
                     )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "Outside-VPN blocking: ${vpnBlockingStatusLabel(if (isVpnRunning) vpnUiState.blockConnectionsWithoutVpn else null)}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer
+                    )
+                    TextButton(onClick = {
+                        if (!openVpnProtectionSettings(context)) {
+                            Toast.makeText(context, "Android VPN settings are unavailable", Toast.LENGTH_SHORT).show()
+                        }
+                    }) {
+                        Icon(Icons.Default.Lock, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("VPN protection settings")
+                    }
                     Spacer(modifier = Modifier.height(6.dp))
                     SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
                         VpnEngineMode.entries.forEachIndexed { index, mode ->
@@ -728,11 +743,17 @@ fun HomeScreen(
                     Spacer(modifier = Modifier.height(12.dp))
                     if (isVpnRunning) {
                         Button(
-                            onClick = { viewModel.stopVpn(context) },
+                            onClick = {
+                                if (vpnUiState.alwaysOnVpn == true) {
+                                    if (!openVpnProtectionSettings(context)) {
+                                        Toast.makeText(context, "Android VPN settings are unavailable", Toast.LENGTH_SHORT).show()
+                                    }
+                                } else viewModel.stopVpn(context)
+                            },
                             modifier = Modifier.fillMaxWidth(),
                             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
                         ) {
-                            Text("Stop VPN")
+                            Text(if (vpnUiState.alwaysOnVpn == true) "Manage always-on VPN" else "Stop VPN")
                         }
                     } else {
                         Button(

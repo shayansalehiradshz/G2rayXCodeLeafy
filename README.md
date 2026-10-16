@@ -57,6 +57,8 @@ The Android VPN source is in [`g2ray_app`](g2ray_app/README.md) in this same rep
 
 The checked-in native HEV libraries have pinned checksum metadata. The large `libXray.aar`, SDK-local settings, signing keys, and APK outputs are intentionally not committed. Rebuild the pinned AAR using the app's script before producing a functional APK. Android CI checks source tests, lint, HEV checksums, and the core build contract without pretending that coreless tests prove a working VPN.
 
+For protection when the VPN stops or crashes, enable Android's **Always-on VPN** and **Block connections without VPN** through Home **VPN protection settings**. Importing a VLESS link alone does not enforce device-wide routing or a kill switch in another client. See the [Android and Windows leak-protection checklist](IP_LEAK_PROTECTION_2026-10-16.md); VPN use cannot be guaranteed undetectable.
+
 See the [physical-device verification record](g2ray_app/DEVICE_VERIFICATION_2026-10-12.md) for tested behavior and remaining limits. Auto/HEV is the normal path, but retained HTTP connections stalled in Native idle testing and a HEV screen-off test. Idle-resume stability is not yet certified.
 The [13 October follow-up](DEVICE_RECOVERY_FOLLOWUP_2026-10-13.md) records the installed recovery-socket fix, direct-GitHub wake verification, and remaining Native/WebSocket failures.
 The [retained-flow investigation](PERFORMANCE_INVESTIGATION_2026-10-13.md) records the origin Fast Open A/B results and current release gates. Source tests and server checks do not certify phone or long-video performance.
