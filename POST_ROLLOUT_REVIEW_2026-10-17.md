@@ -85,6 +85,23 @@ still uses the real bounded executor and retains the timeout, rejection, pool
 ceiling, zero-queue and call-count assertions. Production DNS code and deadlines
 are unchanged. The revised DNS class passed locally.
 
+Final source `bdd922c1d3ba454f5bff400033d6b1a4aac7fd0b` then passed both hosted
+workflows:
+
+- [Android Tests](https://github.com/z3roozsh/G2rayXCodeLeafy/actions/runs/38965556125):
+  631 tests across 47 suites, no failures/errors/skips; native payload/restart
+  fixtures; instrumentation compilation; all 32 generated configurations
+  accepted by the verified pinned Xray; release-schema/build-contract checks.
+  Hosted lint reported zero errors and 26 warnings, separately from local lint.
+- [Static Tests](https://github.com/z3roozsh/G2rayXCodeLeafy/actions/runs/38965561204):
+  66 static, 197 server behavior, nine exit-diagnostic groups and 66 Worker
+  checks; benchmark budgets, retained-flow diagnostic/race fixtures, real-core
+  upload expiry and isolated transports, ShellCheck and Worker dry-run passed.
+
+The full local suite was also rerun after the DNS fixture correction: all 631
+tests passed again. The later correction changes tests/documentation only;
+the previously built APKs contain the same final production code.
+
 These fixtures use real Android Builder configuration and simulated descriptor,
 network and service boundaries. They establish source behavior, not actual
 packet routing, OEM process scheduling or native descriptor behavior on a phone.
@@ -109,12 +126,35 @@ No engine restart, UUID rotation, live config rewrite, port-visibility change,
 region change, Worker deployment or GitHub branch deletion was needed. GitHub
 currently has one branch, `main`.
 
+The live checkout was subsequently fast-forwarded to the reviewed Android fix
+and then `bdd922c`; the live engine, configuration and UUID were preserved.
+Clean per-transport authenticated checks returned:
+
+| Transport | Google 204 | Cloudflare 204 | Example 200 | HTTP/2 initial / retained |
+| --- | --- | --- | --- | --- |
+| XHTTP | 427 ms | 415 ms | 219 ms | 118 / 26 ms |
+| WebSocket | 182 ms | 101 ms | 188 ms | 183 / 13 ms |
+
+Each later HTTP/2 request began one minute after the initial request and opened
+zero new connections. Both separate commands completed successfully and
+rechecked PID/configuration/UUID preservation. These are small Codespace-side
+SOCKS/edge samples, not phone latency, throughput, packet-loss or media tests.
+
+An earlier combined SSH diagnostic lost its terminal stream before delivering
+the complete result; it is not counted as an overall pass. A fresh connection
+verified that no owned test processes remained and the production engine was
+unchanged. The clean per-transport reruns used SSH keepalive and saved their
+output under the live host's ignored `data/verification/final-review-2026-10-17/`.
+
 ## Readiness Boundary
 
 ADB did not list a phone during this pass. No installation, signed-release
 upgrade, independent-app country/capture test, Doze/handoff acceptance or
 sustained media/AI-stream acceptance is claimed. The new APK is a tested source
 candidate, not a certification that every device or network is flawless.
+Production release-signing inputs are not configured in this environment, so
+no signed release bundle or release-upgrade acceptance is claimed. The signing
+gate was not bypassed and no disposable release key was created.
 
 The historical retained-connection idle-stall issue is not closed by a small
 healthy server sample. Android Always-on plus Block connections without VPN
