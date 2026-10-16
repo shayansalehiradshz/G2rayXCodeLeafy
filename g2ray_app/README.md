@@ -32,6 +32,20 @@ Start VPN tries that profile directly even when no Worker or GitHub token is
 configured. Automatic server wake requires a configured wake method only when
 the server actually needs recovery.
 
+### Importing multiple Codespaces
+
+The import screen has its own Codespace destination selector. Choosing a target
+there does not switch the active VPN account or move its credentials. Import
+only the selected destination's configs; a mixed selection is rejected without
+partial writes, and the error stays beside the import action.
+
+Canonical `app.github.dev` SNI/Host values must identify the exact Codespace, not
+merely contain its name. The hostname identifies a Codespace, not its GitHub
+owner. Custom fronts with no recognizable GitHub origin require explicit
+binding confirmation. That confirmation cannot override an identified,
+different Codespace. After a successful import, Settings shows the destination's
+profile list; Home keeps its previous active selection until you change it.
+
 ### Blocking traffic outside the VPN
 
 On Home, open **VPN protection settings**, select G2Ray in Android's VPN settings,

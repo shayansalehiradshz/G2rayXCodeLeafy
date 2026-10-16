@@ -26,6 +26,7 @@ import com.g2ray.client.network.WorkerRouteEndpoint
 import com.g2ray.client.network.WorkerUrlNormalizer
 import com.g2ray.client.network.WorkerWakeResponse
 import com.g2ray.client.parser.VlessUriParser
+import com.g2ray.client.parser.CodespaceProfileIdentity
 import com.g2ray.client.vpn.G2RayVpnService
 import com.g2ray.client.vpn.SocketProtector
 import com.g2ray.client.vpn.RoutePerformanceSummary
@@ -1583,6 +1584,7 @@ class G2RayViewModel internal constructor(
     fun importProfilesText(
         accountId: String,
         input: String,
+        allowUnidentifiedOrigins: Boolean = false,
         onResult: (Result<Int>) -> Unit = {}
     ) {
         if (!configurationMutationAllowedNow()) {
@@ -1606,19 +1608,14 @@ class G2RayViewModel internal constructor(
                     ?.codespaceName
                     ?.trim()
                     ?.takeIf { it.isNotEmpty() }
-                val compatibleProfiles = if (expectedCodespace == null) {
-                    successes
-                } else {
-                    successes.filter { profile ->
-                        profile.sni?.contains(expectedCodespace, ignoreCase = true) == true ||
-                            profile.hostHeader?.contains(expectedCodespace, ignoreCase = true) == true
-                    }
+                require(expectedCodespace == null || successes.all {
+                    CodespaceProfileIdentity.matches(it, expectedCodespace) ||
+                        (allowUnidentifiedOrigins && !CodespaceProfileIdentity.hasKnownOrigin(it))
+                }) {
+                    "Some selected configs do not match this Codespace. Choose the matching Codespace or deselect those configs. Nothing was imported."
                 }
-                require(compatibleProfiles.isNotEmpty()) {
-                    "None of the imported configs belongs to the selected Codespace. Choose the matching Codespace before importing."
-                }
-                repository.importProfiles(accountId, compatibleProfiles)
-                compatibleProfiles.size
+                repository.importProfiles(accountId, successes)
+                successes.size
             },
             onResult = onResult
         )

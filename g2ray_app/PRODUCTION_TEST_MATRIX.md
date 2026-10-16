@@ -432,6 +432,34 @@ rendered UI behavior, actual native shutdown, or real device fault tolerance.
 Repeat normal upgrade/relaunch, legacy-config copying, and Stop/reload on the
 target phone without destructive fault injection before release acceptance.
 
+## Multi-Codespace import isolation
+
+1. Save two different Codespaces with distinct wake credentials. Keep the first
+   active, open its import screen, choose the second as the import destination,
+   and import only the second's configs. Settings must show the second's saved
+   list; Home and existing credentials must retain the first's active selection.
+2. Select configs from both Codespaces for a single import. The operation must
+   reject the whole selected batch, show its error beside the import action, and
+   preserve existing profiles and wake keys. Uncheck the nonmatching configs and
+   retry successfully without re-pasting everything.
+3. Try a name that contains the target as a prefix, a lookalike DNS suffix, and
+   conflicting canonical SNI/Host identities. None may pass as the target.
+4. Import a trusted custom-front config with no GitHub origin identity. Verify
+   confirmation names the chosen destination, Cancel writes nothing, and Import
+   retains that explicit binding. Confirmation must not bypass a known wrong
+   Codespace identity. This does not prove custom-front network compatibility.
+5. Change the destination after an import error, double-tap Import, and leave the
+   screen during a delayed storage operation. Do not duplicate imports, change
+   the active VPN account, or let a late callback pop an unrelated screen.
+6. In a test Worker with a second dashboard slot but no `GITHUB_TOKEN_2`, both
+   health and wake must return `missing_github_token_binding` without contacting
+   GitHub using the primary token. Restore the assigned token and verify only
+   that token is used. Do not modify a live Worker's credentials for this test.
+
+Source tests cover association and atomicity. Picker layout, confirmation, and
+navigation still require physical-device acceptance; compilation is not that
+acceptance.
+
 ## Always-on and lockdown
 
 Run this section on Android 8.1 or newer after saving a working profile.

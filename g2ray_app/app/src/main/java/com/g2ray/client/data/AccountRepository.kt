@@ -1,6 +1,7 @@
 package com.g2ray.client.data
 
 import com.g2ray.client.model.*
+import com.g2ray.client.parser.CodespaceProfileIdentity
 import com.g2ray.client.parser.VlessUriParser
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.Types
@@ -690,8 +691,16 @@ class AccountRepository(private val store: SecureKeyValueStore) {
         accountId: String,
         requests: List<ProfileImportRequest>
     ): List<StoredG2RayProfile> {
-        require(_accounts.value.any { it.id == accountId }) { "Account not found" }
+        val account = requireNotNull(_accounts.value.firstOrNull { it.id == accountId }) { "Account not found" }
         if (requests.isEmpty()) return emptyList()
+
+        account.codespaceName?.trim()?.takeIf { it.isNotEmpty() }?.let { expected ->
+            // Validate the whole batch before persisting anything. Custom fronts
+            // have no inferable GitHub identity and remain explicitly bound.
+            require(requests.none { CodespaceProfileIdentity.conflictsWith(it.parsed, expected) }) {
+                "A config belongs to a different Codespace. Choose the matching Codespace before importing."
+            }
+        }
 
         val knownByUri = linkedMapOf<String, StoredG2RayProfile>()
         _profiles.value.asSequence()

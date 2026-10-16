@@ -20,6 +20,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.g2ray.client.model.*
+import com.g2ray.client.parser.CodespaceProfileIdentity
 import com.g2ray.client.parser.VlessUriParser
 import com.g2ray.client.vpn.SpeedFormatter
 
@@ -147,7 +148,13 @@ fun SettingsScreen(
             ProfileImportScreen(
                 viewModel = viewModel,
                 accountId = currentDest.accountId,
-                onNavigateBack = { handleBack() }
+                onNavigateBack = { handleBack() },
+                onImported = { importedAccountId ->
+                    handleBack()
+                    if (backstack.lastOrNull() is SettingsDest.Profiles) {
+                        backstack[backstack.lastIndex] = SettingsDest.Profiles(importedAccountId)
+                    }
+                }
             )
         }
     }
@@ -971,25 +978,51 @@ private fun failureSuffix(count: Int): String {
     return if (count == 1) " (1 fail)" else " ($count fails)"
 }
 
+private data class PendingProfileImport(val accountId: String, val text: String)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ProfileImportScreen(
     viewModel: G2RayViewModel,
     accountId: String,
-    onNavigateBack: () -> Unit
+    onNavigateBack: () -> Unit,
+    onImported: (String) -> Unit
 ) {
+    val accounts by viewModel.accounts.collectAsState()
+    var targetAccountId by remember(accountId) { mutableStateOf(accountId) }
+    val targetAccount = accounts.firstOrNull { it.id == targetAccountId }
+    var showTargetPicker by remember { mutableStateOf(false) }
+    var importing by remember { mutableStateOf(false) }
+    var screenActive by remember { mutableStateOf(true) }
+    DisposableEffect(Unit) { onDispose { screenActive = false } }
+    var pendingImport by remember { mutableStateOf<PendingProfileImport?>(null) }
     var inputText by remember { mutableStateOf("") }
     var parseResults by remember { mutableStateOf<List<Result<G2RayProfile>>>(emptyList()) }
     var selectedToImport by remember { mutableStateOf<Map<Int, Boolean>>(emptyMap()) }
     var statusMessage by remember { mutableStateOf("") }
     var errorLogs by remember { mutableStateOf<List<String>>(emptyList()) }
 
+    fun submitImport(request: PendingProfileImport, allowUnidentifiedOrigins: Boolean = false) {
+        if (importing) return
+        importing = true
+        statusMessage = ""
+        viewModel.importProfilesText(request.accountId, request.text, allowUnidentifiedOrigins) { result ->
+            if (!screenActive) return@importProfilesText
+            importing = false
+            if (result.isSuccess) {
+                onImported(request.accountId)
+            } else {
+                statusMessage = result.exceptionOrNull()?.message ?: "Import failed"
+            }
+        }
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("Import Profiles") },
                 navigationIcon = {
-                    IconButton(onClick = onNavigateBack) {
+                    IconButton(onClick = onNavigateBack, enabled = !importing) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 }
@@ -1004,6 +1037,50 @@ fun ProfileImportScreen(
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
+            Box(Modifier.fillMaxWidth()) {
+                OutlinedButton(
+                    onClick = { showTargetPicker = true },
+                    enabled = accounts.isNotEmpty() && !importing,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(targetAccount?.displayName ?: "Choose Codespace")
+                        targetAccount?.codespaceName?.takeIf { it.isNotBlank() }?.let {
+                            Text(it, style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                    Icon(Icons.Default.ArrowDropDown, contentDescription = "Choose import destination")
+                }
+                DropdownMenu(
+                    expanded = showTargetPicker,
+                    onDismissRequest = { showTargetPicker = false },
+                    modifier = Modifier.heightIn(max = 320.dp).widthIn(max = 320.dp)
+                ) {
+                    accounts.sortedBy { it.priority }.forEach { account ->
+                        DropdownMenuItem(
+                            text = {
+                                Column {
+                                    Text(account.displayName)
+                                    account.codespaceName?.takeIf { it.isNotBlank() }?.let {
+                                        Text(it, style = MaterialTheme.typography.bodySmall)
+                                    }
+                                }
+                            },
+                            onClick = {
+                                targetAccountId = account.id
+                                showTargetPicker = false
+                                statusMessage = ""
+                            }
+                        )
+                    }
+                }
+            }
+            if (targetAccount == null) {
+                Text("Choose a saved Codespace before importing.", color = MaterialTheme.colorScheme.error)
+            }
+            if (statusMessage.isNotEmpty() && parseResults.isEmpty()) {
+                Text(statusMessage, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
+            }
             if (parseResults.isEmpty()) {
                 Text(
                     "Paste a raw VLESS URI, messy text that contains VLESS links, a multi-line list, or a Base64-encoded subscription.",
@@ -1012,18 +1089,18 @@ fun ProfileImportScreen(
 
                 OutlinedTextField(
                     value = inputText,
-                    onValueChange = { inputText = it },
+                    onValueChange = {
+                        inputText = it
+                        statusMessage = ""
+                    },
                     label = { Text("Subscription Text / VLESS URI") },
                     modifier = Modifier.fillMaxWidth(),
                     minLines = 6
                 )
 
-                if (statusMessage.isNotEmpty()) {
-                    Text(statusMessage, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
-                }
-
                 Button(
                     onClick = {
+                        statusMessage = ""
                         val parsed = VlessUriParser.parseAllProfiles(inputText)
                         if (parsed.isEmpty()) {
                             statusMessage = "No supported vless:// profiles found in the pasted text or subscription."
@@ -1050,13 +1127,20 @@ fun ProfileImportScreen(
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clickable { selectedToImport = selectedToImport + (index to !isChecked) }
+                                .clickable(enabled = !importing) {
+                                    selectedToImport = selectedToImport + (index to !isChecked)
+                                    statusMessage = ""
+                                }
                                 .padding(vertical = 4.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Checkbox(
                                 checked = isChecked,
-                                onCheckedChange = { selectedToImport = selectedToImport + (index to it) }
+                                enabled = !importing,
+                                onCheckedChange = {
+                                    selectedToImport = selectedToImport + (index to it)
+                                    statusMessage = ""
+                                }
                             )
                             Spacer(modifier = Modifier.width(8.dp))
                             Column {
@@ -1077,26 +1161,36 @@ fun ProfileImportScreen(
 
                 Spacer(modifier = Modifier.height(16.dp))
 
+                if (statusMessage.isNotEmpty()) {
+                    Text(statusMessage, color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodyMedium)
+                }
                 Button(
                     onClick = {
-                        val selectedUris = parseResults.mapIndexedNotNull { index, res ->
+                        val selectedProfiles = parseResults.mapIndexedNotNull { index, res ->
                             if (res.isSuccess && (selectedToImport[index] == true)) {
-                                res.getOrThrow().rawUri
+                                res.getOrThrow()
                             } else {
                                 null
                             }
                         }
-                        viewModel.importProfilesText(accountId, selectedUris.joinToString("\n")) { result ->
-                            if (result.isSuccess) {
-                                onNavigateBack()
-                            } else {
-                                statusMessage = result.exceptionOrNull()?.message ?: "Import failed"
-                            }
+                        val request = PendingProfileImport(targetAccountId, selectedProfiles.joinToString("\n") { it.rawUri })
+                        val name = targetAccount?.codespaceName?.trim().orEmpty()
+                        if (name.isNotEmpty() &&
+                            selectedProfiles.any { !CodespaceProfileIdentity.hasKnownOrigin(it) } &&
+                            selectedProfiles.none { CodespaceProfileIdentity.conflictsWith(it, name) }) {
+                            pendingImport = request
+                        } else {
+                            submitImport(request)
                         }
                     },
                     modifier = Modifier.fillMaxWidth(),
-                    enabled = selectedToImport.values.any { it }
+                    enabled = targetAccount != null && !importing && selectedToImport.values.any { it }
                 ) {
+                    if (importing) {
+                        CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                        Spacer(Modifier.width(8.dp))
+                    }
                     Text("Import Selected (${selectedToImport.values.count { it }})")
                 }
 
@@ -1107,11 +1201,31 @@ fun ProfileImportScreen(
                         errorLogs = emptyList()
                         statusMessage = ""
                     },
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !importing
                 ) {
                     Text("Start Over")
                 }
             }
         }
+    }
+    pendingImport?.let { request ->
+        val destination = accounts.firstOrNull { it.id == request.accountId }
+        AlertDialog(
+            onDismissRequest = { pendingImport = null },
+            title = { Text("Confirm Codespace binding") },
+            text = {
+                Text("A custom or unrecognized hostname does not identify its Codespace. Import into ${destination?.displayName ?: "the removed Codespace"}?")
+            },
+            confirmButton = {
+                TextButton(enabled = destination != null, onClick = {
+                    pendingImport = null
+                    submitImport(request, allowUnidentifiedOrigins = true)
+                }) { Text("Import") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingImport = null }) { Text("Cancel") }
+            }
+        )
     }
 }

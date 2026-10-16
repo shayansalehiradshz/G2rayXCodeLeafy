@@ -2293,6 +2293,24 @@ async function testDashboardVariablesSupportMultipleCodespacesWithoutKv() {
   console.log("PASS: Worker dashboard variables support multiple Codespaces without KV");
 }
 
+async function testMissingSecondaryTokenNeverBorrowsThePrimaryToken() {
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    throw new Error("A missing slot token must be rejected before contacting GitHub");
+  };
+  const env = baseEnv({ CODESPACE_2_NAME: "standby-space" });
+  for (const path of ["/api/health?route=false", "/api/wake"]) {
+    const response = await worker.fetch(makeRequest(path, "secret", { codespace_id: "standby-space" }), env, {});
+    const body = await responseJson(response);
+    assert.equal(response.status, 500);
+    assert.equal(body.error, "missing_github_token_binding");
+    assert.equal(body.codespace_id, "standby-space");
+    assert.equal(calls, 0);
+  }
+  console.log("PASS: missing secondary Worker token never falls back to primary credentials");
+}
+
 async function testWorkerRegistrySelectsBoundTokenAndReturnsSafeDirectory() {
   const kv = makeKv();
   await kv.put("codespace-registry:v1", JSON.stringify({
@@ -2524,6 +2542,7 @@ try {
   await testWakeSkipsGithubStartWhenCodespaceIsAvailableButRouteSettling();
   await testSimpleDashboardSetupAcceptsRealCodespaceName();
   await testDashboardVariablesSupportMultipleCodespacesWithoutKv();
+  await testMissingSecondaryTokenNeverBorrowsThePrimaryToken();
   await testWorkerRegistrySelectsBoundTokenAndReturnsSafeDirectory();
   await testRegistryAcceptsPrimaryGithubTokenBinding();
 } finally {
