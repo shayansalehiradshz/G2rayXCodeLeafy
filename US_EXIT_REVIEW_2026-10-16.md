@@ -61,6 +61,13 @@ particular, it does not replace the newer import/account validation or infer
 unknown pre-Android-10 system blocking policy. No core pin, MTU, DNS provider,
 Cloudflare feature, live UUID/configuration, or Worker runtime was changed.
 
+Source anchors at the verified `c07031e` revision:
+
+- [Immediate Start dispatch](https://github.com/z3roozsh/G2rayXCodeLeafy/blob/c07031e/g2ray_app/app/src/main/java/com/g2ray/client/ui/G2RayViewModel.kt#L923)
+- [Capture installation/replacement](https://github.com/z3roozsh/G2rayXCodeLeafy/blob/c07031e/g2ray_app/app/src/main/java/com/g2ray/client/vpn/G2RayVpnService.kt#L1321)
+- [Terminal failure and retained cleanup](https://github.com/z3roozsh/G2rayXCodeLeafy/blob/c07031e/g2ray_app/app/src/main/java/com/g2ray/client/vpn/G2RayVpnService.kt#L1350)
+- [Server exit observations](https://github.com/z3roozsh/G2rayXCodeLeafy/blob/c07031e/g2ray.sh#L6885)
+
 ## Keeping a US Exit
 
 1. In GitHub Settings > Codespaces > Region, select a US region before creating
@@ -122,8 +129,26 @@ Local verification completed:
 
 The functional debug APK SHA-256 is
 `97be6a8c038635590ee3f20635bcc8635af3ae7ab107c0781b039a56a900e05e`.
-Hosted Linux behavior/ShellCheck/native checks and real-core validation of all
-32 Android-generated configurations are tracked separately after source push.
+Hosted verification completed for exact source revision
+`c07031e3c5ab79ab2145237352b0a1c0e34211e4`:
+
+- [Android CI 38956123039](https://github.com/z3roozsh/G2rayXCodeLeafy/actions/runs/38956123039)
+  passed both jobs. Downloaded XML confirms 622 tests / 47 suites with zero
+  failures/errors/skips; hosted lint has zero errors and 26 warnings. The extra
+  warning versus local lint is the hosted tool-version advisory. The real,
+  SHA-256-verified pinned Xray accepted all 32 exported Android configurations.
+  HEV payload/restart fixtures and release-schema build-logic tests passed.
+- [Linux CI 38956136377](https://github.com/z3roozsh/G2rayXCodeLeafy/actions/runs/38956136377)
+  passed all three jobs. Its actual logs contain 66 static, 197 server behavior,
+  nine exit-diagnostic and 66 Worker passes. Error-level ShellCheck, mock budgets,
+  standalone diagnostic/race tests, pinned-core/upload-expiry/owned retained-flow
+  fixtures, and Worker dry-run packaging also passed.
+
+The active-account CLI credential lacks the GitHub Codespaces scope: the
+read-only metadata request returned HTTP 403. Live host region and live client
+exit IP are therefore unverified, not presumed US (or Europe). No credential
+scope or active runtime setting was changed to obtain these source/CI results.
+
 Four tests for removed UI-only planning helpers were replaced by actual dispatch,
 duplicate-start, rejection and service recovery/capture behavior tests; backend
 authentication/quota/rate-limit recovery tests remain intact.
