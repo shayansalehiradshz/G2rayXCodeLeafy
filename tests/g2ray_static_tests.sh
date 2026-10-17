@@ -92,6 +92,12 @@ test_background_tasks_uses_owned_pid_file() {
         || fail 'stale supervisor reexec does not use the actual running script path'
     grep_fixed 'if [[ "${1:-}" == "--background-supervisor" ]]; then' "$SCRIPT" \
         || fail 'script has no dedicated background supervisor entrypoint'
+    grep_fixed 'G2RAY_BG_WATCHDOG_TOKEN="$token" nohup bash "$SCRIPT_PATH" --background-watchdog' "$SCRIPT" \
+        || fail 'supervisor has no independent owned watchdog process'
+    grep_fixed 'start_background_tasks "$token"' "$SCRIPT" \
+        || fail 'watchdog restart does not retain the observed generation fence'
+    grep_fixed 'BG_WATCHDOG_PID_FILE=' "$SCRIPT" \
+        || fail 'watchdog ownership is not tracked independently'
     if grep_fixed '_background_tasks </dev/null >/dev/null 2>&1 &' "$SCRIPT"; then
         fail 'background supervisor still runs as an in-process child of postStart/postAttach'
     fi
@@ -982,8 +988,10 @@ test_cloudflare_worker_waker_is_safe_to_publish() {
         || fail 'Worker does not redact GitHub error response details'
     grep_fixed 'idle_timeout_minutes:' "$WORKER_SCRIPT" \
         || fail 'Worker success response does not retain useful redacted status fields'
-    grep_fixed 'probeCodespaceRoutes(name, routePorts, env)' "$WORKER_SCRIPT" \
+    grep_fixed 'await probeCodespaceRoutes(name, routePorts, env, {' "$WORKER_SCRIPT" \
         || fail 'Worker does not wait for the selected Codespace XHTTP route after start'
+    grep_fixed 'await waitForXhttpRoute(name, port, env, initialProbe, options.startedAt)' "$WORKER_SCRIPT" \
+        || fail 'Worker warm precheck does not pass through stable primary-route verification'
     grep_fixed 'probeCodespaceRoutes(codespaceName, context.routePorts, env)' "$WORKER_SCRIPT" \
         || fail 'Worker health check does not use stable selected-Codespace route readiness'
     grep_fixed 'route_ready: routeChecked' "$WORKER_SCRIPT" \

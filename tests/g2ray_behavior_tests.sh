@@ -41,6 +41,7 @@ reset_runtime_paths() {
     DNS_CANDIDATE_CACHE_FILE="$DATA_DIR/dns_candidate_cache.tsv"
     BOOT_STATUS_FILE="$DATA_DIR/boot_status.json"
     XHTTP_PATH_CACHE_FILE="$DATA_DIR/xhttp_path_cache"
+    XHTTP_MODE_CACHE_FILE="$DATA_DIR/xhttp_mode_cache"
     XHTTP_MODE_FILE="$DATA_DIR/xhttp_mode.txt"
     XHTTP_LINK_TUNING_FILE="$DATA_DIR/xhttp_link_tuning.txt"
     ANTI_SLEEP_DISABLED_FILE="$DATA_DIR/anti_sleep_mode_disabled"
@@ -85,6 +86,7 @@ reset_runtime_paths() {
     BG_TASKS_LOCK_DIR="$DATA_DIR/bg_tasks.lock"
     BG_TASKS_TOKEN_FILE="$DATA_DIR/bg_tasks.token"
     BG_TASKS_HEARTBEAT_FILE="$DATA_DIR/bg_tasks.heartbeat"
+    BG_WATCHDOG_PID_FILE="$DATA_DIR/bg_tasks.watchdog.pid"
     ROUTE_SETTLE_PID_FILE="$DATA_DIR/route_settle.pid"
     ROUTE_SETTLE_TOKEN_FILE="$DATA_DIR/route_settle.token"
     ROUTE_SETTLE_LOG_FILE="$LOG_DIR/route-settle.log"
@@ -1021,6 +1023,161 @@ test_background_heartbeat_reports_atomic_write_failure() {
         fi
     )
     pass "background heartbeat reports atomic state write failures"
+}
+
+test_background_restart_cannot_revive_a_stopped_generation() {
+    (
+        reset_runtime_paths
+        start_background_tasks "obsolete-token" || fail "superseded restart did not exit cleanly"
+        [[ ! -e "$BG_TASKS_PID" && ! -e "$BG_TASKS_TOKEN_FILE" && ! -e "$BG_WATCHDOG_PID_FILE" ]] \
+            || fail "queued watchdog restart recreated explicitly stopped state"
+        [[ ! -d "$BG_TASKS_LOCK_DIR" ]] || fail "superseded restart retained its lock"
+    )
+    pass "queued watchdog restart cannot revive an explicitly stopped generation"
+}
+
+test_background_watchdog_recovers_dead_owned_supervisors() {
+    (
+        reset_runtime_paths
+        local fixture="$TMP_ROOT/watchdog-fixture.sh" first_bg first_watchdog token p foreign_pid="" i
+        local -a starters=()
+        export G2RAY_TEST_SUPERVISOR_SOURCE="$SCRIPT"
+        export G2RAY_DATA_DIR="$DATA_DIR" G2RAY_LOG_DIR="$LOG_DIR"
+        cat > "$fixture" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+export G2RAY_SOURCE_ONLY=1
+source "$G2RAY_TEST_SUPERVISOR_SOURCE"
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+sleep() {
+    if [[ "${1:-}" == 30 ]]; then command sleep 0.1; else command sleep "$@"; fi
+}
+_background_tasks() {
+    write_background_supervisor_heartbeat
+    while background_supervisor_token_current; do command sleep 0.1; done
+}
+case "${1:-}" in
+    --background-supervisor) _background_tasks ;;
+    --background-watchdog) _background_watchdog ;;
+    *) exit 2 ;;
+esac
+SH
+        SCRIPT_PATH="$fixture"
+        trap 'stop_background_tasks >/dev/null 2>&1 || true; if [[ -n "$foreign_pid" ]]; then kill "$foreign_pid" 2>/dev/null || true; fi' EXIT
+        start_background_tasks || fail "fixture supervisor/watchdog failed to start"
+        first_bg=$(cat "$BG_TASKS_PID")
+        first_watchdog=$(cat "$BG_WATCHDOG_PID_FILE")
+        token=$(cat "$BG_TASKS_TOKEN_FILE")
+        for ((i=0; i<100; i++)); do
+            bg_tasks_running "$first_bg" && background_watchdog_running && break
+            sleep 0.05
+        done
+        bg_tasks_running "$first_bg" && background_watchdog_running || fail "fixture ownership was not verified"
+        start_background_tasks || fail "idempotent supervisor startup failed"
+        for ((i=0; i<4; i++)); do
+            (start_background_tasks) &
+            starters+=("$!")
+        done
+        for p in "${starters[@]}"; do
+            wait "$p" || fail "concurrent supervisor startup failed"
+        done
+        [[ "$(cat "$BG_TASKS_PID")" == "$first_bg" && "$(cat "$BG_WATCHDOG_PID_FILE")" == "$first_watchdog" ]] \
+            || fail "idempotent startup replaced a healthy process"
+        _atomic_write "$BG_TASKS_HEARTBEAT_FILE" "$first_bg $token 1"
+        sleep 0.4
+        [[ "$(cat "$BG_TASKS_PID")" == "$first_bg" ]] \
+            || fail "old heartbeat caused the watchdog to replace a live owned supervisor"
+        kill -KILL "$first_watchdog"
+        start_background_tasks || fail "healthy supervisor could not regain its missing watchdog"
+        [[ "$(cat "$BG_TASKS_PID")" == "$first_bg" ]] \
+            || fail "rearming the watchdog replaced a healthy supervisor"
+        background_watchdog_running || fail "replacement watchdog ownership was not confirmed"
+
+        kill -KILL "$first_bg"
+        for ((i=0; i<200; i++)); do
+            p=$(cat "$BG_TASKS_PID" 2>/dev/null || true)
+            if [[ "$p" != "$first_bg" ]] && bg_tasks_running "$p" && background_watchdog_running; then break; fi
+            sleep 0.05
+        done
+        [[ "$p" != "$first_bg" ]] && bg_tasks_running "$p" && background_watchdog_running \
+            || fail "watchdog did not restore the supervisor after unexpected death"
+        [[ "$(cat "$BG_TASKS_TOKEN_FILE")" != "$token" ]] || fail "replacement reused the dead generation token"
+        grep -Fq 'action=restart' "$LOG_FILE" || fail "watchdog restart was not observable"
+
+        command sleep 30 &
+        foreign_pid=$!
+        _atomic_write "$BG_TASKS_PID" "$foreign_pid"
+        _atomic_write "$BG_TASKS_HEARTBEAT_FILE" "$foreign_pid $(cat "$BG_TASKS_TOKEN_FILE") $(date +%s)"
+        for ((i=0; i<200; i++)); do
+            p=$(cat "$BG_TASKS_PID" 2>/dev/null || true)
+            if [[ "$p" != "$foreign_pid" ]] && bg_tasks_running "$p" && background_watchdog_running; then break; fi
+            sleep 0.05
+        done
+        [[ "$p" != "$foreign_pid" ]] && bg_tasks_running "$p" && background_watchdog_running \
+            || fail "watchdog did not replace an unowned stale PID record"
+        kill -0 "$foreign_pid" || fail "watchdog signalled a foreign process"
+        token=$(cat "$BG_TASKS_TOKEN_FILE")
+        stop_background_tasks || fail "explicit supervisor shutdown failed"
+        start_background_tasks "$token" || fail "obsolete queued restart failed to exit cleanly"
+        sleep 0.4
+        [[ ! -e "$BG_TASKS_PID" && ! -e "$BG_TASKS_TOKEN_FILE" && ! -e "$BG_WATCHDOG_PID_FILE" ]] \
+            || fail "watchdog resurrected an explicitly stopped supervisor"
+    )
+    pass "watchdog deduplicates healthy starts, restores dead supervisors, and respects ownership and shutdown"
+}
+
+test_background_watchdog_reports_pid_commit_failure() {
+    (
+        reset_runtime_paths
+        local original_atomic rc=0
+        original_atomic=$(declare -f _atomic_write)
+        printf 'watchdog-test-token\n' > "$BG_TASKS_TOKEN_FILE"
+        SCRIPT_PATH="$TMP_ROOT/watchdog-failed-state-fixture.sh"
+        printf '#!/usr/bin/env bash\nexec sleep 30\n' > "$SCRIPT_PATH"
+        _atomic_write() { return 1; }
+        start_background_watchdog >/dev/null 2>&1 || rc=$?
+        eval "$original_atomic"
+        [[ "$rc" -ne 0 && ! -e "$BG_WATCHDOG_PID_FILE" ]] \
+            || fail "watchdog startup masked its PID commit failure"
+    )
+    pass "watchdog startup reports state-commit failure"
+}
+
+test_background_stop_reports_failed_state_cleanup() {
+    (
+        reset_runtime_paths
+        printf 'stop-test-token\n' > "$BG_TASKS_TOKEN_FILE"
+        rm() {
+            [[ "$*" != *"$BG_TASKS_TOKEN_FILE"* ]] || return 1
+            command rm "$@"
+        }
+        if stop_background_tasks; then
+            fail "background shutdown reported success while its intent token could not be removed"
+        fi
+        [[ -f "$BG_TASKS_TOKEN_FILE" && ! -d "$BG_TASKS_LOCK_DIR" ]] \
+            || fail "failed shutdown did not preserve state and release its startup lock"
+    )
+    pass "background shutdown reports failed intent-state cleanup without retaining its lock"
+}
+
+test_background_heartbeat_cannot_override_visible_process_ownership() {
+    (
+        reset_runtime_paths
+        local p
+        command sleep 30 &
+        p=$!
+        trap 'kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true' EXIT
+        printf 'reused-pid-token\n' > "$BG_TASKS_TOKEN_FILE"
+        printf '%s\n' "$p" > "$BG_TASKS_PID"
+        printf '%s reused-pid-token %s\n' "$p" "$(date +%s)" > "$BG_TASKS_HEARTBEAT_FILE"
+        [[ -r "/proc/$p/environ" ]] || fail "fixture process environment is not readable"
+        if background_supervisor_heartbeat_running "$p"; then
+            fail "a fresh persisted heartbeat overruled the foreign process's actual ownership"
+        fi
+        stop_background_tasks || fail "stale supervisor state could not be cleared"
+        kill -0 "$p" || fail "background shutdown signalled a recycled foreign PID"
+    )
+    pass "fresh heartbeat cannot validate or signal a visibly foreign recycled PID"
 }
 
 test_stale_temp_sweep_removes_only_old_owned_artifacts() {
@@ -2833,6 +2990,65 @@ JSON
     [[ "$link" == *"mode=stream-one"* ]] \
         || fail "generated link followed preference/env mode instead of active config: $link"
     pass "generated links use the active XHTTP config mode"
+}
+
+test_xhttp_mode_cache_avoids_reparsing_and_tracks_config_changes() {
+    (
+        reset_runtime_paths
+        local calls="$TMP_ROOT/mode-jq-count" i
+        : > "$calls"
+        write_test_vless_config
+        jq() { printf 'call\n' >> "$calls"; command jq "$@"; }
+        for ((i=0; i<20; i++)); do
+            [[ "$(xhttp_active_inbound_mode)" == packet-up ]] || fail "cached mode changed"
+        done
+        [[ "$(wc -l < "$calls")" -eq 1 ]] || fail "mode cache reparsed unchanged config"
+        command jq '.inbounds[0].streamSettings.xhttpSettings.mode = "stream-one"' "$CONFIG_FILE" > "${CONFIG_FILE}.new"
+        mv "${CONFIG_FILE}.new" "$CONFIG_FILE"
+        [[ "$(xhttp_active_inbound_mode)" == stream-one ]] || fail "mode cache survived a config replacement"
+        [[ "$(wc -l < "$calls")" -eq 2 ]] || fail "replacement config was not parsed exactly once"
+        printf 'invalid json\n' > "$CONFIG_FILE"
+        [[ -z "$(xhttp_active_inbound_mode)" ]] || fail "corrupt config reused the old mode"
+        rm "$CONFIG_FILE"
+        [[ -z "$(xhttp_active_inbound_mode)" ]] || fail "missing config reused the old mode"
+    )
+    pass "XHTTP mode cache parses unchanged config once and invalidates on replacement, corruption, and deletion"
+}
+
+test_xhttp_mode_cache_preserves_preferences_and_write_failure_fallback() {
+    (
+        reset_runtime_paths
+        write_test_vless_config
+        command jq '.inbounds[0].streamSettings.xhttpSettings.mode = "auto"' "$CONFIG_FILE" > "${CONFIG_FILE}.new"
+        mv "${CONFIG_FILE}.new" "$CONFIG_FILE"
+        G2RAY_XHTTP_MODE=packet-up
+        [[ "$(xhttp_config_mode)" == packet-up ]] || fail "auto inbound ignored the link preference"
+        G2RAY_XHTTP_MODE=stream-up
+        [[ "$(xhttp_config_mode)" == stream-up ]] || fail "mode cache froze the link preference"
+        printf '%s\tinvalid-mode\n' "$(file_fingerprint "$CONFIG_FILE")" > "$XHTTP_MODE_CACHE_FILE"
+        [[ "$(xhttp_active_inbound_mode)" == auto ]] || fail "invalid cached mode was trusted"
+        rm "$XHTTP_MODE_CACHE_FILE"
+        _atomic_write() { return 1; }
+        [[ "$(xhttp_active_inbound_mode)" == auto ]] || fail "cache write failure blocked a valid mode lookup"
+    )
+    pass "XHTTP mode cache preserves auto-mode preferences and falls back after invalid cache or failed writes"
+}
+
+test_xhttp_mode_cache_does_not_commit_a_concurrent_config_swap() {
+    (
+        reset_runtime_paths
+        write_test_vless_config
+        jq() {
+            command jq "$@"
+            command jq '.inbounds[0].streamSettings.xhttpSettings.mode = "stream-up"' "$CONFIG_FILE" > "${CONFIG_FILE}.new"
+            mv "${CONFIG_FILE}.new" "$CONFIG_FILE"
+        }
+        [[ "$(xhttp_active_inbound_mode)" == packet-up ]] || fail "original parsed mode was not returned"
+        [[ ! -e "$XHTTP_MODE_CACHE_FILE" ]] || fail "concurrent replacement was cached under the old fingerprint"
+        unset -f jq
+        [[ "$(xhttp_active_inbound_mode)" == stream-up ]] || fail "concurrent replacement mode was lost"
+    )
+    pass "XHTTP mode cache cannot associate a concurrent replacement with the old config hash"
 }
 
 test_xhttp_mode_reports_export_failure() {
@@ -4862,6 +5078,11 @@ test_run_gh_sanitizes_invalid_timeout_env
 test_background_start_reports_lock_failure_without_live_supervisor
 test_background_start_cleans_up_when_pid_state_cannot_be_committed
 test_background_heartbeat_reports_atomic_write_failure
+test_background_restart_cannot_revive_a_stopped_generation
+test_background_watchdog_recovers_dead_owned_supervisors
+test_background_watchdog_reports_pid_commit_failure
+test_background_stop_reports_failed_state_cleanup
+test_background_heartbeat_cannot_override_visible_process_ownership
 test_stale_temp_sweep_removes_only_old_owned_artifacts
 test_logs_reset_when_script_code_changes
 test_cached_route_order_uses_reliability_then_average_latency
@@ -4966,6 +5187,9 @@ test_xhttp_mode_is_persistent_and_link_consistent
 test_xhttp_mode_change_does_not_restart_auto_inbound
 test_xhttp_mode_reports_export_failure
 test_generated_links_use_active_config_mode_over_env_override
+test_xhttp_mode_cache_avoids_reparsing_and_tracks_config_changes
+test_xhttp_mode_cache_preserves_preferences_and_write_failure_fallback
+test_xhttp_mode_cache_does_not_commit_a_concurrent_config_swap
 test_custom_xhttp_extra_json_is_validated
 test_websocket_fallback_is_advanced_opt_in
 test_websocket_fallback_exports_separate_alpn_variants

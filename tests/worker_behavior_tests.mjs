@@ -1332,7 +1332,8 @@ async function testWakeRequiresStableRouteReadiness() {
   const body = await responseJson(response);
   assert.equal(response.status, 200);
   assert.equal(body.route_ready, true);
-  assert.equal(body.route_probe.attempts, 3);
+  assert.equal(body.route_probe.attempts, 4);
+  assert.equal(routeCalls, 4);
   assert.equal(body.route_probe.stable_probes, 2);
   console.log("PASS: Worker rejects transient single route success");
 }
@@ -1694,7 +1695,9 @@ async function testWakeQueuesNotificationsWithWaitUntil() {
   assert.deepEqual(body.notification_errors, []);
   assert.equal(waitUntilPromises.length, 1);
   await Promise.all(waitUntilPromises);
-  assert.equal(routeCalls >= 2, true);
+  assert.equal(routeCalls, 2);
+  assert.equal(body.route_probe.attempts, 2);
+  assert.equal(body.route_probe.fast_path_precheck_attempts, 1);
   assert.equal(notificationCalls, 1);
   console.log("PASS: Worker queues notifications with waitUntil");
 }
@@ -2209,6 +2212,71 @@ async function testWakeSkipsGithubStartWhenCodespaceIsAvailableButRouteSettling(
   console.log("PASS: Worker wake does not restart an available Codespace just because its route is settling");
 }
 
+async function testWarmWakeReusesOnlyMatchingPortProbes() {
+  for (const primaryStatus of [200, 404]) {
+    const calls = [];
+    globalThis.fetch = async (input, init = {}) => {
+      const url = String(input);
+      if (url.includes("api.github.com")) {
+        assert.notEqual(init.method, "POST", "warm Codespace must not receive a start request");
+        return new Response(JSON.stringify({ name: "behavior-space", state: "Available" }), {
+          status: 200, headers: { "content-type": "application/json" }
+        });
+      }
+      calls.push({ url, at: Date.now() });
+      return new Response("", { status: url.includes("-443.") ? primaryStatus : 200 });
+    };
+    const kv = makeKv();
+    await kv.put("codespace-registry:v1", JSON.stringify({
+      default_codespace_id: "main",
+      codespaces: [{ id: "main", name: "behavior-space", token_binding: "GITHUB_TOKEN", route_ports: [443, 8443] }]
+    }));
+    const response = await worker.fetch(makeRequest("/api/wake"), baseEnv({
+      WAKER_KV: kv,
+      ROUTE_READY_STABLE_SLEEP_MS: "25"
+    }), {});
+    const body = await responseJson(response);
+    const primaryCalls = calls.filter((call) => call.url.includes("-443."));
+    const optionalCalls = calls.filter((call) => call.url.includes("-8443."));
+    assert.equal(body.route_ready, primaryStatus === 200);
+    assert.equal(body.route_probe.port, 443);
+    assert.equal(primaryCalls.length, primaryStatus === 200 ? 2 : 1);
+    assert.equal(optionalCalls.length, 1);
+    if (primaryStatus === 200) {
+      assert.equal(body.route_probe.stable_probes, 2);
+      assert.equal(primaryCalls[1].at - primaryCalls[0].at >= 20, true);
+    } else {
+      assert.equal(body.route_probe.http_status, 404);
+      assert.equal(body.preferred_route_port, 8443);
+    }
+  }
+  console.log("PASS: warm wake reuses same-port probes without borrowing optional-port readiness");
+}
+
+async function testWarmWakeCannotConfirmStabilityPastDeadline() {
+  let routeCalls = 0;
+  globalThis.fetch = async (input) => {
+    if (String(input).includes("api.github.com")) {
+      return new Response(JSON.stringify({ name: "behavior-space", state: "Available" }), {
+        status: 200, headers: { "content-type": "application/json" }
+      });
+    }
+    routeCalls += 1;
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    return new Response("", { status: 200 });
+  };
+  const response = await worker.fetch(makeRequest("/api/wake"), baseEnv({
+    ROUTE_WAIT_MS: "5", ROUTE_READY_STABLE_SLEEP_MS: "25"
+  }), {});
+  const body = await responseJson(response);
+  assert.equal(response.status, 202);
+  assert.equal(body.route_ready, false);
+  assert.equal(body.route_probe.stable_probes, 1);
+  assert.equal(body.route_probe.route_failure_reason, "route_stability_not_confirmed");
+  assert.equal(routeCalls, 1);
+  console.log("PASS: warm precheck cannot claim stable readiness after the route deadline");
+}
+
 async function testSimpleDashboardSetupAcceptsRealCodespaceName() {
   const authorizations = [];
   globalThis.fetch = async (input, init = {}) => {
@@ -2540,6 +2608,8 @@ try {
   await testHealthRouteUrlUsesForwardingDomainOverride();
   await testWakeSkipsGithubStartWhenAlreadyAvailableAndRouteReady();
   await testWakeSkipsGithubStartWhenCodespaceIsAvailableButRouteSettling();
+  await testWarmWakeReusesOnlyMatchingPortProbes();
+  await testWarmWakeCannotConfirmStabilityPastDeadline();
   await testSimpleDashboardSetupAcceptsRealCodespaceName();
   await testDashboardVariablesSupportMultipleCodespacesWithoutKv();
   await testMissingSecondaryTokenNeverBorrowsThePrimaryToken();

@@ -62,6 +62,7 @@ BG_TASKS_LOCK_DIR="$DATA_DIR/bg_tasks.lock"
 RUNTIME_LOCK_DIR="$DATA_DIR/runtime.lock"
 BG_TASKS_TOKEN_FILE="$DATA_DIR/bg_tasks.token"
 BG_TASKS_HEARTBEAT_FILE="$DATA_DIR/bg_tasks.heartbeat"
+BG_WATCHDOG_PID_FILE="$DATA_DIR/bg_tasks.watchdog.pid"
 ROUTE_SETTLE_PID_FILE="$DATA_DIR/route_settle.pid"
 ROUTE_SETTLE_TOKEN_FILE="$DATA_DIR/route_settle.token"
 RESUME_GAP_FILE="$DATA_DIR/resume_gap.txt"
@@ -85,6 +86,7 @@ EXPORT_LOCK_FILE="$DATA_DIR/config-exports.lock"
 DNS_CANDIDATE_CACHE_FILE="$DATA_DIR/dns_candidate_cache.tsv"
 BOOT_STATUS_FILE="$DATA_DIR/boot_status.json"
 XHTTP_PATH_CACHE_FILE="$DATA_DIR/xhttp_path_cache"
+XHTTP_MODE_CACHE_FILE="$DATA_DIR/xhttp_mode_cache"
 XHTTP_MODE_FILE="$DATA_DIR/xhttp_mode.txt"
 XHTTP_LINK_TUNING_FILE="$DATA_DIR/xhttp_link_tuning.txt"
 ANTI_SLEEP_DISABLED_FILE="$DATA_DIR/anti_sleep_mode_disabled"
@@ -1448,12 +1450,23 @@ xhttp_config_path() {
 }
 
 xhttp_active_inbound_mode() {
-    local mode=""
-    if [[ -f "$CONFIG_FILE" ]] && command -v jq >/dev/null 2>&1; then
-        mode=$(jq -r '.inbounds[]? | select(.tag=="vless-in") | .streamSettings.xhttpSettings.mode // empty' "$CONFIG_FILE" 2>/dev/null \
-            | awk 'NF {print; exit}')
+    local mode="" cache_key cached_key cached_mode
+    [[ -f "$CONFIG_FILE" ]] && command -v jq >/dev/null 2>&1 || return 0
+    cache_key=$(file_fingerprint "$CONFIG_FILE" 2>/dev/null || true)
+    if [[ -n "$cache_key" && -s "$XHTTP_MODE_CACHE_FILE" ]]; then
+        IFS=$'\t' read -r cached_key cached_mode < "$XHTTP_MODE_CACHE_FILE" || true
+        if [[ "$cached_key" == "$cache_key" ]] && valid_xhttp_mode "${cached_mode:-}"; then
+            printf '%s' "$cached_mode"
+            return 0
+        fi
     fi
+    mode=$(jq -r '.inbounds[]? | select(.tag=="vless-in") | .streamSettings.xhttpSettings.mode // empty' "$CONFIG_FILE" 2>/dev/null \
+        | awk 'NF {print; exit}') || return 0
     if valid_xhttp_mode "$mode"; then
+        # A concurrent config swap must not associate its mode with the old hash.
+        if [[ -n "$cache_key" && "$(file_fingerprint "$CONFIG_FILE" 2>/dev/null || true)" == "$cache_key" ]]; then
+            _atomic_write "$XHTTP_MODE_CACHE_FILE" "${cache_key}"$'\t'"${mode}" || true
+        fi
         printf '%s' "$mode"
     fi
 }
@@ -3661,27 +3674,39 @@ release_bg_tasks_lock() {
 }
 
 start_background_tasks() {
-    local token bg_pid version
+    local expected_token="${1:-}" token bg_pid version watchdog_status=0
     if ! acquire_bg_tasks_lock; then
         bg_pid=$(cat "$BG_TASKS_PID" 2>/dev/null || true)
-        if bg_tasks_running "$bg_pid" || background_supervisor_heartbeat_running "$bg_pid"; then
+        if { bg_tasks_running "$bg_pid" || background_supervisor_heartbeat_running "$bg_pid"; } && background_watchdog_running; then
             return 0
         fi
         log_event WARN "background supervisor_start_failed reason=lock_busy no_live_supervisor"
         return 1
     fi
+    # A queued watchdog restart must not undo an explicit stop or a newer start.
+    if [[ -n "$expected_token" && "$(cat "$BG_TASKS_TOKEN_FILE" 2>/dev/null || true)" != "$expected_token" ]]; then
+        release_bg_tasks_lock
+        return 0
+    fi
     if [[ -f "$BG_TASKS_PID" ]]; then
         local p; p=$(cat "$BG_TASKS_PID" 2>/dev/null || true)
         if bg_tasks_running "$p" || background_supervisor_heartbeat_running "$p"; then
             if background_supervisor_version_matches; then
+                start_background_watchdog || watchdog_status=$?
                 release_bg_tasks_lock
-                return 0
+                return "$watchdog_status"
             fi
             log_event WARN "background supervisor_stale pid=${p}"
-            stop_background_tasks
+            if ! stop_background_tasks --lock-held; then
+                release_bg_tasks_lock
+                return 1
+            fi
         elif legacy_bg_tasks_running "$p"; then
             log_event WARN "background legacy_supervisor_stale pid=${p}"
-            stop_background_tasks
+            if ! stop_background_tasks --lock-held; then
+                release_bg_tasks_lock
+                return 1
+            fi
         fi
     fi
     token=$(uuidgen 2>/dev/null || printf '%s-%s-%s' "$$" "$RANDOM" "$(date +%s)")
@@ -3697,7 +3722,7 @@ start_background_tasks() {
         release_bg_tasks_lock
         return 1
     fi
-    G2RAY_BG_TASK_TOKEN="$token" nohup bash "$SCRIPT_PATH" --background-supervisor </dev/null >/dev/null 2>&1 &
+    G2RAY_SOURCE_ONLY=0 G2RAY_BG_TASK_TOKEN="$token" nohup bash "$SCRIPT_PATH" --background-supervisor </dev/null >/dev/null 2>&1 &
     bg_pid=$!
     if ! _atomic_write "$BG_TASKS_PID" "$bg_pid"; then
         kill "$bg_pid" >/dev/null 2>&1 || true
@@ -3708,8 +3733,71 @@ start_background_tasks() {
         return 1
     fi
     log_event INFO "background supervisor_started pid=${bg_pid}"
+    start_background_watchdog || watchdog_status=$?
     release_bg_tasks_lock
     disown 2>/dev/null || true
+    return "$watchdog_status"
+}
+
+background_watchdog_running() {
+    local expected="${1:-}" p
+    [[ -n "$expected" ]] || expected=$(cat "$BG_TASKS_TOKEN_FILE" 2>/dev/null || true)
+    p=$(cat "$BG_WATCHDOG_PID_FILE" 2>/dev/null || true)
+    [[ -n "$expected" && "$p" =~ ^[0-9]+$ && -r "/proc/$p/environ" ]] || return 1
+    kill -0 "$p" 2>/dev/null || return 1
+    tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -Fx "G2RAY_BG_WATCHDOG_TOKEN=$expected" >/dev/null
+}
+
+start_background_watchdog() {
+    local token p i
+    token=$(cat "$BG_TASKS_TOKEN_FILE" 2>/dev/null || true)
+    [[ -n "$token" ]] || return 1
+    background_watchdog_running "$token" && return 0
+    # Linux /proc provides ownership proof; never signal a PID based only on a file.
+    if [[ ! -r "/proc/${BASHPID:-$$}/environ" ]]; then
+        log_event WARN "background watchdog_unavailable reason=process_ownership_unavailable"
+        return 1
+    fi
+    G2RAY_SOURCE_ONLY=0 G2RAY_BG_WATCHDOG_TOKEN="$token" nohup bash "$SCRIPT_PATH" --background-watchdog </dev/null >/dev/null 2>&1 &
+    p=$!
+    if ! _atomic_write "$BG_WATCHDOG_PID_FILE" "$p"; then
+        kill "$p" >/dev/null 2>&1 || true
+        wait "$p" 2>/dev/null || true
+        log_event ERROR "background watchdog_start_failed reason=pid_write"
+        return 1
+    fi
+    for ((i=0; i<40; i++)); do
+        if background_watchdog_running "$token"; then
+            log_event INFO "background watchdog_started pid=${p}"
+            return 0
+        fi
+        kill -0 "$p" 2>/dev/null || break
+        sleep 0.05
+    done
+    kill "$p" >/dev/null 2>&1 || true
+    wait "$p" 2>/dev/null || true
+    rm -f "$BG_WATCHDOG_PID_FILE" 2>/dev/null || true
+    log_event ERROR "background watchdog_start_failed reason=ownership_not_confirmed"
+    return 1
+}
+
+_background_watchdog() {
+    set +e
+    local token="${G2RAY_BG_WATCHDOG_TOKEN:-}" p
+    [[ -n "$token" ]] || return 1
+    while [[ "$(cat "$BG_TASKS_TOKEN_FILE" 2>/dev/null || true)" == "$token" ]]; do
+        sleep 30
+        [[ "$(cat "$BG_TASKS_TOKEN_FILE" 2>/dev/null || true)" == "$token" ]] || return 0
+        p=$(cat "$BG_TASKS_PID" 2>/dev/null || true)
+        # Slow bounded work can delay heartbeats. Only a dead/unowned process
+        # justifies replacement here; this watcher never restarts Xray itself.
+        if bg_tasks_running "$p" || background_supervisor_heartbeat_running "$p"; then
+            continue
+        fi
+        log_event WARN "background supervisor_missing pid=${p:-none} action=restart"
+        start_background_tasks "$token" \
+            || log_event ERROR "background supervisor_restart_failed"
+    done
 }
 
 background_supervisor_version() {
@@ -3746,14 +3834,27 @@ supervisor_reexec_if_stale() {
 }
 
 stop_background_tasks() {
-    local p
+    local p watchdog_pid="" lock_held=false status=0
+    [[ "${1:-}" == "--lock-held" ]] && lock_held=true
+    if [[ "$lock_held" != true ]] && ! acquire_bg_tasks_lock; then
+        return 1
+    fi
+    if background_watchdog_running; then
+        watchdog_pid=$(cat "$BG_WATCHDOG_PID_FILE" 2>/dev/null || true)
+        kill "$watchdog_pid" >/dev/null 2>&1 || true
+    fi
     p=$(cat "$BG_TASKS_PID" 2>/dev/null || true)
     if bg_tasks_running "$p" || background_supervisor_heartbeat_running "$p" || legacy_bg_tasks_running "$p"; then
         kill "$p" >/dev/null 2>&1 || true
         sleep 1
         (bg_tasks_running "$p" || background_supervisor_heartbeat_running "$p" || legacy_bg_tasks_running "$p") && kill -9 "$p" >/dev/null 2>&1 || true
     fi
-    rm -f "$BG_TASKS_PID" "$BG_TASKS_VERSION_FILE" "$BG_TASKS_TOKEN_FILE" 2>/dev/null || true
+    if ! rm -f "$BG_TASKS_PID" "$BG_TASKS_VERSION_FILE" "$BG_TASKS_TOKEN_FILE" "$BG_WATCHDOG_PID_FILE" 2>/dev/null; then
+        log_event ERROR "background supervisor_stop_failed reason=state_cleanup"
+        status=1
+    fi
+    [[ "$lock_held" == true ]] || release_bg_tasks_lock
+    return "$status"
 }
 
 legacy_bg_tasks_running() {
@@ -3772,7 +3873,7 @@ bg_tasks_running() {
     kill -0 "$p" 2>/dev/null || return 1
     expected=$(cat "$BG_TASKS_TOKEN_FILE" 2>/dev/null || true)
     if [[ -n "$expected" && -r "/proc/$p/environ" ]]; then
-        tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -Fxq "G2RAY_BG_TASK_TOKEN=$expected"
+        tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -Fx "G2RAY_BG_TASK_TOKEN=$expected" >/dev/null
         return
     fi
     return 1
@@ -3818,6 +3919,10 @@ background_supervisor_heartbeat_matches() {
     kill -0 "$p" 2>/dev/null || return 1
     expected=$(cat "$BG_TASKS_TOKEN_FILE" 2>/dev/null || true)
     [[ -n "$expected" ]] || return 1
+    # A fresh file cannot overrule visible evidence that this PID was reused.
+    if [[ -r "/proc/$p/environ" ]] && ! bg_tasks_running "$p"; then
+        return 1
+    fi
     raw=$(cat "$BG_TASKS_HEARTBEAT_FILE" 2>/dev/null || true)
     read -r hb_pid hb_token hb_ts _ <<< "$raw"
     [[ "$hb_pid" == "$p" && "$hb_token" == "$expected" && "$hb_ts" =~ ^[0-9]+$ ]] || return 1
@@ -3831,7 +3936,7 @@ background_supervisor_heartbeat_running() {
 }
 
 background_supervisor_status() {
-    local p running="false" token_state="missing" version_state="missing" heartbeat_age="unknown" hb now expected current
+    local p running="false" token_state="missing" version_state="missing" heartbeat_age="unknown" watchdog="missing" hb now expected current
     p=$(cat "$BG_TASKS_PID" 2>/dev/null || true)
     if bg_tasks_running "$p"; then
         running="true"
@@ -3851,7 +3956,8 @@ background_supervisor_status() {
         now=$(date +%s)
         heartbeat_age="$((now - hb))s"
     fi
-    printf 'pid=%s running=%s version=%s token=%s heartbeat_age=%s\n' "${p:-none}" "$running" "$version_state" "$token_state" "$heartbeat_age"
+    background_watchdog_running && watchdog="running"
+    printf 'pid=%s running=%s version=%s token=%s heartbeat_age=%s watchdog=%s\n' "${p:-none}" "$running" "$version_state" "$token_state" "$heartbeat_age" "$watchdog"
 }
 
 format_duration_compact() {
@@ -6757,6 +6863,7 @@ bench_rebind_runtime_paths() {
     RUNTIME_LOCK_DIR="$DATA_DIR/runtime.lock"
     BG_TASKS_TOKEN_FILE="$DATA_DIR/bg_tasks.token"
     BG_TASKS_HEARTBEAT_FILE="$DATA_DIR/bg_tasks.heartbeat"
+    BG_WATCHDOG_PID_FILE="$DATA_DIR/bg_tasks.watchdog.pid"
     ROUTE_SETTLE_PID_FILE="$DATA_DIR/route_settle.pid"
     ROUTE_SETTLE_TOKEN_FILE="$DATA_DIR/route_settle.token"
     ROUTE_SETTLE_LOG_FILE="$LOG_DIR/route-settle.log"
@@ -6776,6 +6883,7 @@ bench_rebind_runtime_paths() {
     DNS_CANDIDATE_CACHE_FILE="$DATA_DIR/dns_candidate_cache.tsv"
     BOOT_STATUS_FILE="$DATA_DIR/boot_status.json"
     XHTTP_PATH_CACHE_FILE="$DATA_DIR/xhttp_path_cache"
+    XHTTP_MODE_CACHE_FILE="$DATA_DIR/xhttp_mode_cache"
     XHTTP_MODE_FILE="$DATA_DIR/xhttp_mode.txt"
     XHTTP_LINK_TUNING_FILE="$DATA_DIR/xhttp_link_tuning.txt"
     LOW_OVERHEAD_FILE="$DATA_DIR/low_overhead_mode"
@@ -6952,6 +7060,11 @@ show_server_exit_location() {
 
 if [[ "${G2RAY_SOURCE_ONLY:-}" == "1" ]]; then
     return 0 2>/dev/null || exit 0
+fi
+
+if [[ "${1:-}" == "--background-watchdog" ]]; then
+    _background_watchdog
+    exit $?
 fi
 
 if [[ "${1:-}" == "--exit-location" ]]; then

@@ -349,6 +349,8 @@ bash ./scripts/post-start.sh
 
 `--silent-start` starts or replaces the background supervisor with the pulled script version, verifies runtime readiness, records `data/boot_status.json`, and refreshes exports without stopping a healthy Xray process. `scripts/post-start.sh` is what the devcontainer runs automatically; it wraps `--silent-start` and writes `logs/post-start.log` so a start from the Worker is easier to diagnose later.
 
+The supervisor has an independent, token-owned watchdog. While the Codespace is running, it checks every 30 seconds and replaces a dead supervisor without directly restarting Xray. Slow heartbeats alone do not trigger replacement. Diagnostics shows `watchdog=running`; starting the panel or headless startup also restores a missing watchdog. This cannot recover a stopped host or guarantee survival if both background processes fail.
+
 Persistent logs are written to `logs/g2ray.log`, `logs/g2ray-events.jsonl`, and `logs/g2ray-diagnostics.log`. Diagnostics records a readable snapshot there, so you can send those logs later and still preserve route waits, repairs, probe results, supervisor state, last-good route, route-settling history, and export refreshes from previous hours.
 
 Diagnostics also records the installed Xray binary version versus the Dockerfile's default image pin, the policy values in `config.json`, and observed TCP kernel settings. A Git pull updates source files, not the existing container image or Xray binary. If those versions differ, plan a container rebuild during a break before comparing behavior against the pinned core; rebuilding interrupts the running tunnel. Diagnostics never changes kernel tuning or upgrades the binary.

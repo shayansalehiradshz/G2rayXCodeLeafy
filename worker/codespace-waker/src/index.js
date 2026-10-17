@@ -172,17 +172,20 @@ function wakeFastPathEnabled(env = {}) {
 async function alreadyWarmCodespaceData(name, token, env, routePorts = [codespacePort(env)]) {
   const status = await getCodespaceStatus(name, token, env);
   if (!isCodespaceAvailable(status)) return { status, data: null };
+  const routeStartedAt = Date.now();
   const firstRouteData = await probeCodespaceRoutes(name, routePorts, env, { stable: false });
 
   // A GitHub start call cannot repair a Codespace that is already Available.
   // Keep that distinction honest: report the existing edge state and let the
   // caller poll rather than issuing a needless /start request.
-  const routeData = firstRouteData.route_probes.some((probe) => probe.usable)
-    ? await probeCodespaceRoutes(name, routePorts, env)
+  const routeData = firstRouteData.route_probes[0].usable
+    ? await probeCodespaceRoutes(name, routePorts, env, {
+      initialProbes: firstRouteData.route_probes,
+      startedAt: routeStartedAt
+    })
     : firstRouteData;
-  // Keep the fast-path check visible without folding a probe from one port
-  // into another port's attempt count. `attempts` belongs to the reported
-  // route probe; the precheck is a separate diagnostic field.
+  // The primary precheck is attempt one, not a third redundant request.
+  // An optional port can never seed the primary route's stability check.
   routeData.route_probe.fast_path_precheck_attempts = 1;
   const routeReady = routeData.route_ready;
 
@@ -1724,11 +1727,13 @@ function configuredCooldownSeconds(env, name, fallback, max) {
 async function probeCodespaceRoutes(name, routePorts, env, options = {}) {
   const ports = normalizeRoutePorts(routePorts);
   const probes = await Promise.all(ports.map(async (port, index) => {
+    const initialProbe = options.initialProbes?.find((probe) =>
+      probe.port === port && probe.url === routeUrl(name, port, env));
     // Only the primary XHTTP route gates readiness. An optional WS endpoint
     // cannot pass OPTIONS, so do not spend a full settling loop on it.
     const probe = options.stable === false || index > 0
-      ? await probeXhttpRoute(name, port, 1, Date.now(), env)
-      : await waitForXhttpRoute(name, port, env);
+      ? initialProbe || await probeXhttpRoute(name, port, 1, Date.now(), env)
+      : await waitForXhttpRoute(name, port, env, initialProbe, options.startedAt);
     return { ...probe, port };
   }));
   const primary = probes.find((probe) => probe.port === ports[0]) || probes[0];
@@ -1748,8 +1753,7 @@ async function probeCodespaceRoutes(name, routePorts, env, options = {}) {
   };
 }
 
-async function waitForXhttpRoute(name, port, env) {
-  const startedAt = Date.now();
+async function waitForXhttpRoute(name, port, env, initialProbe = null, startedAt = Date.now()) {
   const routeWaitMs = configuredMs(env, "ROUTE_WAIT_MS", ROUTE_WAIT_MS, 1, 300000);
   const pollIntervalMs = configuredMs(env, "ROUTE_POLL_INTERVAL_MS", ROUTE_POLL_INTERVAL_MS, 1, 60000);
   const stableSleepMs = configuredMs(env, "ROUTE_READY_STABLE_SLEEP_MS", ROUTE_READY_STABLE_SLEEP_MS, 0, 10000);
@@ -1769,7 +1773,10 @@ async function waitForXhttpRoute(name, port, env) {
 
   while (attempts === 0 || Date.now() < deadline) {
     attempts += 1;
-    last = await probeXhttpRoute(name, port, attempts, startedAt, env);
+    last = initialProbe
+      ? { ...initialProbe, attempts, waited_ms: Date.now() - startedAt }
+      : await probeXhttpRoute(name, port, attempts, startedAt, env);
+    initialProbe = null;
     if (last.usable) {
       stableProbes += 1;
       last.stable_probes = stableProbes;

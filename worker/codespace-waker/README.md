@@ -8,7 +8,7 @@ It does not expose VLESS configs, keep the Codespace alive forever, or bypass qu
 
 The browser page is a small mobile-friendly health dashboard. It has a large **Start Codespace** button, a **Check Health** action, route latency/status cards, copyable status text, a stop-polling button, a route history summary, a latency trend, and auto-refresh while the route is still settling.
 
-After GitHub accepts the start request, the Worker waits for the Codespace state to become available, then probes the public `app.github.dev` XHTTP route. If the response says `route_ready: true`, the external route answered a usable XHTTP probe and the VLESS configs should usually be usable. If it says `route_ready: false`, follow the returned `next_action`; HTTP `404` usually means GitHub's port route is still settling, while HTTP `0` usually means DNS or the app route did not answer.
+After GitHub accepts a cold start, the Worker returns progress immediately; the app/dashboard polls Health until the Codespace is available and its public `app.github.dev` XHTTP route passes two consecutive probes. If the response says `route_ready: true`, the external route answered usable XHTTP probes, not a full VLESS traffic test. If it says `route_ready: false`, follow the returned `next_action`; HTTP `404` usually means GitHub's port route is still settling, while HTTP `0` usually means DNS or the app route did not answer.
 
 When the start request is accepted but the route is still settling, the API returns HTTP `202` with `ok: true`, `route_ready: false`, `retry_after_seconds`, `poll_after_seconds`, and a `Retry-After` header. The browser page keeps polling health until the route becomes ready or you stop checking.
 
@@ -84,6 +84,8 @@ Optional: add `CODESPACE_PORT` as a **Plaintext** variable only if you changed t
 Optional: add `CODESPACE_FORWARDING_DOMAIN` as a **Plaintext** variable only if GitHub changes the Codespaces forwarding domain from `app.github.dev`. The Worker also accepts `CODESPACE_PORT_FORWARDING_DOMAIN` and `GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN`.
 
 Optional: set `WAKE_FAST_PATH=0` as a **Plaintext** variable to disable the default warm-route fast path. With the default `WAKE_FAST_PATH=1`, `/wake` first does a cheap route probe; if the route is already stable and GitHub says the Codespace is Available, it returns success without calling GitHub's `/start` API again.
+
+Warm wake reuses the primary port's first successful probe as attempt one, waits the stability interval, then confirms it with a second probe. Optional ports are checked once and cannot establish primary-route readiness. A warm primary 404 returns polling guidance immediately instead of waiting merely because an optional port answered 200.
 
 After GitHub accepts a cold start, the Worker returns HTTP 202 immediately and the app/dashboard polls Health until the Codespace and forwarded route are ready. An individual Health route check is bounded to about eight seconds. This avoids false mobile timeouts without pretending GitHub's forwarding route settles faster. You can override `ROUTE_WAIT_MS`, `ROUTE_POLL_INTERVAL_MS`, `ROUTE_FETCH_TIMEOUT_MS`, and `ROUTE_POLL_AFTER_SECONDS` as Plaintext variables if a measured deployment needs different route-check timing.
 
