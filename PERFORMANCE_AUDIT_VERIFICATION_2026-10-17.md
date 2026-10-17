@@ -83,7 +83,7 @@ are unchanged. A source push or packaging dry-run is not Cloudflare deployment.
 ## Validation
 
 - Isolated Linux copy on the authorized Codespace: 205 behavior checks, 66
-  static checks, 68 Worker checks, nine exit-location groups, ShellCheck error
+  static checks, 68 initial Worker checks, nine exit-location groups, ShellCheck error
   level, and six deterministic mock benchmark budgets passed.
 - The process fixture uses real owned processes and deliberately kills only
   isolated test supervisors/watchdogs. Its poll sleep is shortened for tests;
@@ -94,6 +94,11 @@ are unchanged. A source push or packaging dry-run is not Cloudflare deployment.
   concurrent config swap.
 - Worker regressions require exactly two primary warm requests, stable spacing,
   reset after an intervening 404, deadline rejection, and optional-port isolation.
+- Final Worker stress regression: an optional probe delayed 300 ms could
+  consume a 150 ms primary confirmation budget in the first candidate. The
+  regression failed before the follow-up fix. Primary confirmation now runs
+  concurrently with optional diagnostics on its own deadline. All 69 Worker
+  checks, 66 static checks and the packaging dry-run passed after that fix.
 - Local Worker packaging dry-run passed without deployment.
 - Before/after Linux reproduction: the deployed baseline accepted a current
   heartbeat for an unrelated live PID; the candidate rejected it. Both used
@@ -108,7 +113,8 @@ are unchanged. A source push or packaging dry-run is not Cloudflare deployment.
 
 Two local server runs were invalidated by concurrent source/test edits: one
 file-equality check and one interrupted command name. They are retained in the
-ignored verification logs, not counted as passes; a frozen rerun was started.
+ignored verification logs, not counted as passes. The frozen Windows rerun
+then passed all 205 server behavior checks.
 An initial archive-only Linux static run lacked Git metadata; the rerun used an
 isolated Git index with the actual tracked executable mode. No production test
 was weakened to accommodate these setup issues.
@@ -120,6 +126,26 @@ Private raw logs are under ignored `data/verification/performance-audit-20261017
 The prior device observations cited above remain in
 `g2ray_app/CLAIM_REVIEW_2026-10-17.md`; they are not new device results from this
 server/Worker patch. ADB currently lists no phone.
+
+## Rollout evidence
+
+The first source rollout, `7bfbb02`, passed both hosted workflows:
+[server/pinned-core CI](https://github.com/z3roozsh/G2rayXCodeLeafy/actions/runs/38995329251)
+and [Android/native CI](https://github.com/z3roozsh/G2rayXCodeLeafy/actions/runs/38995336598).
+These runs precede the final optional-probe timing regression/fix described
+above; final-source hosted results are linked in the handoff response.
+
+The authorized active Codespace was fast-forwarded without changing its
+config, UUID, Xray PID or process start time. Only an idle owned supervisor was
+terminated for the live fault check. The watchdog restored it in 22 seconds;
+the replacement supervisor and watchdog both passed ownership checks. Local
+XHTTP remained HTTP 200 at 0 ms and edge XHTTP HTTP 200 at 153 ms. Those are
+Codespace-side OPTIONS samples, not phone performance measurements.
+
+No live Xray restart, UUID rotation, Android settings change, phone install,
+Cloudflare deployment, or user-data reset was performed in this review. The
+final Worker code still needs the normal manual dashboard deployment; its
+environment variables and shared wake key are unchanged.
 
 ## Remaining acceptance
 

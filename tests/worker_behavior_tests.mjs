@@ -2277,6 +2277,41 @@ async function testWarmWakeCannotConfirmStabilityPastDeadline() {
   console.log("PASS: warm precheck cannot claim stable readiness after the route deadline");
 }
 
+async function testWarmOptionalProbeCannotConsumePrimaryStabilityDeadline() {
+  let primaryCalls = 0;
+  let optionalCalls = 0;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("api.github.com")) {
+      return new Response(JSON.stringify({ name: "behavior-space", state: "Available" }), {
+        status: 200, headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("-8443.")) {
+      optionalCalls += 1;
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    } else {
+      primaryCalls += 1;
+    }
+    return new Response("", { status: 200 });
+  };
+  const kv = makeKv();
+  await kv.put("codespace-registry:v1", JSON.stringify({
+    default_codespace_id: "main",
+    codespaces: [{ id: "main", name: "behavior-space", token_binding: "GITHUB_TOKEN", route_ports: [443, 8443] }]
+  }));
+  const response = await worker.fetch(makeRequest("/api/wake"), baseEnv({
+    WAKER_KV: kv, ROUTE_WAIT_MS: "150", ROUTE_READY_STABLE_SLEEP_MS: "1", ROUTE_FETCH_TIMEOUT_MS: "1000"
+  }), {});
+  const body = await responseJson(response);
+  assert.equal(body.route_ready, true, "optional diagnostic delay consumed the primary route's confirmation deadline");
+  assert.equal(body.route_probe.port, 443);
+  assert.equal(body.route_probe.stable_probes, 2);
+  assert.equal(primaryCalls, 2);
+  assert.equal(optionalCalls, 1);
+  console.log("PASS: slow optional warm diagnostics cannot consume the primary stability deadline");
+}
+
 async function testSimpleDashboardSetupAcceptsRealCodespaceName() {
   const authorizations = [];
   globalThis.fetch = async (input, init = {}) => {
@@ -2610,6 +2645,7 @@ try {
   await testWakeSkipsGithubStartWhenCodespaceIsAvailableButRouteSettling();
   await testWarmWakeReusesOnlyMatchingPortProbes();
   await testWarmWakeCannotConfirmStabilityPastDeadline();
+  await testWarmOptionalProbeCannotConsumePrimaryStabilityDeadline();
   await testSimpleDashboardSetupAcceptsRealCodespaceName();
   await testDashboardVariablesSupportMultipleCodespacesWithoutKv();
   await testMissingSecondaryTokenNeverBorrowsThePrimaryToken();

@@ -172,18 +172,10 @@ function wakeFastPathEnabled(env = {}) {
 async function alreadyWarmCodespaceData(name, token, env, routePorts = [codespacePort(env)]) {
   const status = await getCodespaceStatus(name, token, env);
   if (!isCodespaceAvailable(status)) return { status, data: null };
-  const routeStartedAt = Date.now();
-  const firstRouteData = await probeCodespaceRoutes(name, routePorts, env, { stable: false });
-
   // A GitHub start call cannot repair a Codespace that is already Available.
   // Keep that distinction honest: report the existing edge state and let the
   // caller poll rather than issuing a needless /start request.
-  const routeData = firstRouteData.route_probes[0].usable
-    ? await probeCodespaceRoutes(name, routePorts, env, {
-      initialProbes: firstRouteData.route_probes,
-      startedAt: routeStartedAt
-    })
-    : firstRouteData;
+  const routeData = await probeCodespaceRoutes(name, routePorts, env, { warm: true });
   // The primary precheck is attempt one, not a third redundant request.
   // An optional port can never seed the primary route's stability check.
   routeData.route_probe.fast_path_precheck_attempts = 1;
@@ -1727,13 +1719,21 @@ function configuredCooldownSeconds(env, name, fallback, max) {
 async function probeCodespaceRoutes(name, routePorts, env, options = {}) {
   const ports = normalizeRoutePorts(routePorts);
   const probes = await Promise.all(ports.map(async (port, index) => {
-    const initialProbe = options.initialProbes?.find((probe) =>
-      probe.port === port && probe.url === routeUrl(name, port, env));
+    const startedAt = Date.now();
     // Only the primary XHTTP route gates readiness. An optional WS endpoint
     // cannot pass OPTIONS, so do not spend a full settling loop on it.
-    const probe = options.stable === false || index > 0
-      ? initialProbe || await probeXhttpRoute(name, port, 1, Date.now(), env)
-      : await waitForXhttpRoute(name, port, env, initialProbe, options.startedAt);
+    let probe;
+    if (index > 0) {
+      probe = await probeXhttpRoute(name, port, 1, startedAt, env);
+    } else if (options.warm === true) {
+      const firstProbe = await probeXhttpRoute(name, port, 1, startedAt, env);
+      // Confirm concurrently with optional diagnostics, on this port's budget.
+      probe = firstProbe.usable
+        ? await waitForXhttpRoute(name, port, env, firstProbe, startedAt)
+        : firstProbe;
+    } else {
+      probe = await waitForXhttpRoute(name, port, env);
+    }
     return { ...probe, port };
   }));
   const primary = probes.find((probe) => probe.port === ports[0]) || probes[0];

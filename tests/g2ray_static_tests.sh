@@ -990,7 +990,7 @@ test_cloudflare_worker_waker_is_safe_to_publish() {
         || fail 'Worker success response does not retain useful redacted status fields'
     grep_fixed 'await probeCodespaceRoutes(name, routePorts, env, {' "$WORKER_SCRIPT" \
         || fail 'Worker does not wait for the selected Codespace XHTTP route after start'
-    grep_fixed 'await waitForXhttpRoute(name, port, env, initialProbe, options.startedAt)' "$WORKER_SCRIPT" \
+    grep_fixed 'await waitForXhttpRoute(name, port, env, firstProbe, startedAt)' "$WORKER_SCRIPT" \
         || fail 'Worker warm precheck does not pass through stable primary-route verification'
     grep_fixed 'probeCodespaceRoutes(codespaceName, context.routePorts, env)' "$WORKER_SCRIPT" \
         || fail 'Worker health check does not use stable selected-Codespace route readiness'
