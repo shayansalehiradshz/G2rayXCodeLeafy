@@ -49,15 +49,19 @@ import java.net.Proxy
 import java.net.Socket
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import okhttp3.ConnectionPool
 import okhttp3.Call
@@ -286,12 +290,57 @@ class LiveVpnDeviceTest {
     }
 
     @Test
+    fun youtubeLimitsKeepBudgetDefaultsAndRequireLongerPlaybackForExtendedRuns() {
+        assertEquals(VideoTestLimits(60_000L, 12L * 1024 * 1024, 15_000L), videoTestLimits(Bundle()))
+        val extended = Bundle().apply {
+            putString("videoDurationSeconds", "180")
+            putString("videoBudgetMiB", "256")
+        }
+        assertEquals(VideoTestLimits(180_000L, 256L * 1024 * 1024, 150_000L), videoTestLimits(extended))
+        for ((key, values) in mapOf(
+            "videoDurationSeconds" to listOf("", "invalid", "59", "601", "9223372036854775807"),
+            "videoBudgetMiB" to listOf("", "invalid", "11", "2049", "9223372036854775807")
+        )) {
+            values.forEach { value ->
+                assertThrows(IllegalArgumentException::class.java) {
+                    videoTestLimits(Bundle().apply { putString(key, value) })
+                }
+            }
+        }
+        assertEquals(2_048L * 1024 * 1024,
+            videoTestLimits(Bundle().apply { putString("videoBudgetMiB", "2048") }).mobileBudgetBytes)
+    }
+
+    @Test
     fun selectedProfileRecoversAfterRepeatedCoreFailures() {
         assumeTrue(
             "Core failure injection requires -e liveCoreRecovery true",
             InstrumentationRegistry.getArguments().getString("liveCoreRecovery") == "true"
         )
         runLiveTest(coreFailureCycles = 2)
+    }
+
+    @Test
+    fun selectedProfileRecoversAfterMobileDataOutage() {
+        assumeTrue("Physical network changes require -e liveNetworkRecovery true",
+            InstrumentationRegistry.getArguments().getString("liveNetworkRecovery") == "true")
+        assumeTrue("The on-device restoration script requires Android 12 or newer",
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+        runLiveTest(acceptanceCheck = ::verifyMobileDataOutage)
+    }
+
+    @Test
+    fun selectedProfileKeepsResponsiveDuringConcurrentTransfers() {
+        assumeTrue("Loaded transfers require -e liveLoadedTransfers true",
+            InstrumentationRegistry.getArguments().getString("liveLoadedTransfers") == "true")
+        runLiveTest(acceptanceCheck = { _, client -> verifyLoadedTransfers(client) })
+    }
+
+    @Test
+    fun deviceShellScriptExecutesMultipleCommandsThroughStdin() {
+        assumeTrue("Bidirectional shell commands require Android 12 or newer",
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+        assertEquals("first\nsecond\n", executeOnDeviceScript("printf 'first\\n'\nprintf 'second\\n'"))
     }
 
     private fun engineFromTestArgument(value: String?): VpnEngineMode {
@@ -307,7 +356,8 @@ class LiveVpnDeviceTest {
         controlPlaneCheck: Boolean = false,
         startupOnly: Boolean = false,
         transferOnly: Boolean = false,
-        videoOnly: Boolean = false
+        videoOnly: Boolean = false,
+        acceptanceCheck: (suspend (Context, OkHttpClient) -> Unit)? = null
     ) = runBlocking {
         val args = InstrumentationRegistry.getArguments()
         assumeTrue("Live network tests require -e liveVpn true", args.getString("liveVpn") == "true")
@@ -448,6 +498,10 @@ class LiveVpnDeviceTest {
             }
             if (controlPlaneCheck) {
                 verifyActiveControlPlane(context)
+                return@runBlocking
+            }
+            if (acceptanceCheck != null) {
+                acceptanceCheck(context, client)
                 return@runBlocking
             }
             if (coreFailureCycles > 0) {
@@ -610,6 +664,108 @@ class LiveVpnDeviceTest {
             }
         }
 
+    @Suppress("DEPRECATION")
+    private suspend fun verifyMobileDataOutage(context: Context, client: OkHttpClient) =
+        kotlinx.coroutines.coroutineScope {
+            val connectivity = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            fun physicalInternet() = connectivity.allNetworks.mapNotNull { network ->
+                connectivity.getNetworkCapabilities(network)?.takeIf {
+                    it.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                        it.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                }
+            }
+            val physical = physicalInternet()
+            assertTrue("This test requires LTE only, with no second Internet network",
+                physical.isNotEmpty() && physical.all { it.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) })
+            val automation = InstrumentationRegistry.getInstrumentation().uiAutomation
+            fun shell(command: String): String = ParcelFileDescriptor.AutoCloseInputStream(
+                automation.executeShellCommand(command)
+            ).bufferedReader().use { it.readText() }
+            assertEquals("Refuse to change a radio that was not originally enabled",
+                "1", shell("settings get global mobile_data").trim())
+            val startedAt = SystemClock.elapsedRealtime()
+            // Keep restoration in the on-device script and the non-cancellable cleanup.
+            val radioCycle = async(Dispatchers.IO) {
+                executeOnDeviceScript("svc data disable\nsleep 8\nsvc data enable")
+            }
+            try {
+                withTimeout(20_000L) {
+                    while (physicalInternet().isNotEmpty()) delay(100L)
+                }
+                report("event=physical_network_lost elapsed_ms=${SystemClock.elapsedRealtime() - startedAt}")
+                val unverified = withTimeout(8_000L) {
+                    VpnStateRepository.state.first { !it.tunnelVerified }
+                }
+                assertTrue("Network loss discarded the user's connected intent",
+                    unverified.tunnelState !in setOf(TunnelState.Disconnected, TunnelState.Disabled, TunnelState.Error))
+                radioCycle.await()
+                withTimeout(30_000L) {
+                    while (physicalInternet().isEmpty()) delay(100L)
+                }
+                val restoredAt = SystemClock.elapsedRealtime()
+                val recovered = withTimeout(90_000L) {
+                    VpnStateRepository.state.first {
+                        (it.tunnelState == TunnelState.Connected && it.tunnelVerified) || it.tunnelState == TunnelState.Error
+                    }
+                }
+                assertEquals("VPN did not recover automatically after the LTE outage",
+                    TunnelState.Connected, recovered.tunnelState)
+                client.connectionPool.evictAll()
+                assertResponsiveQuorum(probeHttpsQuorum(client, "physical_network_recovery"), "physical_network_recovery")
+                report("event=physical_network_recovery_verified outage_command_ms=8000 " +
+                    "after_network_return_ms=${SystemClock.elapsedRealtime() - restoredAt} " +
+                    "total_ms=${SystemClock.elapsedRealtime() - startedAt}")
+            } finally {
+                withContext(NonCancellable + Dispatchers.IO) {
+                    shell("svc data enable")
+                    assertEquals("The test did not restore mobile data",
+                        "1", shell("settings get global mobile_data").trim())
+                }
+            }
+        }
+
+    private fun executeOnDeviceScript(script: String): String {
+        check(Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            "Bidirectional shell commands require Android 12 or newer"
+        }
+        val descriptors = InstrumentationRegistry.getInstrumentation().uiAutomation.executeShellCommandRw("sh")
+        return ParcelFileDescriptor.AutoCloseInputStream(descriptors[0]).use { output ->
+            ParcelFileDescriptor.AutoCloseOutputStream(descriptors[1]).use { input ->
+                input.write((script + "\n").toByteArray(Charsets.UTF_8))
+            }
+            output.bufferedReader().readText()
+        }
+    }
+
+    private suspend fun verifyLoadedTransfers(client: OkHttpClient) =
+        kotlinx.coroutines.coroutineScope {
+            val startedAt = SystemClock.elapsedRealtime()
+            val transferStarted = CompletableDeferred<Unit>()
+            val workload = async(Dispatchers.IO) {
+                transferStarted.complete(Unit)
+                repeat(LOADED_TRANSFER_CHUNKS) { index ->
+                    coroutineContext.ensureActive()
+                    report("event=loaded_transfer_chunk chunk=${index + 1}")
+                    transferSample(client, BOUNDED_DOWNLOAD_BYTES, BOUNDED_UPLOAD_BYTES)
+                }
+            }
+            transferStarted.await()
+            var quorumChecks = 0
+            while (!workload.isCompleted) {
+                val phase = "during_transfer_${quorumChecks + 1}"
+                withContext(Dispatchers.IO) {
+                    assertResponsiveQuorum(probeHttpsQuorum(client, phase), phase)
+                }
+                quorumChecks++
+                delay(250L)
+            }
+            workload.await()
+            assertTrue("No HTTPS check overlapped the transfer workload", quorumChecks > 0)
+            report("event=loaded_transfer_acceptance checks=$quorumChecks chunks=$LOADED_TRANSFER_CHUNKS " +
+                "payload_bytes=${LOADED_TRANSFER_CHUNKS.toLong() * (BOUNDED_DOWNLOAD_BYTES + BOUNDED_UPLOAD_BYTES)} " +
+                "elapsed_ms=${SystemClock.elapsedRealtime() - startedAt}")
+        }
+
     private suspend fun waitForBackgroundIdle(durationMs: Long, screenOffPower: PowerManager? = null) {
         // Coroutine timer delays exclude deep sleep on Android. Measure idle
         // with elapsedRealtime so screen-off time counts without a wake lock.
@@ -704,6 +860,7 @@ class LiveVpnDeviceTest {
             error("Budgeted third-party playback requires Android 10 or newer")
         }
         val args = InstrumentationRegistry.getArguments()
+        val limits = videoTestLimits(args)
         val uri = Uri.parse(requireNotNull(args.getString("videoUrl")) { "Pass an explicit public YouTube videoUrl" })
         require(uri.scheme == "https" && uri.host == "www.youtube.com" && uri.path == "/watch" &&
             !uri.getQueryParameter("v").isNullOrBlank()) { "videoUrl must be a public HTTPS YouTube watch URL" }
@@ -731,14 +888,16 @@ class LiveVpnDeviceTest {
         var bufferingTransitions = 0
         var previousState: Int? = null
         var budgetReached = false
+        report("event=youtube_limits duration_ms=${limits.durationMs} " +
+            "mobile_budget_bytes=${limits.mobileBudgetBytes} required_playing_ms=${limits.requiredPlayingMs}")
         try {
             context.startActivity(Intent(Intent.ACTION_VIEW, uri).setPackage("com.google.android.youtube")
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-            while (SystemClock.elapsedRealtime() - started < 60_000L) {
+            while (SystemClock.elapsedRealtime() - started < limits.durationMs) {
                 val elapsed = SystemClock.elapsedRealtime() - started
                 val used = mobileBytes() - initialBytes
                 check(used >= 0L) { "Mobile counters reset during video; stop rather than guess the budget" }
-                if (used >= VIDEO_MOBILE_BUDGET_BYTES) {
+                if (used >= limits.mobileBudgetBytes) {
                     budgetReached = true
                     break
                 }
@@ -786,10 +945,31 @@ class LiveVpnDeviceTest {
                 "buffering_transitions=$bufferingTransitions")
         }
         assertNotNull("The requested video never reported active playback", firstPlayingAt)
-        assertTrue("The requested video did not report local Playing state for 15 observed seconds",
-            playingObservation.observedMs >= 15_000L)
+        assertTrue("The requested video did not report local Playing state for ${limits.requiredPlayingMs} observed ms",
+            playingObservation.observedMs >= limits.requiredPlayingMs)
         assertTrue("YouTube reported rebuffering during the bounded sample", bufferingTransitions == 0)
         report("bounded_youtube_acceptance=true")
+    }
+
+    private data class VideoTestLimits(
+        val durationMs: Long,
+        val mobileBudgetBytes: Long,
+        val requiredPlayingMs: Long
+    )
+
+    private fun videoTestLimits(args: Bundle): VideoTestLimits {
+        fun argument(name: String, default: Long, allowed: LongRange): Long {
+            val value = args.getString(name)?.let {
+                requireNotNull(it.toLongOrNull()) { "$name must be an integer" }
+            } ?: default
+            require(value in allowed) { "$name must be in $allowed" }
+            return value
+        }
+        val durationSeconds = argument("videoDurationSeconds", 60L, 60L..600L)
+        val budgetMiB = argument("videoBudgetMiB", 12L, 12L..2_048L)
+        // Preserve the limited-data check; extended runs require all but 30 s playing.
+        val requiredSeconds = if (durationSeconds == 60L) 15L else durationSeconds - 30L
+        return VideoTestLimits(durationSeconds * 1_000L, budgetMiB * 1024 * 1024, requiredSeconds * 1_000L)
     }
 
     private class PlayingObservation {
@@ -833,7 +1013,7 @@ class LiveVpnDeviceTest {
         const val UPLOAD_BYTES = 64 * 1024
         const val BOUNDED_DOWNLOAD_BYTES = 8 * 1024 * 1024
         const val BOUNDED_UPLOAD_BYTES = 2 * 1024 * 1024
-        const val VIDEO_MOBILE_BUDGET_BYTES = 12 * 1024 * 1024L
+        const val LOADED_TRANSFER_CHUNKS = 12
         // A generous regression ceiling, not a promise of instant browsing.
         const val RESPONSIVE_ENDPOINT_LIMIT_MS = 6_000L
     }

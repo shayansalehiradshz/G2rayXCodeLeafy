@@ -5,6 +5,10 @@ Run these checks on the same physical Android phone and ISP used for daily traff
 The [17 October physical-device record](DEVICE_ACCEPTANCE_2026-10-17.md) identifies
 the installed build, completed checks, interrupted attempts, and remaining
 acceptance. Its small HTTPS probes do not replace the broader tests below.
+The [extended 17 October record](EXTENDED_DEVICE_ACCEPTANCE_2026-10-17.md) adds
+bounded transfers, loaded responsiveness, real LTE-outage recovery, three-minute
+YouTube samples, short real AI-app exchanges, and Native screen-off/forced Doze.
+It also retains the incomplete and failed harness observations and their limits.
 
 ## Automated gates
 
@@ -599,6 +603,31 @@ long-duration throughput ceiling. These checks do not establish actual YouTube
 buffering, Instagram feed behavior, packet loss, or superiority to another
 client. Test those separately within the remaining budget.
 
+For concurrent loaded latency, use the same explicit `liveVpn=true` selection
+with `liveLoadedTransfers=true`, `smallProbesOnly=true`, and
+`LiveVpnDeviceTest#selectedProfileKeepsResponsiveDuringConcurrentTransfers`.
+It transfers twelve 8 MiB downloads / 2 MiB uploads (120 MiB payload total), while
+independent complete-body HTTPS quorums must stay within the existing six-second
+response gate. Request times, completed byte counts, and the number of overlapping
+checks are reported. This is not a full bufferbloat study or a guarantee of
+latency under every competing workload.
+
+Only with explicit permission for a temporary mobile-data interruption, use
+`liveNetworkRecovery=true`, `liveVpn=true`, `smallProbesOnly=true`, and
+`LiveVpnDeviceTest#selectedProfileRecoversAfterMobileDataOutage`. It requires
+Android 12+, originally enabled data, and LTE as the only Internet connection.
+An on-device shell command disables data for eight seconds, then re-enables it; a separate
+non-cancellable cleanup also restores data. The test must observe genuine
+physical-network loss, invalidation of route verification, automatic restoration
+without Start VPN, and a fresh HTTPS quorum. Keep a host-side `finally` that
+runs `adb shell svc data enable` as an additional guard. This tests loss/return
+of LTE, not a Wi-Fi/LTE handoff. Never silently enable a radio that was originally
+disabled or change another network to satisfy its preconditions.
+The restoration script is sent to `sh` through `executeShellCommandRw` stdin;
+`executeShellCommand` does not interpret chained shell syntax. The independent
+`deviceShellScriptExecutesMultipleCommandsThroughStdin` regression validates
+this path without changing a radio or accessing the Internet.
+
 An Android 10+ opt-in YouTube observation is available with `liveVideo=true`,
 `smallProbesOnly=true`, and an explicit public `videoUrl`/`videoTitle`, using
 `selectedProfilePlaysBoundedYoutubeSample`. Unlock the phone first. It observes
@@ -616,6 +645,17 @@ frames or uninterrupted playback. A budget-limited run that cannot complete
 the observation is not a pass. No video resolution, app settings, account
 data, or lock policy is changed. Repeat controlled visual/video acceptance
 separately before claiming smooth high-resolution or long-session playback.
+
+With an explicitly larger data allowance, `-e videoDurationSeconds 180
+-e videoBudgetMiB 256` extends that same test to three minutes with a 256 MiB
+phone-wide mobile-counter stop. Supported durations are 60-600 seconds and
+budgets are 12-2048 MiB; invalid values fail instead of silently changing the
+test. Defaults remain 60 seconds / 12 MiB / 15 observed Playing seconds.
+Extended runs require at least duration minus 30 seconds of observed Playing,
+and still reject any reported post-start buffering transition. The packaged
+`youtubeLimitsKeepBudgetDefaultsAndRequireLongerPlaybackForExtendedRuns` test
+checks these limits without Internet traffic. Larger allowances do not turn
+media-session telemetry into decoded-frame, resolution, or long-session proof.
 
 ## US Exit and Capture Retention
 
