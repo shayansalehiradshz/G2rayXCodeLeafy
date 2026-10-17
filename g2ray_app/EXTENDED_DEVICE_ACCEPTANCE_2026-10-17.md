@@ -99,6 +99,10 @@ five-minute check; the earlier HEV five-minute result remains separately recorde
 
 This is a USB-powered, explicitly forced Doze observation. It does not establish
 natural unplugged Doze behavior, a full sleep cycle, or battery consumption.
+The complete run's phone-wide counters advanced by 11,525,554 received and
+6,725,799 transmitted bytes, including other applications or tethered traffic.
+The test requests and their connection pool were idle; the whole upstream
+tunnel was not independently proven silent throughout the screen-off interval.
 
 ## YouTube and Cloud-AI Apps
 
