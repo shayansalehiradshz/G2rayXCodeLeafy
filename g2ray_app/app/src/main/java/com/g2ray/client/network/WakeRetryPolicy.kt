@@ -28,16 +28,26 @@ internal class WakeRetryCooldown(private val nowMs: () -> Long) {
 internal suspend fun awaitWakeRetryDelay(
     delayMs: Long,
     nowMs: () -> Long,
-    sleep: suspend (Long) -> Unit = { delay(it) }
+    sleep: suspend (Long) -> Unit = { delay(it) },
+    minimumDelayMs: Long = delayMs,
+    shouldRetryEarly: () -> Boolean = { false }
 ) {
     val durationMs = delayMs.coerceAtLeast(0L)
-    val deadlineMs = nowMs().coerceIn(0L, Long.MAX_VALUE - durationMs) + durationMs
+    val startedAtMs = nowMs().coerceIn(0L, Long.MAX_VALUE - durationMs)
+    val deadlineMs = startedAtMs + durationMs
+    val minimumDeadlineMs = startedAtMs + minimumDelayMs.coerceIn(0L, durationMs)
     while (true) {
-        val remainingMs = deadlineMs - nowMs().coerceAtLeast(0L)
+        val now = nowMs().coerceAtLeast(0L)
+        val remainingMs = deadlineMs - now
         if (remainingMs <= 0L) return
+        // A new physical path may supersede local exponential backoff, but
+        // never a server's mandatory Retry-After boundary. Other callers keep
+        // the complete delay unless they explicitly opt into early retry.
+        if (now >= minimumDeadlineMs && shouldRetryEarly()) return
         // These timers do not wake the CPU. A resumed device checks its
         // remaining cooldown within a second instead of restarting the wait.
-        sleep(minOf(remainingMs, 1_000L))
+        val untilMinimumMs = (minimumDeadlineMs - now).takeIf { it > 0L } ?: 1_000L
+        sleep(minOf(remainingMs, untilMinimumMs, 1_000L))
     }
 }
 

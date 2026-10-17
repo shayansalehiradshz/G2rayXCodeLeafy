@@ -8,6 +8,48 @@ import kotlinx.coroutines.test.runTest
 
 class WakeRetryPolicyTest {
     @Test
+    fun earlyRetryKeepsTheFullDelayWithoutAnExplicitMinimumOverride() = runTest {
+        var now = 0L
+        awaitWakeRetryDelay(2_500L, nowMs = { now }, sleep = { now += it },
+            shouldRetryEarly = { true })
+        assertEquals(2_500L, now)
+    }
+
+    @Test
+    fun earlyRetryMinimumCannotBeNegativeOrExceedTheActualWait() = runTest {
+        for ((minimum, expected) in listOf(-1L to 0L, 5_000L to 2_500L, Long.MAX_VALUE to 2_500L)) {
+            var now = 0L
+            awaitWakeRetryDelay(2_500L, nowMs = { now }, sleep = { now += it },
+                minimumDelayMs = minimum, shouldRetryEarly = { true })
+            assertEquals("minimum=$minimum", expected, now)
+        }
+    }
+
+    @Test
+    fun replacementNetworkCanEndLocalBackoffAtTheNextClockCheck() = runTest {
+        var now = 0L
+        awaitWakeRetryDelay(60_000L, nowMs = { now }, sleep = { now += it },
+            minimumDelayMs = 0L, shouldRetryEarly = { now >= 1_000L })
+        assertEquals(1_000L, now)
+    }
+
+    @Test
+    fun replacementNetworkStillHonorsTheCompleteMandatoryCooldown() = runTest {
+        var now = 0L
+        awaitWakeRetryDelay(60_000L, nowMs = { now }, sleep = { now += it },
+            minimumDelayMs = 5_500L, shouldRetryEarly = { true })
+        assertEquals(5_500L, now)
+    }
+
+    @Test
+    fun unavailableOrUnchangedNetworkDoesNotShortenLocalBackoff() = runTest {
+        var now = 0L
+        awaitWakeRetryDelay(2_500L, nowMs = { now }, sleep = { now += it },
+            minimumDelayMs = 0L, shouldRetryEarly = { false })
+        assertEquals(2_500L, now)
+    }
+
+    @Test
     fun retryWaitHonorsTheDeadlineWithoutRoundingItsLastInterval() = runTest {
         var nowMs = 0L
         val sleeps = mutableListOf<Long>()

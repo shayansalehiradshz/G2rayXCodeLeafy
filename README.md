@@ -6,7 +6,7 @@ A sleek VLESS proxy manager for GitHub Codespaces.
 
 [![Version](https://img.shields.io/badge/version-1.4.3-2DC94E?style=flat-square)](#g2rayxcodeleafy)
 [![License](https://img.shields.io/badge/license-MIT-2DC94E?style=flat-square)](LICENSE)
-[![Status](https://img.shields.io/badge/status-stable-2DC94E?style=flat-square)]()
+[![Status](https://img.shields.io/badge/status-validation_pending-D99A23?style=flat-square)](g2ray_app/PRODUCTION_TEST_MATRIX.md)
 
 </div>
 

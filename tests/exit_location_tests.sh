@@ -69,7 +69,8 @@ fixture_first='{"ip":"203.0.113.1","country":"US"}'
 fixture_second='{"ip":"203.0.113.2","country":"US"}'
 server_exit_location_json | jq -e '.status == "us_observed" and .multiple_exit_ips and
     .scope == "server_ipv4_egress" and .expected_country == "US"' >/dev/null
-show_server_exit_location | grep -Fq 'not by itself a phone-IP leak'
+output=$(show_server_exit_location)
+[[ "$output" == *'not by itself a phone-IP leak'* ]]
 printf 'PASS: multiple NAT exits remain distinct from a phone-IP bypass\n'
 
 fixture_first='{"ip":"203.0.113.1","country":"US","city":"Test\u001b[31m City","org":"Test\nISP"}'

@@ -530,6 +530,9 @@ class G2RayViewModel internal constructor(
             activeProfileId: String?,
             routeReady: Boolean
         ): AppConnectionState {
+            // A wake/discovery update cannot verify or release a retained TUN.
+            // Keep the service's blocked status visible until an actual retry.
+            if (previous.tunnelState == TunnelState.Blocked) return previous
             return previous.copy(
                 routeState = routeState,
                 message = message,

@@ -9,6 +9,7 @@ import com.g2ray.client.model.TunnelState
 import com.g2ray.client.model.VpnStateRepository
 import com.g2ray.client.parser.VlessUriParser
 import java.util.concurrent.atomic.AtomicLong
+import java.time.Duration
 import kotlin.coroutines.CoroutineContext
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
@@ -39,6 +40,7 @@ import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import org.robolectric.shadows.ShadowNetwork
+import org.robolectric.shadows.ShadowSystemClock
 
 @OptIn(ExperimentalCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
@@ -74,6 +76,113 @@ class G2RayVpnServiceReverificationTest {
             assertEquals(0, bridge.stops)
             assertTrue(VpnStateRepository.state.value.tunnelVerified)
             assertTrue(VpnStateRepository.state.value.routeReady)
+        }
+    }
+
+    @Test
+    fun handoffCancelsTheOldPeriodicProbeWithoutDelayingNewNetworkVerification() = runTest {
+        exercisePeriodicProbeNetworkChange(loseNetworkFirst = false)
+    }
+
+    @Test
+    fun physicalNetworkLossCancelsThePeriodicProbeAndMonitoringResumesAfterReturn() = runTest {
+        exercisePeriodicProbeNetworkChange(loseNetworkFirst = true)
+    }
+
+    @Test
+    fun repeatingTheSameNetworkDoesNotCancelAValidPeriodicProbe() = runTest {
+        val entered = CompletableDeferred<Unit>()
+        val probe = CountingProbe().apply {
+            onProbe = { entered.complete(Unit); awaitCancellation() }
+        }
+        withConnectedService(probe) { service, _ ->
+            startHealthMonitor(service)
+            tick(30_000L)
+            assertTrue(entered.isCompleted)
+            val monitor = field(service, "healthJob") as Job
+            applyNetwork(service, ShadowNetwork.newInstance(100))
+            runCurrent()
+            assertTrue(monitor.isActive)
+            assertTrue((field(service, "lifecycleOperationMutex") as Mutex).isLocked)
+        }
+    }
+
+    @Test
+    fun aReplacementNetworkExpeditesBackoffWhenTheCoreIsStopped() = runTest {
+        withConnectedService(CountingProbe()) { service, bridge ->
+            setCoreState(service, TunnelCoreState.Error)
+            setField(service, "desiredConnected", true)
+            schedulePersistentReconnect(service)
+            runCurrent()
+            applyNetwork(service, ShadowNetwork.newInstance(101))
+            tick(1_000L)
+            assertEquals("A usable replacement must not wait out the old local backoff", 1, bridge.stops)
+        }
+    }
+
+    @Test
+    fun aReplacementNetworkBeforeTheQueuedRetryStartsIsNotLost() = runTest {
+        withConnectedService(CountingProbe()) { service, bridge ->
+            setCoreState(service, TunnelCoreState.Error)
+            setField(service, "desiredConnected", true)
+            schedulePersistentReconnect(service)
+            // The callback arrives while the background retry is still queued.
+            applyNetwork(service, ShadowNetwork.newInstance(101))
+            runCurrent()
+            tick(1_000L)
+            assertEquals("Do not recapture the new network as the failed path", 1, bridge.stops)
+        }
+    }
+
+    @Test
+    fun aReplacementNetworkCannotBypassTheServersRetryAfter() = runTest {
+        withConnectedService(CountingProbe()) { service, bridge ->
+            setCoreState(service, TunnelCoreState.Error)
+            setField(service, "desiredConnected", true)
+            schedulePersistentReconnect(service, retryAfterMs = 60_000L)
+            applyNetwork(service, ShadowNetwork.newInstance(101))
+            tick(3_000L)
+            assertEquals(0, bridge.stops)
+            applyNetwork(service, ShadowNetwork.newInstance(102))
+            tick(3_000L)
+            assertEquals(0, bridge.stops)
+            assertTrue((field(service, "reconnectRetryJob") as Job).isActive)
+        }
+    }
+
+    @Test
+    fun anUnchangedOrUnavailableNetworkDoesNotExpediteAStoppedCoreRetry() = runTest {
+        withConnectedService(CountingProbe()) { service, bridge ->
+            setCoreState(service, TunnelCoreState.Error)
+            setField(service, "desiredConnected", true)
+            schedulePersistentReconnect(service)
+            runCurrent()
+            applyNetwork(service, ShadowNetwork.newInstance(100))
+            tick(1_000L)
+            assertEquals(0, bridge.stops)
+            applyNetwork(service, null)
+            tick(1_000L)
+            assertEquals(0, bridge.stops)
+            assertTrue((field(service, "reconnectRetryJob") as Job).isActive)
+        }
+    }
+
+    @Test
+    fun aReplacementNetworkVerifiesAStillRunningCoreBeforeRetryCanRestartIt() = runTest {
+        val probe = CountingProbe()
+        withConnectedService(probe) { service, bridge ->
+            setField(service, "desiredConnected", true)
+            schedulePersistentReconnect(service)
+            runCurrent()
+            applyNetwork(service, ShadowNetwork.newInstance(101))
+            tick(1_000L)
+            assertEquals(0, bridge.stops)
+            tick(1_500L)
+            assertEquals(1, probe.calls)
+            assertTrue(VpnStateRepository.state.value.tunnelVerified)
+            assertNull(field(service, "reconnectRetryJob"))
+            tick(5_000L)
+            assertEquals(0, bridge.stops)
         }
     }
 
@@ -430,6 +539,72 @@ class G2RayVpnServiceReverificationTest {
             assertTrue(field(service, "waitingForUnderlyingNetwork") as Boolean)
             assertEquals(0, bridge.stops)
         }
+    }
+
+    private suspend fun TestScope.exercisePeriodicProbeNetworkChange(loseNetworkFirst: Boolean) {
+        val entered = CompletableDeferred<Unit>()
+        val cancelled = CompletableDeferred<Unit>()
+        val probe = CountingProbe().apply {
+            onProbe = {
+                entered.complete(Unit)
+                try { awaitCancellation() } finally { cancelled.complete(Unit) }
+            }
+        }
+        withConnectedService(probe) { service, bridge ->
+            VpnStateRepository.state.value = VpnStateRepository.state.value.copy(
+                tunnelState = TunnelState.Connected, routeReady = true, tunnelVerified = true
+            )
+            startHealthMonitor(service)
+            tick(30_000L)
+            assertTrue(entered.isCompleted)
+            val oldMonitor = field(service, "healthJob") as Job
+            assertTrue((field(service, "lifecycleOperationMutex") as Mutex).isLocked)
+
+            probe.onProbe = { RunningRouteResult(true) }
+            if (loseNetworkFirst) {
+                applyNetwork(service, null)
+                runCurrent()
+                assertTrue("A networkless probe must release the handoff mutex", cancelled.isCompleted)
+                assertFalse((field(service, "lifecycleOperationMutex") as Mutex).isLocked)
+            }
+            applyNetwork(service, ShadowNetwork.newInstance(101))
+            runCurrent()
+            assertTrue("A replacement must cancel the obsolete periodic request", oldMonitor.isCancelled)
+            assertTrue(cancelled.isCompleted)
+            assertFalse((field(service, "lifecycleOperationMutex") as Mutex).isLocked)
+            tick(2_500L)
+            assertEquals(2, probe.calls)
+            assertTrue(VpnStateRepository.state.value.tunnelVerified)
+            assertEquals("A successful handoff must retain the healthy core", 0, bridge.stops)
+            tick(30_000L)
+            assertTrue("Periodic monitoring must remain active on the replacement", probe.calls >= 3)
+        }
+    }
+
+    private fun TestScope.tick(milliseconds: Long) {
+        ShadowSystemClock.advanceBy(Duration.ofMillis(milliseconds))
+        advanceTimeBy(milliseconds)
+        runCurrent()
+    }
+
+    private fun TestScope.startHealthMonitor(service: G2RayVpnService) {
+        G2RayVpnService::class.java.getDeclaredMethod("startCoreHealthMonitor")
+            .apply { isAccessible = true }.invoke(service)
+        runCurrent()
+    }
+
+    private fun setCoreState(service: G2RayVpnService, value: TunnelCoreState) {
+        val core = field(service, "core") as XrayCoreManager
+        @Suppress("UNCHECKED_CAST")
+        val state = XrayCoreManager::class.java.getDeclaredField("_state")
+            .apply { isAccessible = true }.get(core) as MutableStateFlow<TunnelCoreState>
+        state.value = value
+    }
+
+    private fun schedulePersistentReconnect(service: G2RayVpnService, retryAfterMs: Long? = null) {
+        G2RayVpnService::class.java.getDeclaredMethod("schedulePersistentReconnect", String::class.java,
+            java.lang.Long::class.java).apply { isAccessible = true }
+            .invoke(service, "Fixture disconnected route", retryAfterMs)
     }
 
     private suspend fun TestScope.assertReplacedHandoffDoesNotRecover(oldProbeSuccess: Boolean) {

@@ -46,6 +46,13 @@ binding confirmation. That confirmation cannot override an identified,
 different Codespace. After a successful import, Settings shows the destination's
 profile list; Home keeps its previous active selection until you change it.
 
+Changing an account's Codespace name does not rewrite its existing VLESS links.
+Startup and automatic backup selection recheck recognized Codespace identities
+against the account's current name. A conflicting selected profile remains
+Blocked with a configuration error. Import or select a matching config, then
+use Retry VPN. Old links remain saved for repair; explicitly bound custom
+fronts without a recognized origin remain compatible, not authenticated.
+
 ### Blocking traffic outside the VPN
 
 Start VPN hands connection ownership to the service immediately, without a
@@ -60,8 +67,14 @@ then enable **Always-on VPN** and **Block connections without VPN**. Both are
 system-controlled settings: the app cannot silently enable them. Without OS
 blocking, traffic may use the normal network after the VPN stops or its process
 dies. On Android 10+, Home displays the OS-reported blocking state while the
-service is running; older versions show **Check Android settings**, not an
+service is running or retaining a Blocked guard; older versions show **Check Android settings**, not an
 unverified protection claim.
+
+A successful manual Codespace wake does not start VPN or verify its data path.
+While Blocked, wake updates preserve the service warning until an actual VPN retry.
+Network transitions cancel obsolete prompt and periodic health requests.
+A surviving core is verified before replacement; a stopped core can retry
+early on a usable new network without bypassing a server Retry-After.
 
 Android's always-on start restores the currently selected saved profile, including
 after a normal app Stop cleared the previous session cache. On Android 10+, the

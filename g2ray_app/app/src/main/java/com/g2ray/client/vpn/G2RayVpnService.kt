@@ -53,6 +53,7 @@ import com.g2ray.client.network.WorkerRouteCoordinator
 import com.g2ray.client.network.awaitWakeRetryDelay
 import com.g2ray.client.network.interruptibleDnsLookup
 import com.g2ray.client.parser.VlessUriParser
+import com.g2ray.client.parser.CodespaceProfileIdentity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
@@ -1165,6 +1166,9 @@ class G2RayVpnService : VpnService() {
                     if (!lifecycleGuard.isCurrent(lifecycleToken)) {
                         return@withLock
                     }
+                    profileBindingFailure(profile, activeAccountId)?.let {
+                        throw IllegalStateException(it)
+                    }
                     rememberLastProfileContext(rawProfile, activeAccountId)
 
                     if (!lifecycleGuard.isCurrent(lifecycleToken)) {
@@ -1875,6 +1879,10 @@ class G2RayVpnService : VpnService() {
         if (!isTunnelCurrent(lifecycleToken, tun)) {
             return RunningRouteResult(false, "VPN lifecycle changed before engine startup")
         }
+        profileBindingFailure(profile, activeAccountId)?.let {
+            return RunningRouteResult(false, it, retryAllowed = false,
+                failureScope = RouteFailureScope.Configuration)
+        }
         activeEngine = engine
         hevTunnelRunning = false
         val resolutionStartedAt = SystemClock.elapsedRealtime()
@@ -2059,7 +2067,7 @@ class G2RayVpnService : VpnService() {
         val nowMs = System.currentTimeMillis()
         val networkKey = (application as G2RayApplication).routeMeasurementContext.keyFor(underlyingNetwork)
         val storedCandidates = selectAlternativeProfiles(
-            profiles = accountRepository.profiles.value,
+            profiles = profileCandidatesForAccount(accountId),
             accountId = accountId,
             currentRawUri = selected.rawUri,
             maxCandidates = 10,
@@ -2266,7 +2274,7 @@ class G2RayVpnService : VpnService() {
         if (attemptLimit == 0) return null
         val accountId = activeAccountId ?: accountRepository.activeSelection.value.accountId
         val candidates = selectAlternativeProfiles(
-            profiles = accountRepository.profiles.value,
+            profiles = profileCandidatesForAccount(accountId),
             accountId = accountId,
             currentRawUri = currentProfile.rawUri,
             maxCandidates = MAX_BACKUP_ROUTE_CANDIDATES,
@@ -2606,18 +2614,28 @@ class G2RayVpnService : VpnService() {
         if (!isTunnelCurrent(token, tun)) return
         healthJob?.cancel()
         healthJob = null
+        // Capture before dispatch: a network callback can arrive while the
+        // retry coroutine is queued, before it begins its first backoff wait.
+        val scheduledNetworkGeneration = underlyingNetworkGeneration.get()
         markTunnelUnverified("$reason Retrying automatically...")
         reconnectRetryJob = scope.launch {
             var attempt = 0
             var retryWaitMs = retryAfterMs
             var retryReason = reason
+            var retryNetworkGeneration = scheduledNetworkGeneration
             while (isActive && desiredConnected && isTunnelCurrent(token, tun)) {
                 val backoff = reconnectBackoffMs(attempt)
                 val retryDelay = reconnectDelayMs(attempt, retryWaitMs)
                 attempt = (attempt + 1).coerceAtMost(4)
                 markTunnelUnverified("$retryReason Retrying automatically in ${(retryDelay + 999L) / 1000L}s...")
                 awaitWakeRetryDelay(
-                    retryDelay + Random.nextLong(0L, backoff / 5L + 1L), SystemClock::elapsedRealtime
+                    retryDelay + Random.nextLong(0L, backoff / 5L + 1L), SystemClock::elapsedRealtime,
+                    minimumDelayMs = retryWaitMs?.coerceIn(0L, MAX_WAKE_RETRY_DELAY_MS) ?: 0L,
+                    shouldRetryEarly = {
+                        !waitingForUnderlyingNetwork &&
+                            underlyingNetworkGeneration.get() != retryNetworkGeneration &&
+                            core.state.value in setOf(TunnelCoreState.Error, TunnelCoreState.Disconnected)
+                    }
                 )
                 if (!desiredConnected || !isTunnelCurrent(token, tun)) break
                 lifecycleOperationMutex.withLock {
@@ -2631,6 +2649,7 @@ class G2RayVpnService : VpnService() {
                     }
                     retryWaitMs = route.retryAfterMs
                     retryReason = route.error ?: reason
+                    retryNetworkGeneration = underlyingNetworkGeneration.get()
                     withContext(Dispatchers.Main) {
                         if (!desiredConnected || !isTunnelCurrent(token, tun)) return@withContext
                         if (route.success) {
@@ -2873,6 +2892,19 @@ class G2RayVpnService : VpnService() {
             // mutex instead of delaying the replacement network's verification.
             routeReverifyJob?.cancel()
             routeReverifyJob = null
+            // A periodic probe owns the same mutex and clients as handoff
+            // verification. Cancel its obsolete wait too; otherwise the new
+            // physical path can sit behind both old full-path/SOCKS deadlines.
+            if (healthJob?.isActive == true) {
+                healthJob?.cancel()
+                healthJob = null
+                if (core.state.value == TunnelCoreState.Connected && activeProfile != null &&
+                    !routeRecoveryInProgress && routeRecoveryJob?.isActive != true &&
+                    reconnectRetryJob?.isActive != true
+                ) {
+                    startCoreHealthMonitor()
+                }
+            }
         }
         val underlyingNetworksAccepted = runCatching {
             setUnderlyingNetworks(network?.let { arrayOf(it) } ?: emptyArray())
@@ -3033,6 +3065,30 @@ class G2RayVpnService : VpnService() {
         } ?: throw IllegalStateException(
             "No valid active VLESS profile. Import and select a profile first."
         )
+    }
+
+    private fun profileBindingFailure(profile: G2RayProfile, accountId: String?): String? {
+        if (accountId.isNullOrBlank()) return null
+        if (!accountRepository.savedDataReady.value) {
+            return "Saved VPN settings are unavailable. Open the app to recover them."
+        }
+        val account = accountRepository.accounts.value.firstOrNull { it.id == accountId }
+            ?: return "The selected Codespace is unavailable. Choose a saved Codespace and retry."
+        val expected = account.codespaceName?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        return "This VPN config belongs to a different Codespace. Select a matching config and retry."
+            .takeIf { CodespaceProfileIdentity.conflictsWith(profile, expected) }
+    }
+
+    private fun profileCandidatesForAccount(accountId: String?): List<StoredG2RayProfile> {
+        if (accountId.isNullOrBlank()) return emptyList()
+        // Existing links can predate import validation or a later account edit.
+        // Filter before ranking/limiting so stale bindings cannot crowd out
+        // valid backups or spend a route attempt on another host.
+        return accountRepository.profiles.value.filter { stored ->
+            stored.accountId == accountId && VlessUriParser.parse(stored.rawUri).getOrNull()?.let {
+                profileBindingFailure(it, accountId) == null
+            } == true
+        }
     }
 
     private fun systemAlwaysOnEnabled(): Boolean? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {

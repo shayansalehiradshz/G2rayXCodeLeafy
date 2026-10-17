@@ -477,6 +477,11 @@ target phone without destructive fault injection before release acceptance.
    health and wake must return `missing_github_token_binding` without contacting
    GitHub using the primary token. Restore the assigned token and verify only
    that token is used. Do not modify a live Worker's credentials for this test.
+7. Import a canonical link for Codespace A, then edit its account to Codespace B.
+   Manual and system startup must retain capture and reject the stale link before
+   starting an engine or caching the session. Matching B links and explicitly
+   bound custom fronts must still work. Old links must remain saved without
+   crowding valid backups out of the attempt budget or crossing account boundaries.
 
 Source tests cover association and atomicity. Picker layout, confirmation, and
 navigation still require physical-device acceptance; compilation is not that
@@ -606,6 +611,13 @@ client. Test those separately within the remaining budget.
 For concurrent loaded latency, use the same explicit `liveVpn=true` selection
 with `liveLoadedTransfers=true`, `smallProbesOnly=true`, and
 `LiveVpnDeviceTest#selectedProfileKeepsResponsiveDuringConcurrentTransfers`.
+The stricter harness records `request_start_ms` / `request_end_ms` and requires
+`overlapped_probes > 0`: at least one complete responsive HTTPS probe must fall
+inside a completed bulk request's interval. A running coroutine alone cannot
+prove that. This establishes request-lifetime overlap, not simultaneous payload
+bytes or saturation. Repeat the candidate on-device; earlier records do not
+retroactively pass this new gate. The pure boundary regression is
+`LiveVpnDeviceTest#loadedOverlapRequiresACompleteProbeInsideAnActualTransferRequest`.
 It transfers twelve 8 MiB downloads / 2 MiB uploads (120 MiB payload total), while
 independent complete-body HTTPS quorums must stay within the existing six-second
 response gate. Request times, completed byte counts, and the number of overlapping
@@ -623,6 +635,10 @@ without Start VPN, and a fresh HTTPS quorum. Keep a host-side `finally` that
 runs `adb shell svc data enable` as an additional guard. This tests loss/return
 of LTE, not a Wi-Fi/LTE handoff. Never silently enable a radio that was originally
 disabled or change another network to satisfy its preconditions.
+The return event records monotonic `clock_ms`; the separate tunnel-verified
+event precedes fresh HTTPS requests. Compare the first complete responsive
+request interval with that return clock, and report full-quorum completion
+separately. Do not treat the combined three-request time as state recovery alone.
 The restoration script is sent to `sh` through `executeShellCommandRw` stdin;
 `executeShellCommand` does not interpret chained shell syntax. The independent
 `deviceShellScriptExecutesMultipleCommandsThroughStdin` regression validates
@@ -694,6 +710,19 @@ notification, OS policy status or connection state. The source fixtures cover
 both Android 7 and Android 12; real process death/system restart remains a
 separate device gate. A successful manual wake alone must not claim that the
 VPN has started or that the full data path is verified.
+
+While Blocked, both successful and failed manual wakes must preserve the
+service warning, unverified state, and routeReady=false until a real VPN retry.
+Home must retain the OS-reported blocking label while holding that guard;
+the label must not equate in-process capture with Android lockdown.
+
+During an outstanding periodic probe, replace or lose the physical network.
+The obsolete request must cancel and release lifecycle ownership promptly,
+and periodic monitoring must resume after a successful handoff. A callback
+for the same network must not cancel a valid probe. A stopped core can retry
+early when a usable replacement arrives, including before its retry coroutine
+starts, but never before a mandatory Retry-After. A running core must first
+get a fresh route proof instead of an unnecessary restart.
 
 ## v2rayNG A/B comparison
 

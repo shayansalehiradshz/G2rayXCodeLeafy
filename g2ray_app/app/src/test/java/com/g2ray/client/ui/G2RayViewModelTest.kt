@@ -18,6 +18,26 @@ import org.robolectric.RobolectricTestRunner
 
 @RunWith(RobolectricTestRunner::class)
 class G2RayViewModelTest {
+    @Test
+    fun wakeSuccessCannotEraseTheBlockedTrafficStatus() {
+        val blocked = AppConnectionState(
+            routeState = RouteState.Error,
+            tunnelState = TunnelState.Blocked,
+            message = "VPN failed. Internet remains blocked.",
+            routeReady = false,
+            tunnelVerified = false
+        )
+        val updated = G2RayViewModel.mergeRouteStateVisibleForTesting(
+            previous = blocked,
+            routeState = RouteState.Ready,
+            message = "Codespace route ready",
+            activeAccountId = "fixture-account",
+            activeProfileId = "fixture-profile",
+            routeReady = true
+        )
+        assertEquals(blocked, updated)
+    }
+
 
     @Test
     fun normalizeWorkerUrl_validFormats_correct() {

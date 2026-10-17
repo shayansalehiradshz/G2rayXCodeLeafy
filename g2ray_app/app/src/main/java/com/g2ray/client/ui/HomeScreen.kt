@@ -604,7 +604,7 @@ fun HomeScreen(
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "Outside-VPN blocking: ${vpnBlockingStatusLabel(if (isVpnRunning) vpnUiState.blockConnectionsWithoutVpn else null)}",
+                        text = "Android outside-VPN blocking: ${vpnBlockingStatusLabel(if (isVpnRunning || vpnUiState.tunnelState == TunnelState.Blocked) vpnUiState.blockConnectionsWithoutVpn else null)}",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onPrimaryContainer
                     )

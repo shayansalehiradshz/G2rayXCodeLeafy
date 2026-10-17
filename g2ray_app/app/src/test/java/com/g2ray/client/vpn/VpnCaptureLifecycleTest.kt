@@ -10,6 +10,8 @@ import com.g2ray.client.G2RayApplication
 import com.g2ray.client.model.TunnelState
 import com.g2ray.client.model.VpnStateRepository
 import com.g2ray.client.data.EncryptedPrefsStore
+import com.g2ray.client.data.AccountRepository
+import com.g2ray.client.parser.VlessUriParser
 import java.io.IOException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
@@ -57,6 +59,62 @@ class VpnCaptureLifecycleTest {
         Dispatchers.resetMain()
         VpnStateRepository.state.value = originalState
         created.forEach { runCatching { it.close() } }
+    }
+
+    @Test fun systemStartRejectsASavedProfileFromARetargetedCodespace() = runTest {
+        exerciseRetargetedAccount(systemStart = true)
+    }
+
+    @Test fun manualStartRejectsASavedProfileFromARetargetedCodespace() = runTest {
+        exerciseRetargetedAccount(systemStart = false)
+    }
+
+    @Test fun matchingCustomAndUnassociatedProfilesKeepTheirStartupCompatibility() = runTest {
+        withService { service ->
+            val repository = AccountRepository(fixtureStore(service))
+            val account = repository.addAccount("Current", "", "current-fixture")
+            setField(service, "accountRepository\$delegate", lazyOf(repository))
+            val current = originProfile("current-fixture", "203.0.113.2")
+            val custom = VlessUriParser.parse(current.rawUri.replace(
+                "current-fixture-443.app.github.dev", "front.example"
+            )).getOrThrow()
+            assertNull(invoke(service, "profileBindingFailure", current, account.id))
+            assertNull(invoke(service, "profileBindingFailure", custom, account.id))
+            assertNull(invoke(service, "profileBindingFailure", custom, null))
+            assertNotNull(invoke(service, "profileBindingFailure", current, "missing-account"))
+        }
+    }
+
+    @Test fun staleBindingsCannotCrowdValidBackupsOutOfTheAttemptBudget() = runTest {
+        withService { service ->
+            val repository = AccountRepository(fixtureStore(service))
+            val account = repository.addAccount("Old", "", "old-fixture")
+            val old = originProfile("old-fixture", "203.0.113.1")
+            val stale = repository.importProfile(account.id, "Stale", old.rawUri, old)
+            repository.updateAccount(account.id, "New", "", "new-fixture")
+            val current = originProfile("new-fixture", "203.0.113.2")
+            val selected = repository.importProfile(account.id, "Current", current.rawUri, current)
+            val customUri = current.rawUri.replace("203.0.113.2", "203.0.113.3")
+                .replace("new-fixture-443.app.github.dev", "front.example")
+            val customParsed = VlessUriParser.parse(customUri).getOrThrow()
+            val custom = repository.importProfile(account.id, "Custom", customUri, customParsed)
+            val otherAccount = repository.addAccount("Other", "", "other-fixture")
+            val other = originProfile("other-fixture", "203.0.113.4")
+            repository.importProfile(otherAccount.id, "Other", other.rawUri, other)
+            setField(service, "accountRepository\$delegate", lazyOf(repository))
+            val selectionBefore = repository.activeSelection.value
+
+            @Suppress("UNCHECKED_CAST")
+            val eligible = invoke(service, "profileCandidatesForAccount", account.id) as
+                List<com.g2ray.client.model.StoredG2RayProfile>
+            assertEquals(setOf(selected.id, custom.id), eligible.map { it.id }.toSet())
+            val backup = G2RayVpnService.selectAlternativeProfiles(eligible, account.id,
+                selected.rawUri, maxCandidates = 1).single()
+            assertEquals(custom.id, backup.id)
+            assertEquals(selectionBefore, repository.activeSelection.value)
+            assertTrue("Filtering must preserve old profiles for explicit repair",
+                repository.profiles.value.any { it.id == stale.id })
+        }
     }
 
     @Test fun repeatedInvalidStartReusesTheIdleCaptureGuard() = runTest {
@@ -440,6 +498,37 @@ class VpnCaptureLifecycleTest {
     private fun fixtureStore(service: G2RayVpnService): EncryptedPrefsStore = EncryptedPrefsStore {
         service.getSharedPreferences("vpn-privacy-fixture", android.content.Context.MODE_PRIVATE)
     }
+
+    private suspend fun TestScope.exerciseRetargetedAccount(systemStart: Boolean) {
+        withService { service ->
+            val store = fixtureStore(service)
+            val repository = AccountRepository(store)
+            val account = repository.addAccount("Old host", "", "old-fixture")
+            val parsed = originProfile("old-fixture", "203.0.113.1")
+            val profile = repository.importProfile(account.id, "Old", parsed.rawUri, parsed)
+            repository.selectProfile(profile.id)
+            repository.updateAccount(account.id, "New host", "", "new-fixture")
+            setField(service, "accountRepository\$delegate", lazyOf(repository))
+            val request = if (systemStart) Intent(VpnService.SERVICE_INTERFACE) else
+                Intent(G2RayVpnService.ACTION_START)
+                    .putExtra(G2RayVpnService.EXTRA_ACCOUNT_ID, account.id)
+                    .putExtra(G2RayVpnService.EXTRA_RAW_PROFILE_URI, profile.rawUri)
+            service.onStartCommand(request, 0, 1)
+            finishCleanup(service)
+
+            assertEquals(TunnelState.Blocked, VpnStateRepository.state.value.tunnelState)
+            assertTrue(VpnStateRepository.state.value.message.contains("different Codespace"))
+            assertNotNull(field(service, "vpnInterface"))
+            assertNull(field(service, "activeProfile"))
+            assertNull("Do not cache a mismatched route as a usable session", store.getString("last_raw_profile_uri"))
+        }
+    }
+
+    private fun originProfile(name: String, address: String) = VlessUriParser.parse(
+        "vless://00000000-0000-4000-8000-000000000001@$address:443" +
+            "?encryption=none&security=tls&type=ws&path=%2Fws" +
+            "&sni=$name-443.app.github.dev&host=$name-443.app.github.dev"
+    ).getOrThrow()
 
     private suspend fun TestScope.finishCleanup(service: G2RayVpnService) {
         runCurrent()

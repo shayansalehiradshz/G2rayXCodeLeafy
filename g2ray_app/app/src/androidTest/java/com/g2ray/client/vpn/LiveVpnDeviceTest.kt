@@ -47,6 +47,7 @@ import java.io.IOException
 import java.io.InputStream
 import java.net.Proxy
 import java.net.Socket
+import java.util.Collections
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CompletableDeferred
@@ -72,6 +73,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
@@ -703,6 +705,8 @@ class LiveVpnDeviceTest {
                     while (physicalInternet().isEmpty()) delay(100L)
                 }
                 val restoredAt = SystemClock.elapsedRealtime()
+                report("event=physical_network_returned clock_ms=$restoredAt " +
+                    "elapsed_ms=${restoredAt - startedAt}")
                 val recovered = withTimeout(90_000L) {
                     VpnStateRepository.state.first {
                         (it.tunnelState == TunnelState.Connected && it.tunnelVerified) || it.tunnelState == TunnelState.Error
@@ -710,6 +714,8 @@ class LiveVpnDeviceTest {
                 }
                 assertEquals("VPN did not recover automatically after the LTE outage",
                     TunnelState.Connected, recovered.tunnelState)
+                report("event=physical_network_tunnel_verified " +
+                    "after_network_return_ms=${SystemClock.elapsedRealtime() - restoredAt}")
                 client.connectionPool.evictAll()
                 assertResponsiveQuorum(probeHttpsQuorum(client, "physical_network_recovery"), "physical_network_recovery")
                 report("event=physical_network_recovery_verified outage_command_ms=8000 " +
@@ -737,16 +743,39 @@ class LiveVpnDeviceTest {
         }
     }
 
+    private data class RequestInterval(val startedMs: Long, val finishedMs: Long) {
+        fun containsComplete(probe: RequestInterval): Boolean =
+            finishedMs > startedMs && probe.finishedMs > probe.startedMs &&
+                probe.startedMs >= startedMs && probe.finishedMs <= finishedMs
+    }
+
+    @Test
+    fun loadedOverlapRequiresACompleteProbeInsideAnActualTransferRequest() {
+        val transfer = RequestInterval(100L, 200L)
+        assertTrue(transfer.containsComplete(RequestInterval(110L, 190L)))
+        assertTrue(transfer.containsComplete(RequestInterval(100L, 200L)))
+        assertFalse(transfer.containsComplete(RequestInterval(50L, 90L)))
+        assertFalse(transfer.containsComplete(RequestInterval(210L, 250L)))
+        assertFalse(transfer.containsComplete(RequestInterval(90L, 110L)))
+        assertFalse(transfer.containsComplete(RequestInterval(190L, 210L)))
+        assertFalse(transfer.containsComplete(RequestInterval(150L, 150L)))
+        assertFalse(RequestInterval(100L, 100L).containsComplete(RequestInterval(100L, 100L)))
+    }
+
     private suspend fun verifyLoadedTransfers(client: OkHttpClient) =
         kotlinx.coroutines.coroutineScope {
             val startedAt = SystemClock.elapsedRealtime()
             val transferStarted = CompletableDeferred<Unit>()
+            val transfers = Collections.synchronizedList(mutableListOf<RequestInterval>())
+            val responsiveProbes = mutableListOf<RequestInterval>()
             val workload = async(Dispatchers.IO) {
                 transferStarted.complete(Unit)
                 repeat(LOADED_TRANSFER_CHUNKS) { index ->
                     coroutineContext.ensureActive()
                     report("event=loaded_transfer_chunk chunk=${index + 1}")
-                    transferSample(client, BOUNDED_DOWNLOAD_BYTES, BOUNDED_UPLOAD_BYTES)
+                    transferSample(client, BOUNDED_DOWNLOAD_BYTES, BOUNDED_UPLOAD_BYTES) { start, end ->
+                        transfers.add(RequestInterval(start, end))
+                    }
                 }
             }
             transferStarted.await()
@@ -754,14 +783,24 @@ class LiveVpnDeviceTest {
             while (!workload.isCompleted) {
                 val phase = "during_transfer_${quorumChecks + 1}"
                 withContext(Dispatchers.IO) {
-                    assertResponsiveQuorum(probeHttpsQuorum(client, phase), phase)
+                    assertResponsiveQuorum(probeHttpsQuorum(client, phase) { start, end ->
+                        responsiveProbes.add(RequestInterval(start, end))
+                    }, phase)
                 }
                 quorumChecks++
                 delay(250L)
             }
             workload.await()
-            assertTrue("No HTTPS check overlapped the transfer workload", quorumChecks > 0)
-            report("event=loaded_transfer_acceptance checks=$quorumChecks chunks=$LOADED_TRANSFER_CHUNKS " +
+            // A scheduled coroutine (or an unfinished quorum) does not prove overlap.
+            // Require a complete usable, responsive request inside a completed bulk
+            // request's lifetime. This proves request concurrency, not link saturation.
+            val completedTransfers = synchronized(transfers) { transfers.toList() }
+            val overlappedProbes = responsiveProbes.count { probe ->
+                completedTransfers.any { it.containsComplete(probe) }
+            }
+            assertTrue("No complete responsive HTTPS probe occurred inside a bulk request", overlappedProbes > 0)
+            report("event=loaded_transfer_acceptance checks=$quorumChecks overlapped_probes=$overlappedProbes " +
+                "chunks=$LOADED_TRANSFER_CHUNKS " +
                 "payload_bytes=${LOADED_TRANSFER_CHUNKS.toLong() * (BOUNDED_DOWNLOAD_BYTES + BOUNDED_UPLOAD_BYTES)} " +
                 "elapsed_ms=${SystemClock.elapsedRealtime() - startedAt}")
         }
@@ -778,7 +817,11 @@ class LiveVpnDeviceTest {
         }
     }
 
-    private fun probeHttpsQuorum(client: OkHttpClient, phase: String): Int {
+    private fun probeHttpsQuorum(
+        client: OkHttpClient,
+        phase: String,
+        onResponsiveRequest: (Long, Long) -> Unit = { _, _ -> }
+    ): Int {
         val endpoints = listOf(
             "https://www.gstatic.com/generate_204" to 204,
             "https://cp.cloudflare.com/generate_204" to 204,
@@ -792,11 +835,16 @@ class LiveVpnDeviceTest {
                     .execute().use { response ->
                         val body = response.body?.string().orEmpty()
                         val valid = response.code == status && (status == 204 || body.contains("Example Domain"))
-                        val elapsedMs = SystemClock.elapsedRealtime() - started
+                        val finished = SystemClock.elapsedRealtime()
+                        val elapsedMs = finished - started
                         val fast = valid && elapsedMs <= RESPONSIVE_ENDPOINT_LIMIT_MS
-                        if (fast) responsive++
+                        if (fast) {
+                            responsive++
+                            onResponsiveRequest(started, finished)
+                        }
                         report("phase=$phase endpoint=${url.substringAfter("https://").substringBefore('/')} " +
-                            "http=${response.code} usable=$valid responsive=$fast elapsed_ms=$elapsedMs")
+                            "http=${response.code} usable=$valid responsive=$fast elapsed_ms=$elapsedMs " +
+                            "request_start_ms=$started request_end_ms=$finished")
                     }
             } catch (error: Exception) {
                 report("phase=$phase endpoint=${url.substringAfter("https://").substringBefore('/')} " +
@@ -814,7 +862,12 @@ class LiveVpnDeviceTest {
         )
     }
 
-    private fun transferSample(client: OkHttpClient, downloadBytes: Int, uploadBytes: Int) {
+    private fun transferSample(
+        client: OkHttpClient,
+        downloadBytes: Int,
+        uploadBytes: Int,
+        onCompletedRequest: (Long, Long) -> Unit = { _, _ -> }
+    ) {
         // A failed transfer must not silently consume another copy of the budget.
         val transferClient = client.newBuilder().retryOnConnectionFailure(false)
             .followRedirects(false).followSslRedirects(false).build()
@@ -829,16 +882,22 @@ class LiveVpnDeviceTest {
                 val body = response.body ?: throw IOException("Download response has no body")
                 body.byteStream().use { readTransferBody(it, downloadBytes) }
             }
-        report("download_bytes=$downloadBytes elapsed_ms=${SystemClock.elapsedRealtime() - started}")
-        val uploadStarted = SystemClock.elapsedRealtime()
+        val downloadFinished = SystemClock.elapsedRealtime()
+        onCompletedRequest(started, downloadFinished)
+        report("download_bytes=$downloadBytes elapsed_ms=${downloadFinished - started} " +
+            "request_start_ms=$started request_end_ms=$downloadFinished")
         val payload = ByteArray(uploadBytes) { (it and 0xff).toByte() }
+        val uploadStarted = SystemClock.elapsedRealtime()
         transferClient.newCall(Request.Builder()
             .url("https://speed.cloudflare.com/__up?nonce=$nonce")
             .post(payload.toRequestBody("application/octet-stream".toMediaType()))
             .build()).execute().use { response ->
                 assertTrue("Upload endpoint rejected the transfer: HTTP ${response.code}", response.isSuccessful)
             }
-        report("upload_bytes=$uploadBytes elapsed_ms=${SystemClock.elapsedRealtime() - uploadStarted}")
+        val uploadFinished = SystemClock.elapsedRealtime()
+        onCompletedRequest(uploadStarted, uploadFinished)
+        report("upload_bytes=$uploadBytes elapsed_ms=${uploadFinished - uploadStarted} " +
+            "request_start_ms=$uploadStarted request_end_ms=$uploadFinished")
     }
 
     private fun readTransferBody(input: InputStream, expectedBytes: Int): Int {

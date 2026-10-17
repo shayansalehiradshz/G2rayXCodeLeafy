@@ -59,6 +59,11 @@ Per-endpoint nearest-rank latency statistics, in milliseconds:
 | HEV / WebSocket | example.com | 239 | 377 | 856 |
 | HEV / WebSocket | Cloudflare | 237 | 506 | 1,013 |
 
+This historical harness counted probes while the workload coroutine was
+unfinished. It did not record per-request containment intervals. The later
+claim-review revision adds a stricter overlap assertion; these original
+measurements must not be relabeled as passing that new gate.
+
 The slower Cloudflare responses are retained, not discarded. These are complete
 small-response times, not ICMP ping, isolated edge RTT, first byte, or a full
 bufferbloat study. Repeated bounded transfers also do not prove flat throughput
