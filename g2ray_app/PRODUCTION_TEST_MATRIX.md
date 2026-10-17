@@ -9,6 +9,10 @@ The [extended 17 October record](EXTENDED_DEVICE_ACCEPTANCE_2026-10-17.md) adds
 bounded transfers, loaded responsiveness, real LTE-outage recovery, three-minute
 YouTube samples, short real AI-app exchanges, and Native screen-off/forced Doze.
 It also retains the incomplete and failed harness observations and their limits.
+The [claim-review candidate record](CLAIM_REVIEW_2026-10-17.md) identifies the
+subsequent installed recovery fixes, pre-fix reproductions, stricter overlap
+acceptance, and new outage/core/idle results. Earlier media and AI observations
+remain tied to their original APK rather than silently validating the candidate.
 
 ## Automated gates
 
