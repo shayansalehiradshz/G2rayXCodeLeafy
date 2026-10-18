@@ -5776,7 +5776,7 @@ JSON
 }
 
 quota_snapshot_json() {
-    local now cycle stored prev ss elapsed budget running=false
+    local now cycle stored prev ss elapsed budget
     now=$(date +%s) || return 1
     cycle=$(current_quota_cycle) || return 1
     stored=$(cat "$QUOTA_CYCLE_FILE" 2>/dev/null || true)
@@ -5791,9 +5791,9 @@ quota_snapshot_json() {
     elapsed=$(( now - ss )); (( elapsed < 0 )) && elapsed=0
     (( elapsed > 3600 )) && elapsed=3600
     prev=$(( prev + elapsed )); (( prev > 2678400 )) && prev=2678400
-    is_running && running=true
-    printf '{"used_seconds":%s,"budget_seconds":%s,"sampled_at_ms":%s,"cycle":"%s","assumed_running":%s}' \
-        "$prev" "$budget" "$((now * 1000))" "$cycle" "$running"
+    # This snapshot runs on a live host; stopping Xray does not stop host billing.
+    printf '{"used_seconds":%s,"budget_seconds":%s,"sampled_at_ms":%s,"cycle":"%s","assumed_running":true}' \
+        "$prev" "$budget" "$((now * 1000))" "$cycle"
 }
 
 write_codespace_bundle_qr() {

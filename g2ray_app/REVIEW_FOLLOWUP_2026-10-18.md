@@ -50,6 +50,15 @@ working transport, DNS, fragmentation, failover, or route-optimization defaults.
    isolation is verified; initialization failure cannot leave that worker
    running. The temporary status file remains private instead of being removed
    and recreated during initialization.
+7. **Live quota-export defect:** refreshing exports on the active Codespace
+   revealed a call to the nonexistent `is_running` helper. A new regression
+   reproduced the error without mocking that nonexistent helper. A fresh
+   snapshot exported on the live host now marks host activity independently
+   of Xray: stopping the proxy does not stop billable Codespace uptime. The
+   app still labels projection as conditional on the host staying running.
+   Invalid or expired-cycle snapshots remain unavailable; export still does
+   not mutate the uptime counters. The bundle/QR round-trip test checks this
+   activity flag as well as the original links, tuning, and usage data.
 
 Four new regression tests failed against the baseline before their fixes.
 The quota save guard, tile rejection path, and metadata ownership/schema rules
@@ -146,8 +155,9 @@ No speculative setting change or default engine switch follows from these few
 sequential samples. They also do not establish sustained throughput or media/AI
 performance.
 
-The final local server run passed all 209 checks and exited cleanly after adding
-deadline completion/clock regressions and the startup barrier. Its process-group
+The final local server run passed all 210 checks and exited cleanly, with no
+remaining Bash processes, after adding deadline completion/clock regressions,
+the startup barrier, and the live quota-export regression. Its process-group
 rejection check now also proves the command never started. Static checks passed
 66/66; Worker checks passed 69/69. A clean runner exit and fresh Linux CI remain
 deployment requirements; merely counting printed PASS lines is insufficient.
@@ -165,6 +175,20 @@ No package crash entry was present in the final crash-buffer check. This is
 bounded observation, not a guarantee that the app cannot crash. Android
 always-on/lockdown settings were not changed. This is a debug upgrade, not
 signed-release upgrade acceptance.
+
+The first follow-up rollout (`6e03c18`) was fast-forwarded into the active
+Codespace, not left as a request for the owner to pull. Local and public-route
+probes passed. Xray's PID/start time, config fingerprint, and UUID fingerprint
+were unchanged. Both hosted workflows passed for that revision. The quota
+defect above was discovered by that live export check, after the original
+automated bundle test had masked it with an invalid helper mock.
+
+The actual-phone mobile-data outage check also passed: after an eight-second
+outage, the running tunnel verified in 5,052 ms after network return; a complete
+HTTPS quorum finished in 7,942 ms after return. This is a mobile-data outage,
+not a Wi-Fi/LTE handoff. The final Quick Settings start left the app reporting
+`Route: Ready | Engine: HEV TUN`. No always-on, lockdown, bypass, or transport
+default was changed for this test.
 
 ## Readiness and the supplied phone plan
 

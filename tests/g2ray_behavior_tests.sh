@@ -5096,7 +5096,6 @@ test_all_config_qr_preserves_links_and_usage_without_touching_runtime() {
         current_quota_cycle > "$QUOTA_CYCLE_FILE"
         printf '213660' > "$TOTAL_UPTIME_FILE"
         date +%s > "$SESSION_START_FILE"
-        is_running() { return 0; }
         before=$(cat "$TOTAL_UPTIME_FILE")
         link='vless://00000000-0000-0000-0000-000000000001@example.test:443?encryption=none&type=xhttp&extra=%7B%22xmux%22%3A%7B%7D%7D#example'
         write_codespace_import_bundle "$link" || fail "all-config bundle write failed"
@@ -5109,10 +5108,31 @@ test_all_config_qr_preserves_links_and_usage_without_touching_runtime() {
         [[ "$(printf '%s' "$decoded" | jq -r '.quota_estimate.budget_seconds')" == 216000 ]] || fail "QR lost quota budget"
         [[ "$(cat "$TOTAL_UPTIME_FILE")" == "$before" ]] || fail "QR export changed runtime quota"
         [[ "$(printf '%s' "$decoded" | jq -r '.quota_estimate.used_seconds')" -ge 213660 ]] || fail "QR lost used quota"
+        [[ "$(printf '%s' "$decoded" | jq -r '.quota_estimate.assumed_running')" == true ]] \
+            || fail 'fresh host quota snapshot was marked stopped'
         printf 'old-cycle' > "$QUOTA_CYCLE_FILE"
         [[ "$(quota_snapshot_json)" == null ]] || fail "stale quota cycle was presented as current"
     )
     pass "all-config QR preserves links, tuning and scoped local usage"
+}
+
+test_quota_snapshot_tracks_host_activity_not_engine_state() {
+    (
+        reset_runtime_paths
+        local QUOTA_CYCLE_FILE="$DATA_DIR/quota_cycle.txt"
+        local TOTAL_UPTIME_FILE="$DATA_DIR/total_uptime_sec.txt"
+        local SESSION_START_FILE="$DATA_DIR/session_start.txt"
+        local snapshot
+        current_quota_cycle > "$QUOTA_CYCLE_FILE"
+        printf '3600' > "$TOTAL_UPTIME_FILE"
+        date +%s > "$SESSION_START_FILE"
+        xray_running() { return 1; }
+        snapshot=$(quota_snapshot_json 2>"$TMP_ROOT/quota-snapshot-errors") || fail 'quota snapshot failed with a stopped engine'
+        [[ ! -s "$TMP_ROOT/quota-snapshot-errors" ]] || fail 'quota snapshot invoked an unavailable helper'
+        [[ "$(printf '%s' "$snapshot" | jq -r '.assumed_running')" == true ]] \
+            || fail 'stopping Xray was treated as stopping the billable host'
+    )
+    pass 'quota snapshot projects host usage independently of the engine state'
 }
 
 test_all_config_qr_without_encoder_discards_stale_png() {
@@ -5131,6 +5151,7 @@ test_all_config_qr_without_encoder_discards_stale_png() {
 }
 
 test_all_config_qr_without_encoder_discards_stale_png
+test_quota_snapshot_tracks_host_activity_not_engine_state
 test_all_config_qr_preserves_links_and_usage_without_touching_runtime
 test_xhttp_extra_requires_one_complete_object
 test_deadline_includes_exit_cleanup
