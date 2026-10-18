@@ -215,7 +215,11 @@ class LiveVpnDeviceTest {
             buffer.copyOf(length)
         }
         require(bytes.size <= 16_384) { "Experimental route file is too large" }
-        val experimental = VlessUriParser.parse(bytes.toString(Charsets.UTF_8).trim()).getOrThrow()
+        val experimentalText = bytes.toString(Charsets.UTF_8).trim()
+        require(experimentalText.isNotEmpty()) {
+            "Push an owned VLESS link to /data/local/tmp/g2ray-experimental-route.vless before running"
+        }
+        val experimental = VlessUriParser.parse(experimentalText).getOrThrow()
         val candidates = repository.profiles.value.mapNotNull { stored ->
             VlessUriParser.parse(stored.rawUri).getOrNull()?.takeIf { it.uuid == experimental.uuid }
         }
@@ -225,20 +229,22 @@ class LiveVpnDeviceTest {
         } ?: error("Import a matching direct profile before comparing an experimental route")
         val manager = XrayCoreManager()
         val results = mutableListOf<Pair<String, XrayDelaySummary>>()
-        withContext(Dispatchers.IO) {
-            listOf("direct" to direct, "experimental" to experimental,
-                "experimental" to experimental, "direct" to direct).forEach { (label, profile) ->
-                requirePhysicalNetwork()
-                val result = manager.measureDelaySummary(
-                    profile, context.filesDir.absolutePath, timeoutSeconds = 4,
-                    testUrls = SocksRunningRouteProbe.HEALTH_URLS, sampleCount = 3,
-                    dpiCompatibilityEnabled = settings.dpiCompatibilityEnabled,
-                    checkActive = { coroutineContext.ensureActive() }
-                )
-                results += label to result
-                report("event=experimental_route_comparison route=$label " +
-                    "successful=${result.successfulSamples} total=${result.totalSamples} " +
-                    "median_ms=${result.medianMs} p95_ms=${result.p95Ms}")
+        withTimeout(180_000L) {
+            withContext(Dispatchers.IO) {
+                listOf("direct" to direct, "experimental" to experimental,
+                    "experimental" to experimental, "direct" to direct).forEach { (label, profile) ->
+                    requirePhysicalNetwork()
+                    val result = manager.measureDelaySummary(
+                        profile, context.filesDir.absolutePath, timeoutSeconds = 4,
+                        testUrls = SocksRunningRouteProbe.HEALTH_URLS, sampleCount = 3,
+                        dpiCompatibilityEnabled = settings.dpiCompatibilityEnabled,
+                        checkActive = { coroutineContext.ensureActive() }
+                    )
+                    results += label to result
+                    report("event=experimental_route_comparison route=$label " +
+                        "successful=${result.successfulSamples} total=${result.totalSamples} " +
+                        "median_ms=${result.medianMs} p95_ms=${result.p95Ms}")
+                }
             }
         }
         assertEquals("Route comparison changed the active selection", selection,

@@ -4632,7 +4632,7 @@ test_deadline_startup_wait_is_bounded_if_parent_stalls() {
         local rc=0
         wait "$owner" 2>/dev/null || rc=$?
         [[ "$alive" == false ]] || fail 'deadline startup child exceeded its budget while its parent was stopped'
-        [[ "$rc" == 0 ]] || fail 'resumed deadline parent did not report initialization failure'
+        [[ "$rc" == 0 ]] || fail 'stalled deadline fixture did not observe initialization failure'
         [[ ! -e "$TMP_ROOT/deadline-stalled-must-not-run" ]] || fail 'late startup barrier launched work'
     )
     pass 'deadline startup barrier stays bounded while its parent is stopped'
