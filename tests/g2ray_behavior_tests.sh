@@ -4553,6 +4553,91 @@ test_deadline_fails_closed_without_a_clock() {
     pass 'deadline clock initialization failure never runs an unbounded task'
 }
 
+test_deadline_startup_wait_stops_after_parent_dies() {
+    (
+        reset_runtime_paths
+        local child_file="$TMP_ROOT/deadline-startup-child" owner child alive=true attempt
+        (
+            kill() {
+                if [[ "${1:-}" == -0 && "${2:-}" == -- ]]; then
+                    builtin printf '%s\n' "${3#-}" > "$child_file"
+                    builtin kill -STOP "$BASHPID"
+                fi
+                builtin kill "$@"
+            }
+            run_with_deadline 10 touch "$TMP_ROOT/deadline-orphan-must-not-run"
+        ) &
+        owner=$!
+        for attempt in {1..100}; do
+            [[ -s "$child_file" ]] && break
+            sleep 0.02
+        done
+        child=$(cat "$child_file" 2>/dev/null || true)
+        if [[ ! "$child" =~ ^[0-9]+$ ]]; then
+            builtin kill -KILL "$owner" 2>/dev/null || true
+            wait "$owner" 2>/dev/null || true
+            fail 'deadline startup fixture did not reach the parent barrier'
+        fi
+        builtin kill -KILL "$owner" 2>/dev/null || true
+        wait "$owner" 2>/dev/null || true
+        for attempt in {1..100}; do
+            if ! builtin kill -0 "$child" 2>/dev/null ||
+                [[ "$(ps -o stat= -p "$child" 2>/dev/null)" == Z* ]]; then
+                alive=false
+                break
+            fi
+            sleep 0.02
+        done
+        builtin kill -KILL -- "-$child" 2>/dev/null || true
+        [[ "$alive" == false ]] || fail 'deadline startup child kept spinning after its parent died'
+        [[ ! -e "$TMP_ROOT/deadline-orphan-must-not-run" ]] || fail 'orphaned deadline child launched work'
+    )
+    pass 'deadline startup barrier exits when its parent dies without launching work'
+}
+
+test_deadline_startup_wait_is_bounded_if_parent_stalls() {
+    (
+        reset_runtime_paths
+        local child_file="$TMP_ROOT/deadline-stalled-child" owner child alive=true attempt
+        (
+            kill() {
+                if [[ "${1:-}" == -0 && "${2:-}" == -- ]]; then
+                    builtin printf '%s\n' "${3#-}" > "$child_file"
+                    builtin kill -STOP "$BASHPID"
+                fi
+                builtin kill "$@"
+            }
+            local rc=0
+            run_with_deadline 1 touch "$TMP_ROOT/deadline-stalled-must-not-run" || rc=$?
+            [[ "$rc" != 0 ]] || fail 'stalled deadline initialization reported success'
+        ) &
+        owner=$!
+        for attempt in {1..100}; do
+            [[ -s "$child_file" ]] && break
+            sleep 0.02
+        done
+        child=$(cat "$child_file" 2>/dev/null || true)
+        if [[ ! "$child" =~ ^[0-9]+$ ]]; then
+            builtin kill -KILL "$owner" 2>/dev/null || true
+            wait "$owner" 2>/dev/null || true
+            fail 'stalled deadline fixture did not reach the parent barrier'
+        fi
+        sleep 1.3
+        if ! builtin kill -0 "$child" 2>/dev/null ||
+            [[ "$(ps -o stat= -p "$child" 2>/dev/null)" == Z* ]]; then
+            alive=false
+        fi
+        builtin kill -KILL -- "-$child" 2>/dev/null || true
+        builtin kill -CONT "$owner" 2>/dev/null || true
+        local rc=0
+        wait "$owner" 2>/dev/null || rc=$?
+        [[ "$alive" == false ]] || fail 'deadline startup child exceeded its budget while its parent was stopped'
+        [[ "$rc" == 0 ]] || fail 'resumed deadline parent did not report initialization failure'
+        [[ ! -e "$TMP_ROOT/deadline-stalled-must-not-run" ]] || fail 'late startup barrier launched work'
+    )
+    pass 'deadline startup barrier stays bounded while its parent is stopped'
+}
+
 test_deadline_rejects_unverified_process_group() {
     (
         reset_runtime_paths
@@ -5168,6 +5253,8 @@ test_deadline_includes_exit_cleanup
 test_deadline_preserves_status_without_a_status_write
 test_deadline_uses_completion_time_when_parent_is_delayed
 test_deadline_fails_closed_without_a_clock
+test_deadline_startup_wait_stops_after_parent_dies
+test_deadline_startup_wait_is_bounded_if_parent_stalls
 test_degraded_probe_keeps_healthy_baseline_at_threshold
 test_optional_legacy_bundle_failure_preserves_current_exports
 test_codespace_bundle_rejects_missing_or_empty_links

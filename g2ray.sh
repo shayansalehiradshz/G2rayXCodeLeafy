@@ -705,7 +705,7 @@ deadline_time_us() {
 
 run_with_deadline() {
     local seconds="${1:-30}" pid waited_ticks=0 max_ticks status=0 status_file command_name monitor_was_enabled=false
-    local start_us now_us completed_us budget_us
+    local start_us now_us completed_us budget_us startup_ticks=0 owner_pid="${BASHPID:-$$}"
     shift || return 1
     [[ "$seconds" =~ ^[0-9]+$ && "$seconds" -gt 0 ]] || seconds=30
     max_ticks=$((seconds * 10))
@@ -727,8 +727,17 @@ run_with_deadline() {
     (
         set +m
         set +e
-        # Do not launch work before the parent verifies our isolated group.
-        while [[ ! -s "$status_file" ]]; do sleep 0.01; done
+        # The startup barrier must also end if its parent dies or stalls.
+        while :; do
+            if ! builtin kill -0 "$owner_pid" 2>/dev/null ||
+                ! deadline_time_us now_us ||
+                (( now_us < start_us || now_us - start_us >= budget_us || startup_ticks >= max_ticks * 10 )); then
+                exit 125
+            fi
+            [[ -s "$status_file" ]] && break
+            sleep 0.01
+            startup_ticks=$((startup_ticks + 1))
+        done
         # Command-local EXIT traps must finish before recording completion.
         ( "$@" )
         status=$?

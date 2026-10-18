@@ -42,6 +42,7 @@ import com.g2ray.client.network.GitHubCodespaceCoordinator
 import com.g2ray.client.network.GitHubNetwork
 import com.g2ray.client.network.WorkerNetwork
 import com.g2ray.client.network.WorkerRouteCoordinator
+import com.g2ray.client.parser.VlessUriParser
 import java.io.ByteArrayInputStream
 import java.io.IOException
 import java.io.InputStream
@@ -176,6 +177,79 @@ class LiveVpnDeviceTest {
         } finally {
             instrumentation.runOnMainSync { owner.viewModelStore.clear() }
         }
+    }
+
+    @Test
+    fun experimentalRouteComparedWithoutChangingSavedConfiguration() = runBlocking {
+        val args = InstrumentationRegistry.getArguments()
+        assumeTrue("Experimental routes require -e liveExperimentalRoute true",
+            args.getString("liveExperimentalRoute") == "true")
+        val context = ApplicationProvider.getApplicationContext<G2RayApplication>()
+        val repository = context.accountRepository
+        assertTrue("Saved data failed to load", repository.loadError.value == null)
+        val connectivity = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        fun requirePhysicalNetwork() {
+            val capabilities = connectivity.getNetworkCapabilities(connectivity.activeNetwork)
+            assertTrue("A working physical network is required",
+                capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true)
+            assertFalse("Stop VPN before comparing physical routes",
+                capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true)
+        }
+        requirePhysicalNetwork()
+        val selection = repository.activeSelection.value
+        val settings = VpnEnginePreferences(context.secureStore).readSettings()
+        // A shell-readable test file avoids placing the VLESS credential in
+        // instrumentation arguments, logcat, or the saved profile repository.
+        val bytes = ParcelFileDescriptor.AutoCloseInputStream(
+            InstrumentationRegistry.getInstrumentation().uiAutomation.executeShellCommand(
+                "cat /data/local/tmp/g2ray-experimental-route.vless"
+            )
+        ).use { input ->
+            val buffer = ByteArray(16_385)
+            var length = 0
+            while (length < buffer.size) {
+                val count = input.read(buffer, length, buffer.size - length)
+                if (count < 0) break
+                length += count
+            }
+            buffer.copyOf(length)
+        }
+        require(bytes.size <= 16_384) { "Experimental route file is too large" }
+        val experimental = VlessUriParser.parse(bytes.toString(Charsets.UTF_8).trim()).getOrThrow()
+        val candidates = repository.profiles.value.mapNotNull { stored ->
+            VlessUriParser.parse(stored.rawUri).getOrNull()?.takeIf { it.uuid == experimental.uuid }
+        }
+        val direct = candidates.firstOrNull {
+            it.transport == experimental.transport && it.alpn == experimental.alpn &&
+                it.address != experimental.address
+        } ?: error("Import a matching direct profile before comparing an experimental route")
+        val manager = XrayCoreManager()
+        val results = mutableListOf<Pair<String, XrayDelaySummary>>()
+        withContext(Dispatchers.IO) {
+            listOf("direct" to direct, "experimental" to experimental,
+                "experimental" to experimental, "direct" to direct).forEach { (label, profile) ->
+                requirePhysicalNetwork()
+                val result = manager.measureDelaySummary(
+                    profile, context.filesDir.absolutePath, timeoutSeconds = 4,
+                    testUrls = SocksRunningRouteProbe.HEALTH_URLS, sampleCount = 3,
+                    dpiCompatibilityEnabled = settings.dpiCompatibilityEnabled,
+                    checkActive = { coroutineContext.ensureActive() }
+                )
+                results += label to result
+                report("event=experimental_route_comparison route=$label " +
+                    "successful=${result.successfulSamples} total=${result.totalSamples} " +
+                    "median_ms=${result.medianMs} p95_ms=${result.p95Ms}")
+            }
+        }
+        assertEquals("Route comparison changed the active selection", selection,
+            repository.activeSelection.value)
+        assertEquals("Route comparison changed settings", settings,
+            VpnEnginePreferences(context.secureStore).readSettings())
+        assertFalse("Route comparison left a core running", ReflectionXrayBridge().getState())
+        assertTrue("A direct comparison round failed its health quorum",
+            results.filter { it.first == "direct" }.all { it.second.successfulSamples >= 2 })
+        assertTrue("The experimental route failed its health quorum on the phone",
+            results.filter { it.first == "experimental" }.all { it.second.successfulSamples >= 2 })
     }
 
     @Test
@@ -499,10 +573,11 @@ class LiveVpnDeviceTest {
             }
             val connected = withTimeout(180_000L) {
                 VpnStateRepository.state.first {
-                    (it.tunnelState == TunnelState.Connected && it.tunnelVerified) || it.tunnelState == TunnelState.Error
+                    (it.tunnelState == TunnelState.Connected && it.tunnelVerified) ||
+                        it.tunnelState in setOf(TunnelState.Error, TunnelState.Blocked)
                 }
             }
-            assertEquals("Tunnel failed to verify", TunnelState.Connected, connected.tunnelState)
+            assertEquals("Tunnel failed to verify: ${connected.message}", TunnelState.Connected, connected.tunnelState)
             val expectedEngine = if (mode == VpnEngineMode.XrayNative) ActiveVpnEngine.XrayNative else ActiveVpnEngine.Hev
             assertEquals("The requested engine was not exercised", expectedEngine, connected.activeVpnEngine)
             report("engine=${mode.storageValue} transport=${profile!!.transport} ui_start=$uiStart " +
@@ -704,10 +779,11 @@ class LiveVpnDeviceTest {
                 val reconnected = withTimeout(180_000L) {
                     VpnStateRepository.state.first {
                         (it.tunnelState == TunnelState.Connected && it.tunnelVerified) ||
-                            it.tunnelState == TunnelState.Error
+                            it.tunnelState in setOf(TunnelState.Error, TunnelState.Blocked)
                     }
                 }
-                assertEquals("Core failure $cycle did not recover", TunnelState.Connected, reconnected.tunnelState)
+                assertEquals("Core failure $cycle did not recover: ${reconnected.message}",
+                    TunnelState.Connected, reconnected.tunnelState)
                 client.connectionPool.evictAll()
                 assertResponsiveQuorum(probeHttpsQuorum(client, "core_recovery_$cycle"), "core_recovery_$cycle")
                 report("event=core_recovery_verified cycle=$cycle " +
@@ -758,10 +834,11 @@ class LiveVpnDeviceTest {
                     "elapsed_ms=${restoredAt - startedAt}")
                 val recovered = withTimeout(90_000L) {
                     VpnStateRepository.state.first {
-                        (it.tunnelState == TunnelState.Connected && it.tunnelVerified) || it.tunnelState == TunnelState.Error
+                        (it.tunnelState == TunnelState.Connected && it.tunnelVerified) ||
+                            it.tunnelState in setOf(TunnelState.Error, TunnelState.Blocked)
                     }
                 }
-                assertEquals("VPN did not recover automatically after the LTE outage",
+                assertEquals("VPN did not recover automatically after the LTE outage: ${recovered.message}",
                     TunnelState.Connected, recovered.tunnelState)
                 report("event=physical_network_tunnel_verified " +
                     "after_network_return_ms=${SystemClock.elapsedRealtime() - restoredAt}")

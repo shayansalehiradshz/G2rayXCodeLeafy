@@ -66,7 +66,11 @@ transfer must work before calling the new route usable.
 
 This does not need the Enterprise Host-override feature above because the
 connector reaches Xray locally. It adds a separate `cloudflared` process to the
-Codespace. It has **not** been installed or accepted on this project.
+Codespace; the project does not automatically install or supervise it. An isolated
+deployment on 18 October passed server-side authenticated transport checks, but
+failed both three-probe rounds on the owner's phone while direct comparison
+rounds passed. It was not made a default or added to startup. See the
+[claim review and phone results](REVIEW_AND_PHONE_CHECK_2026-10-18.md).
 
 1. In Cloudflare, open **Networking > Tunnels**, create a named tunnel, and
    choose the Codespace's Linux architecture. Install `cloudflared` from the

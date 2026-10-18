@@ -771,6 +771,26 @@ get a fresh route proof instead of an unnecessary restart.
 
 ## v2rayNG A/B comparison
 
+### Separate experimental entrance
+
+With VPN stopped, push an owned test VLESS link to
+`/data/local/tmp/g2ray-experimental-route.vless` and run
+`LiveVpnDeviceTest#experimentalRouteComparedWithoutChangingSavedConfiguration`
+with `-e liveExperimentalRoute true`. Do not place the link in instrumentation
+arguments or publish the input file. The test requires a saved direct profile
+with the same UUID, transport, and ALPN. It runs direct/experimental/experimental/
+direct three-endpoint samples through the packaged native core on the physical
+network, then verifies that selection/settings did not change and no probe core
+remains. Each round must pass at least two endpoints. No imported profile,
+fallback, or existing VPN can silently substitute for the experimental route.
+These are short authenticated route checks, not full-device TUN, throughput,
+video, long-session, or universal speed acceptance.
+
+Live startup/recovery waits treat both Error and Blocked as terminal failures
+and include the service's reason in the assertion. A billing/configuration block
+must not be hidden behind the generic 180-second test timeout or counted as a
+completed transfer/video workload.
+
 For the browsing-first route-selection revision, also follow
 [the responsiveness review](RESPONSIVENESS_REVIEW_2026-10-17.md). Confirm that
 the optimizer uses repeated finalist samples, does not replace a stable route
