@@ -853,7 +853,8 @@ class XrayCoreManager : TunnelCore {
         fakeDnsEnabled: Boolean = false,
         ipv4Only: Boolean = false,
         dpiCompatibilityEnabled: Boolean = false,
-        fallbackProfiles: List<G2RayProfile> = emptyList()
+        fallbackProfiles: List<G2RayProfile> = emptyList(),
+        routingPolicy: RoutingPolicy = RoutingPolicy()
     ) {
         startupRetryAllowed = true
         if (!bridge.isAvailable()) {
@@ -905,7 +906,8 @@ class XrayCoreManager : TunnelCore {
                     ipv4Only = ipv4Only,
                     dpiCompatibilityEnabled = dpiCompatibilityEnabled,
                     tunFd = tunFd.takeIf { engine == ActiveVpnEngine.XrayNative },
-                    fallbackProfiles = fallbackProfiles
+                    fallbackProfiles = fallbackProfiles,
+                    routingPolicy = routingPolicy
                 )
                 val request = bridge.newRunFromJsonRequest(datDir, configJson)
                 val nativeStartedAt = SystemClock.elapsedRealtime()

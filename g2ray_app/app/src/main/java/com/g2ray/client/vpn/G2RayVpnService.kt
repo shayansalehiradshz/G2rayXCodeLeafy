@@ -240,6 +240,7 @@ class G2RayVpnService : VpnService() {
     private var ipv4Only = false
     private var dpiCompatibilityEnabled = false
     private var seamlessFailoverEnabled = true
+    private var routingPolicy = RoutingPolicy()
     private var activeEngine: ActiveVpnEngine? = null
     private var hevTunnelRunning = false
     private val sessionProfileHealth = mutableMapOf<String, SessionProfileHealth>()
@@ -1136,6 +1137,8 @@ class G2RayVpnService : VpnService() {
                     }
                     // Hold capture before settings, native ownership or wake
                     // waits; a failed connection must not select a direct exit.
+                    if (vpnInterface == null) routingPolicy = RoutingPolicy()
+                    val captureExclusions = routingPolicy.excludedPackages
                     var tun = vpnInterface ?: installTunInterface(lifecycleToken)
                     registerUnderlyingNetworkMonitor()
                     val captureWasIpv4Only = vpnInterfaceIpv4Only ?: ipv4Only
@@ -1145,7 +1148,8 @@ class G2RayVpnService : VpnService() {
                     ipv4Only = vpnPreferences.isIpv4OnlyEnabled()
                     dpiCompatibilityEnabled = vpnPreferences.isDpiCompatibilityEnabled()
                     seamlessFailoverEnabled = vpnPreferences.isSeamlessFailoverEnabled()
-                    if (captureWasIpv4Only != ipv4Only) {
+                    routingPolicy = vpnPreferences.getRoutingPolicy()
+                    if (captureWasIpv4Only != ipv4Only || captureExclusions != routingPolicy.excludedPackages) {
                         tun = installTunInterface(lifecycleToken)
                     }
                     // Stop clears the old session cache, not saved profiles.
@@ -1318,6 +1322,10 @@ class G2RayVpnService : VpnService() {
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             runCatching { builder.setMetered(false) }
+        }
+        routingPolicy.excludedPackages.filter { it != packageName }.forEach { excluded ->
+            try { builder.addDisallowedApplication(excluded) }
+            catch (_: android.content.pm.PackageManager.NameNotFoundException) { /* App was uninstalled. */ }
         }
         return builder.establish()
     }
@@ -1934,7 +1942,8 @@ class G2RayVpnService : VpnService() {
             fakeDnsEnabled = fastDnsEnabled,
             ipv4Only = ipv4Only,
             dpiCompatibilityEnabled = dpiCompatibilityEnabled,
-            fallbackProfiles = runtimeProfiles.drop(1)
+            fallbackProfiles = runtimeProfiles.drop(1),
+            routingPolicy = routingPolicy
         )
         logStartupPhase("core_start", engine, coreStartedAt, core.state.value == TunnelCoreState.Connected)
         if (!isTunnelCurrent(lifecycleToken, tun)) {
@@ -2460,6 +2469,9 @@ class G2RayVpnService : VpnService() {
         }
         when (outcome) {
             is CodespaceWakeOutcome.Ready -> {
+                activeAccountId?.let { id ->
+                    runCatching { com.g2ray.client.data.QuotaEstimateStore(secureStore).clearConfirmedBlock(id) }
+                }
                 val keyId = when (outcome.backend) {
                     WakeControlBackend.WORKER -> wake.workerApiKeyId
                     WakeControlBackend.GITHUB_DIRECT -> wake.githubApiKeyId
@@ -2479,6 +2491,11 @@ class G2RayVpnService : VpnService() {
                 }
             }
             is CodespaceWakeOutcome.Failed -> {
+                if (outcome.httpCode == 402 || outcome.workerResponse?.quota_blocked == true) {
+                    activeAccountId?.let { id ->
+                        runCatching { com.g2ray.client.data.QuotaEstimateStore(secureStore).recordConfirmedBlock(id) }
+                    }
+                }
                 if (outcome.retryAllowed) retryCooldown.record(outcome.retryAfterMs)
                 if (outcome.controlPlaneUnavailable) {
                     val alternative = tryAlternativeStoredProfiles(profile, tun, lifecycleToken)
@@ -3148,16 +3165,20 @@ class G2RayVpnService : VpnService() {
         val pendingIntent = PendingIntent.getActivity(
             this,
             0,
-            Intent(this, MainActivity::class.java),
+            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
+        val stopIntent = if (systemAlwaysOnEnabled() == true) pendingIntent else PendingIntent.getService(
+            this, 1, Intent(this, G2RayVpnService::class.java).setAction(ACTION_STOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_menu_compass)
+            .setSmallIcon(com.g2ray.client.R.drawable.ic_vpn_notification)
             .setContentTitle("G2Ray VPN")
             .setContentText(status)
             .setStyle(NotificationCompat.BigTextStyle().bigText(status))
             .setContentIntent(pendingIntent)
+            .addAction(0, if (systemAlwaysOnEnabled() == true) "Manage VPN" else "Disconnect", stopIntent)
             .setOngoing(true)
             .build()
     }

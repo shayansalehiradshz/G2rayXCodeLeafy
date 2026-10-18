@@ -79,7 +79,8 @@ object XrayConfigBuilder {
         ipv4Only: Boolean = false,
         dpiCompatibilityEnabled: Boolean = false,
         tunFd: Int? = null,
-        fallbackProfiles: List<G2RayProfile> = emptyList()
+        fallbackProfiles: List<G2RayProfile> = emptyList(),
+        routingPolicy: RoutingPolicy = RoutingPolicy()
     ): String {
         require(healthSocksPort in 1..65535) { "Health SOCKS port must be valid" }
         val root = JSONObject()
@@ -116,14 +117,15 @@ object XrayConfigBuilder {
         }
         root.put("inbounds", JSONArray().apply {
             if (engine == ActiveVpnEngine.XrayNative) {
-                put(buildTunInbound(fakeDnsEnabled, ipv4Only))
+                put(buildTunInbound(fakeDnsEnabled, ipv4Only, routingPolicy.hasDomainBypass))
             }
             put(buildSocksInbound(
                 port = healthSocksPort,
                 tag = localInboundTag,
                 udp = engine == ActiveVpnEngine.Hev,
                 sniffTraffic = engine == ActiveVpnEngine.Hev,
-                fakeDnsEnabled = fakeDnsEnabled
+                fakeDnsEnabled = fakeDnsEnabled,
+                domainBypassEnabled = routingPolicy.hasDomainBypass
             ))
         })
 
@@ -139,8 +141,12 @@ object XrayConfigBuilder {
                     })
                 })
             }
-            // There is deliberately no direct/freedom outbound in a VPN
-            // configuration, including as a future fallback target.
+            // Direct egress exists only for explicitly opted-in domain bypass.
+            if (routingPolicy.hasDomainBypass) put(JSONObject().apply {
+                put("tag", "bypass")
+                put("protocol", "freedom")
+                put("settings", JSONObject().put("domainStrategy", "UseIPv4"))
+            })
             put(JSONObject().apply {
                 put("tag", "block")
                 put("protocol", "blackhole")
@@ -193,6 +199,15 @@ object XrayConfigBuilder {
                     put("type", "field")
                     put("inboundTag", JSONArray().put(DNS_INBOUND_TAG))
                     putProxyTarget(balancedRoutes)
+                })
+                if (routingPolicy.hasDomainBypass) put(JSONObject().apply {
+                    put("type", "field")
+                    put("inboundTag", dnsIngressTags)
+                    put("domain", JSONArray().apply {
+                        if (routingPolicy.bypassIranianDomains) put("domain:ir")
+                        routingPolicy.bypassDomains.forEach { put("domain:$it") }
+                    })
+                    put("outboundTag", "bypass")
                 })
                 // Codespaces XHTTP is a TCP-oriented path. Force browser QUIC
                 // to fall back to the same TCP transport used by the server.
@@ -302,7 +317,7 @@ object XrayConfigBuilder {
         }
     }
 
-    private fun buildTunInbound(fakeDnsEnabled: Boolean, ipv4Only: Boolean): JSONObject {
+    private fun buildTunInbound(fakeDnsEnabled: Boolean, ipv4Only: Boolean, domainBypassEnabled: Boolean = false): JSONObject {
         return JSONObject().apply {
             put("tag", "tun-in")
             put("port", 0)
@@ -321,7 +336,7 @@ object XrayConfigBuilder {
                     put("8.8.8.8")
                 })
             })
-            put("sniffing", buildSniffing(fakeDnsEnabled))
+            put("sniffing", buildSniffing(fakeDnsEnabled, domainBypassEnabled))
         }
     }
 
@@ -330,7 +345,8 @@ object XrayConfigBuilder {
         tag: String,
         udp: Boolean,
         sniffTraffic: Boolean = false,
-        fakeDnsEnabled: Boolean = false
+        fakeDnsEnabled: Boolean = false,
+        domainBypassEnabled: Boolean = false
     ): JSONObject {
         return JSONObject().apply {
             put("tag", tag)
@@ -341,23 +357,24 @@ object XrayConfigBuilder {
                 put("udp", udp)
             })
             if (sniffTraffic) {
-                put("sniffing", buildSniffing(fakeDnsEnabled))
+                put("sniffing", buildSniffing(fakeDnsEnabled, domainBypassEnabled))
             }
         }
     }
 
-    private fun buildSniffing(fakeDnsEnabled: Boolean): JSONObject {
+    private fun buildSniffing(fakeDnsEnabled: Boolean, domainBypassEnabled: Boolean = false): JSONObject {
         return JSONObject().apply {
-            put("enabled", fakeDnsEnabled)
+            put("enabled", fakeDnsEnabled || domainBypassEnabled)
             put("destOverride", JSONArray().apply {
                 if (fakeDnsEnabled) {
                     put("fakedns")
                 }
+                if (domainBypassEnabled) { put("http"); put("tls") }
             })
             // Fake-IP metadata is recovered without reading application content.
             // The pinned core still replaces FakeDNS destinations in route-only mode.
             put("routeOnly", true)
-            put("metadataOnly", true)
+            put("metadataOnly", !domainBypassEnabled)
         }
     }
 

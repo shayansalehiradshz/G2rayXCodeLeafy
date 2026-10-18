@@ -53,6 +53,134 @@ import java.util.concurrent.atomic.AtomicBoolean
 @Config(application = G2RayApplication::class, sdk = [31])
 class SavedDataRecoveryViewModelTest {
     @Test
+    fun codespaceSwitchWithoutConfigsLeavesTheWorkingSessionAlone() {
+        val repository = repositoryWithProfile()
+        val empty = repository.addAccount("Empty", "", "empty-space")
+        val selection = repository.activeSelection.value
+        withViewModel(repository, InMemorySecureStore()) { viewModel, application ->
+            val services = org.robolectric.Shadows.shadowOf(application)
+            services.clearStartedServices()
+            VpnStateRepository.state.value = VpnStateRepository.state.value.copy(tunnelState = TunnelState.Connected, tunnelVerified = true)
+            viewModel.connectToAccount(empty.id)
+            assertEquals(selection, repository.activeSelection.value)
+            assertEquals(TunnelState.Connected, VpnStateRepository.state.value.tunnelState)
+            assertTrue(VpnStateRepository.state.value.tunnelVerified)
+            assertTrue(viewModel.statusMessage.value.contains("Import at least one config"))
+            assertNull(services.nextStartedService)
+        }
+    }
+
+    @Test
+    fun codespaceSwitchHonorsAndroidAlwaysOnWithoutStoppingOrChangingAccounts() {
+        val repository = repositoryWithProfile()
+        val second = repository.addAccount("Second", "", "second-space")
+        val source = repository.profiles.value.first()
+        val parsed = VlessUriParser.parseFirstProfile(source.rawUri).getOrThrow()
+        repository.importProfile(second.id, parsed.name, parsed.rawUri, parsed)
+        val selection = repository.activeSelection.value
+        withViewModel(repository, InMemorySecureStore()) { viewModel, application ->
+            val services = org.robolectric.Shadows.shadowOf(application)
+            services.clearStartedServices()
+            VpnStateRepository.state.value = VpnStateRepository.state.value.copy(tunnelState = TunnelState.Connected, alwaysOnVpn = true)
+            viewModel.connectToAccount(second.id)
+            assertEquals(selection, repository.activeSelection.value)
+            assertEquals(TunnelState.Connected, VpnStateRepository.state.value.tunnelState)
+            assertTrue(viewModel.statusMessage.value.contains("always-on"))
+            assertNull(services.nextStartedService)
+        }
+    }
+
+    @Test
+    fun stoppedCodespaceSwitchStartsTheNewStoredSelectionWithoutDeletingTheOldOne() {
+        val repository = repositoryWithProfile()
+        val first = repository.activeSelection.value
+        val second = repository.addAccount("Second", "", "second-space")
+        val parsed = VlessUriParser.parseFirstProfile(repository.profiles.value.first().rawUri.replace("fixture.example", "second.example")).getOrThrow()
+        val imported = repository.importProfile(second.id, parsed.name, parsed.rawUri, parsed)
+        withViewModel(repository, InMemorySecureStore()) { viewModel, application ->
+            val services = org.robolectric.Shadows.shadowOf(application)
+            services.clearStartedServices()
+            @Suppress("UNCHECKED_CAST")
+            val availability = G2RayViewModel::class.java.getDeclaredField("_isVpnCoreAvailable")
+                .apply { isAccessible = true }.get(viewModel) as MutableStateFlow<Boolean>
+            availability.value = true
+            viewModel.connectToAccount(second.id)
+            val job = G2RayViewModel::class.java.getDeclaredField("accountSwitchJob")
+                .apply { isAccessible = true }.get(viewModel) as kotlinx.coroutines.Job
+            runBlocking { withTimeout(10_000L) { job.join() } }
+            val started = services.nextStartedService
+            assertEquals(G2RayVpnService.ACTION_START, started?.action)
+            assertEquals(second.id, started?.getStringExtra(G2RayVpnService.EXTRA_ACCOUNT_ID))
+            assertEquals(parsed.rawUri, started?.getStringExtra(G2RayVpnService.EXTRA_RAW_PROFILE_URI))
+            assertEquals(imported.id, repository.activeSelection.value.profileId)
+            assertEquals(second.id, repository.activeSelection.value.accountId)
+            assertTrue(repository.profiles.value.any { it.id == first.profileId })
+            assertEquals(2, repository.accounts.value.size)
+            assertNull(services.nextStartedService)
+        }
+    }
+
+    @Test
+    fun runningCodespaceSwitchWaitsForStopBeforeSelectingAndStartingTheReplacement() {
+        val repository = repositoryWithProfile()
+        val first = repository.activeSelection.value
+        val second = repository.addAccount("Second", "", "second-space")
+        val parsed = VlessUriParser.parseFirstProfile(repository.profiles.value.first().rawUri.replace("fixture.example", "second.example")).getOrThrow()
+        repository.importProfile(second.id, parsed.name, parsed.rawUri, parsed)
+        withViewModel(repository, InMemorySecureStore()) { viewModel, application ->
+            val services = org.robolectric.Shadows.shadowOf(application)
+            services.clearStartedServices()
+            @Suppress("UNCHECKED_CAST")
+            val availability = G2RayViewModel::class.java.getDeclaredField("_isVpnCoreAvailable")
+                .apply { isAccessible = true }.get(viewModel) as MutableStateFlow<Boolean>
+            availability.value = true
+            VpnStateRepository.state.value = VpnStateRepository.state.value.copy(tunnelState = TunnelState.Connected)
+            viewModel.connectToAccount(second.id)
+            assertEquals(G2RayVpnService.ACTION_STOP, services.nextStartedService?.action)
+            assertEquals(first, repository.activeSelection.value)
+            assertNull(services.nextStartedService)
+            val competingStart = RecordingServiceContext(application)
+            viewModel.startVpn(competingStart)
+            assertEquals(0, competingStart.starts)
+            VpnStateRepository.state.value = VpnStateRepository.state.value.copy(tunnelState = TunnelState.Disconnected)
+            val job = G2RayViewModel::class.java.getDeclaredField("accountSwitchJob")
+                .apply { isAccessible = true }.get(viewModel) as kotlinx.coroutines.Job
+            runBlocking { withTimeout(10_000L) { job.join() } }
+            assertEquals(second.id, repository.activeSelection.value.accountId)
+            val replacement = services.nextStartedService
+            assertEquals(G2RayVpnService.ACTION_START, replacement?.action)
+            assertEquals(second.id, replacement?.getStringExtra(G2RayVpnService.EXTRA_ACCOUNT_ID))
+            assertEquals(parsed.rawUri, replacement?.getStringExtra(G2RayVpnService.EXTRA_RAW_PROFILE_URI))
+        }
+    }
+
+    @Test
+    fun manualStopCancelsAPendingCodespaceSwitchWithoutRestarting() {
+        val repository = repositoryWithProfile()
+        val first = repository.activeSelection.value
+        val second = repository.addAccount("Second", "", "second-space")
+        val parsed = VlessUriParser.parseFirstProfile(repository.profiles.value.first().rawUri).getOrThrow()
+        repository.importProfile(second.id, parsed.name, parsed.rawUri, parsed)
+        withViewModel(repository, InMemorySecureStore()) { viewModel, application ->
+            val services = org.robolectric.Shadows.shadowOf(application)
+            services.clearStartedServices()
+            VpnStateRepository.state.value = VpnStateRepository.state.value.copy(tunnelState = TunnelState.Connected)
+            viewModel.connectToAccount(second.id)
+            assertEquals(G2RayVpnService.ACTION_STOP, services.nextStartedService?.action)
+            val stop = RecordingServiceContext(application)
+            viewModel.stopVpn(stop)
+            VpnStateRepository.state.value = VpnStateRepository.state.value.copy(tunnelState = TunnelState.Disconnected)
+            val job = G2RayViewModel::class.java.getDeclaredField("accountSwitchJob")
+                .apply { isAccessible = true }.get(viewModel) as kotlinx.coroutines.Job
+            runBlocking { withTimeout(10_000L) { job.join() } }
+            assertTrue(job.isCancelled)
+            assertEquals(first, repository.activeSelection.value)
+            assertEquals(G2RayVpnService.ACTION_STOP, stop.startedIntent?.action)
+            assertNull(services.nextStartedService)
+        }
+    }
+
+    @Test
     fun duplicateStartCannotReplaceAConnectedStateWhenUiCoreAvailabilityIsStale() {
         withViewModel(repositoryWithProfile(), InMemorySecureStore()) { viewModel, application ->
             @Suppress("UNCHECKED_CAST")
@@ -497,6 +625,7 @@ class SavedDataRecoveryViewModelTest {
             viewModel.startVpn(context)
 
             assertEquals(G2RayVpnService.ACTION_START, context.startedIntent?.action)
+            assertEquals("VPN start requested.", viewModel.statusMessage.value)
             assertEquals(selected.accountId, context.startedIntent?.getStringExtra(G2RayVpnService.EXTRA_ACCOUNT_ID))
             assertEquals(expected.rawUri, context.startedIntent?.getStringExtra(G2RayVpnService.EXTRA_RAW_PROFILE_URI))
             assertEquals(selected, repository.activeSelection.value)

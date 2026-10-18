@@ -7,6 +7,14 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
 
     <application
         android:name=".G2RayApplication"
@@ -21,6 +29,7 @@
 
         <activity
             android:name=".MainActivity"
+            android:theme="@android:style/Theme.Material.NoActionBar"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -28,6 +37,14 @@
             </intent-filter>
         </activity>
 
+        <service
+            android:name=".vpn.VpnTileService"
+            android:label="G2Ray VPN"
+            android:icon="@drawable/ic_vpn_notification"
+            android:exported="true"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter><action android:name="android.service.quicksettings.action.QS_TILE" /></intent-filter>
+        </service>
         <service
             android:name=".vpn.G2RayVpnService"
             android:permission="android.permission.BIND_VPN_SERVICE"

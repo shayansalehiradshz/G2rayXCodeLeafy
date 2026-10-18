@@ -38,6 +38,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.*
@@ -177,6 +178,82 @@ class G2RayViewModel internal constructor(
         initialSettings.seamlessFailoverEnabled
     )
     val seamlessFailoverEnabled: StateFlow<Boolean> = _seamlessFailoverEnabled.asStateFlow()
+    private val _routingPolicy = MutableStateFlow(initialSettings.routingPolicy)
+    val routingPolicy = _routingPolicy.asStateFlow()
+    private val _diagnosticsEnabled = MutableStateFlow(initialSettings.diagnosticsEnabled)
+    val diagnosticsEnabled = _diagnosticsEnabled.asStateFlow()
+    internal val quotaEstimates = com.g2ray.client.data.QuotaEstimateStore((application as G2RayApplication).secureStore)
+    private var accountSwitchJob: Job? = null
+    internal fun saveQuotaFromBundle(accountId: String, input: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val bundle = org.json.JSONObject(com.g2ray.client.parser.ConfigImportPayload.expand(input))
+                val expected = accounts.value.firstOrNull { it.id == accountId }?.codespaceName ?: return@runCatching
+                if (bundle.optString("codespace_name") != expected) return@runCatching
+                val quota = bundle.optJSONObject("quota_estimate") ?: return@runCatching
+                quotaEstimates.save(accountId, com.g2ray.client.data.QuotaEstimateStore.fromJson(quota))
+            }
+        }
+    }
+
+    fun saveRoutingPolicy(policy: com.g2ray.client.vpn.RoutingPolicy, onResult: (Result<Unit>) -> Unit) {
+        if (!configurationMutationAllowedNow()) {
+            onResult(Result.failure(IllegalStateException("Disconnect VPN and wait for route tests before changing bypass rules.")))
+            return
+        }
+        require(policy.excludedPackages.none { it == getApplication<Application>().packageName }) { "The VPN app cannot exclude itself" }
+        launchConfigurationMutation("save routing", { vpnEnginePreferences.setRoutingPolicy(policy) }) { result ->
+            result.onSuccess { _routingPolicy.value = policy; _statusMessage.value = "Routing saved for the next connection." }
+            onResult(result)
+        }
+    }
+
+    fun setDiagnosticsEnabled(enabled: Boolean) {
+        launchConfigurationMutation("save diagnostics", { vpnEnginePreferences.setDiagnosticsEnabled(enabled) }) { result ->
+            result.onSuccess {
+                _diagnosticsEnabled.value = enabled
+                com.g2ray.client.vpn.DiagnosticEvents.setEnabled(enabled)
+                _statusMessage.value = if (enabled) "Bounded diagnostics enabled." else "Diagnostics disabled and cleared."
+            }
+        }
+    }
+
+    fun connectToAccount(accountId: String) {
+        if (accountSwitchJob?.isActive == true || !requireSavedData()) return
+        val account = accounts.value.firstOrNull { it.id == accountId && it.enabled } ?: return
+        if (profiles.value.none { it.accountId == accountId }) {
+            _statusMessage.value = "Import at least one config for ${account.displayName} first."
+            return
+        }
+        if (VpnStateRepository.state.value.alwaysOnVpn == true) {
+            _statusMessage.value = "Turn off Android always-on before switching Codespaces. Your current VPN was not changed."
+            return
+        }
+        accountSwitchJob = viewModelScope.launch {
+            routeOptimizationJob?.cancelAndJoin()
+            currentDelayProbeJob?.cancelAndJoin()
+            currentWakeJob?.cancelAndJoin()
+            if (configurationMutationJob?.isActive == true) {
+                _statusMessage.value = "Wait for the current settings change to finish."
+                return@launch
+            }
+            try {
+                if (VpnStateRepository.state.value.tunnelState !in setOf(TunnelState.Disabled, TunnelState.Disconnected, TunnelState.Error)) {
+                    getApplication<Application>().startService(Intent(getApplication(), G2RayVpnService::class.java).apply {
+                        action = G2RayVpnService.ACTION_STOP
+                    })
+                    kotlinx.coroutines.withTimeout(20_000L) {
+                        VpnStateRepository.state.first { it.tunnelState in setOf(TunnelState.Disabled, TunnelState.Disconnected, TunnelState.Error) }
+                    }
+                }
+                withContext(Dispatchers.IO) { repository.selectAccount(accountId) }
+                startVpnForSelection(getApplication())
+            } catch (cancelled: CancellationException) {
+                if (cancelled is kotlinx.coroutines.TimeoutCancellationException) _statusMessage.value = "Previous VPN is still stopping. No account was switched."
+                else throw cancelled
+            } catch (error: Exception) { _statusMessage.value = "Could not switch Codespace: ${error.localizedMessage}" }
+        }
+    }
 
     private val _isRouteOptimizing = MutableStateFlow(false)
     val isRouteOptimizing: StateFlow<Boolean> = _isRouteOptimizing.asStateFlow()
@@ -586,6 +663,8 @@ class G2RayViewModel internal constructor(
 
     private var currentWakeJob: Job? = null
     private var configurationMutationJob: Job? = null
+    private val _isSavingSettings = MutableStateFlow(false)
+    val isSavingSettings = _isSavingSettings.asStateFlow()
     private var currentDelayProbeJob: Job? = null
     private var routeOptimizationJob: Job? = null
     @Volatile
@@ -625,6 +704,7 @@ class G2RayViewModel internal constructor(
 
     private fun configurationMutationAllowedNow(): Boolean {
         val startupBusy = currentWakeJob?.isActive == true ||
+            accountSwitchJob?.isActive == true ||
             currentDelayProbeJob?.isActive == true ||
             routeOptimizationJob?.isActive == true
         return configurationMutationAllowed(VpnStateRepository.state.value.tunnelState, startupBusy)
@@ -668,9 +748,11 @@ class G2RayViewModel internal constructor(
             onResult(result)
         }
         configurationMutationJob = job
+        _isSavingSettings.value = true
         job.invokeOnCompletion {
             if (configurationMutationJob === job) {
                 configurationMutationJob = null
+                _isSavingSettings.value = false
             }
         }
         job.start()
@@ -702,6 +784,9 @@ class G2RayViewModel internal constructor(
                 _dpiCompatibilityEnabled.value = settings.dpiCompatibilityEnabled
                 _autoRouteOptimizationEnabled.value = settings.autoRouteOptimizationEnabled
                 _seamlessFailoverEnabled.value = settings.seamlessFailoverEnabled
+                _routingPolicy.value = settings.routingPolicy
+                _diagnosticsEnabled.value = settings.diagnosticsEnabled
+                com.g2ray.client.vpn.DiagnosticEvents.setEnabled(settings.diagnosticsEnabled)
                 _preferenceLoadError.value = null
                 _statusMessage.value = repository.loadError.value ?: "Saved settings reloaded."
             }
@@ -822,6 +907,7 @@ class G2RayViewModel internal constructor(
                 }
                 when (outcome) {
                     is CodespaceWakeOutcome.Ready -> {
+                        withContext(Dispatchers.IO) { runCatching { quotaEstimates.clearConfirmedBlock(account.id) } }
                         availableWakeAt[account.id] = System.currentTimeMillis()
                         withContext(Dispatchers.IO) {
                             outcome.workerResponse?.let { response ->
@@ -872,6 +958,9 @@ class G2RayViewModel internal constructor(
                         }
                     }
                     is CodespaceWakeOutcome.Failed -> {
+                        if (outcome.httpCode == 402 || outcome.workerResponse?.quota_blocked == true) {
+                            withContext(Dispatchers.IO) { quotaEstimates.recordConfirmedBlock(account.id) }
+                        }
                         withContext(Dispatchers.IO) {
                             outcome.workerResponse?.let { response ->
                                 repository.recordCodespaceHealth(
@@ -947,6 +1036,14 @@ class G2RayViewModel internal constructor(
     }
 
     fun startVpn(context: Context = getApplication()) {
+        if (accountSwitchJob?.isActive == true) {
+            _statusMessage.value = "Wait for the Codespace switch to finish."
+            return
+        }
+        startVpnForSelection(context)
+    }
+
+    private fun startVpnForSelection(context: Context) {
         savedDataUnavailableNow()?.let { error ->
             _statusMessage.value = error
             if (vpnStartAllowed(VpnStateRepository.state.value.tunnelState)) reportVpnStartBlocked(error)
@@ -1134,6 +1231,7 @@ class G2RayViewModel internal constructor(
     }
 
     fun stopVpn(context: Context = getApplication()) {
+        accountSwitchJob?.cancel()
         if (VpnStateRepository.state.value.alwaysOnVpn == true) {
             _statusMessage.value = "Always-on VPN is controlled in Android VPN settings."
             return
@@ -1142,7 +1240,7 @@ class G2RayViewModel internal constructor(
             action = G2RayVpnService.ACTION_STOP
         }
         context.startService(intent)
-        _statusMessage.value = "Stopping VPN..."
+        _statusMessage.value = "VPN stop requested."
     }
 
     private fun startVpnService(profileUri: String, context: Context, accountId: String?) {
@@ -1160,7 +1258,7 @@ class G2RayViewModel internal constructor(
         }
         try {
             ContextCompat.startForegroundService(context.applicationContext, intent)
-            _statusMessage.value = "Starting VPN..."
+            _statusMessage.value = "VPN start requested."
         } catch (error: Exception) {
             val message = "Could not start VPN: ${error.localizedMessage ?: error.javaClass.simpleName}"
             VpnStateRepository.state.update {
@@ -1519,6 +1617,7 @@ class G2RayViewModel internal constructor(
         val accountProfileCount = repository.profiles.value.count { it.accountId == accountId }
         val now = System.currentTimeMillis()
         val busy = currentWakeJob?.isActive == true ||
+            accountSwitchJob?.isActive == true ||
             configurationMutationJob?.isActive == true ||
             currentDelayProbeJob?.isActive == true ||
             routeOptimizationJob?.isActive == true

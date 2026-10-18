@@ -5728,6 +5728,47 @@ JSON
     _atomic_write "$CONFIG_META_FILE" "$payload"
 }
 
+quota_snapshot_json() {
+    local now cycle stored prev ss elapsed budget running=false
+    now=$(date +%s) || return 1
+    cycle=$(current_quota_cycle) || return 1
+    stored=$(cat "$QUOTA_CYCLE_FILE" 2>/dev/null || true)
+    [[ "$stored" == "$cycle" ]] || { printf 'null'; return 0; }
+    prev=$(cat "$TOTAL_UPTIME_FILE" 2>/dev/null || true)
+    ss=$(cat "$SESSION_START_FILE" 2>/dev/null || true)
+    budget="${G2RAY_QUOTA_SECONDS:-216000}"
+    [[ "$prev" =~ ^[0-9]{1,10}$ && "$ss" =~ ^[0-9]{1,10}$ && "$budget" =~ ^[0-9]{1,7}$ ]] \
+        || { printf 'null'; return 0; }
+    prev=$((10#$prev)); ss=$((10#$ss)); budget=$((10#$budget))
+    (( budget > 0 && budget <= 2678400 )) || budget=216000
+    elapsed=$(( now - ss )); (( elapsed < 0 )) && elapsed=0
+    (( elapsed > 3600 )) && elapsed=3600
+    prev=$(( prev + elapsed )); (( prev > 2678400 )) && prev=2678400
+    is_running && running=true
+    printf '{"used_seconds":%s,"budget_seconds":%s,"sampled_at_ms":%s,"cycle":"%s","assumed_running":%s}' \
+        "$prev" "$budget" "$((now * 1000))" "$cycle" "$running"
+}
+
+write_codespace_bundle_qr() {
+    local bundle="$1" encoded
+    command -v gzip >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1 || return 1
+    mkdir -p "$QR_DIR" || return 1
+    encoded=$(printf '%s' "$bundle" | gzip -n -c | base64 | tr '+/' '-_' | tr -d '\r\n=') || return 1
+    # Leave room for error correction. Oversized bundles retain individual QRs.
+    if (( ${#encoded} > 2100 )); then
+        rm -f "$QR_DIR/all-configs.txt" "$QR_DIR/all-configs.png"
+        return 0
+    fi
+    _atomic_write "$QR_DIR/all-configs.txt" "g2ray://import/$encoded" || return 1
+    chmod 600 "$QR_DIR/all-configs.txt" 2>/dev/null || true
+    if command -v qrencode >/dev/null 2>&1; then
+        qrencode -l M -m 4 -s 8 -t PNG -o "$QR_DIR/all-configs.png" "g2ray://import/$encoded" 2>/dev/null || return 1
+        chmod 600 "$QR_DIR/all-configs.png" 2>/dev/null || true
+    else
+        rm -f "$QR_DIR/all-configs.png" || return 1
+    fi
+}
+
 write_codespace_import_bundle() {
     local links="${1:-}" legacy="${2:-false}" generated worker_codespace_id first=true link bundle
     local bundle_file="$CODESPACE_BUNDLE_FILE" schema=2
@@ -5749,6 +5790,9 @@ write_codespace_import_bundle() {
         printf '  "generated_at": "%s",\n' "$(json_escape "$generated")"
         printf '  "codespace_name": "%s",\n' "$(json_escape "$CODESPACE_NAME")"
         printf '  "worker_codespace_id": "%s",\n' "$(json_escape "$worker_codespace_id")"
+        if [[ "$legacy" != true ]]; then
+            printf '  "quota_estimate": %s,\n' "$(quota_snapshot_json || printf 'null')"
+        fi
         printf '  "configs": [\n'
         while IFS= read -r link; do
             [[ -n "$link" ]] || continue
@@ -5764,6 +5808,10 @@ write_codespace_import_bundle() {
     )
     _atomic_write "$bundle_file" "$bundle" || return 1
     chmod 600 "$bundle_file" 2>/dev/null || true
+    if [[ "$legacy" != true ]] && ! write_codespace_bundle_qr "$bundle"; then
+        rm -f "$QR_DIR/all-configs.txt" "$QR_DIR/all-configs.png" 2>/dev/null || true
+        log_event WARN "codespace_bundle all_config_qr_unavailable action=use_individual_qrs" || true
+    fi
     if [[ "$legacy" != true ]] && ! write_codespace_import_bundle "$links" true; then
         # The compatibility artifact must not roll back a valid current export
         # or leave an older UUID available for accidental import.
@@ -7416,6 +7464,13 @@ while true; do
             echo -e "  ${WHITE}${MOBILE_CONFIG_FILE}${NC}\n"
             _INDEX=1
             _QR_MODE="${G2RAY_QR_MODE:-recommended}"
+            if [[ "$_QR_MODE" != none && -s "$QR_DIR/all-configs.txt" ]]; then
+                printf '  All configs + local usage estimate (scan with G2Ray Android):\n'
+                [[ ! -s "$QR_DIR/all-configs.png" ]] || printf '  PNG: %s/all-configs.png\n' "$QR_DIR"
+                if command -v qrencode >/dev/null 2>&1; then
+                    qrencode -l M -m 2 -t UTF8 "$(cat "$QR_DIR/all-configs.txt")" || true
+                fi
+            fi
             for _LINK in "${_CONFIG_LINKS[@]}"; do
                 _SHOW_QR=false
                 [[ "$_QR_MODE" == "all" || ( "$_QR_MODE" != "none" && $_INDEX -eq 1 ) ]] && _SHOW_QR=true

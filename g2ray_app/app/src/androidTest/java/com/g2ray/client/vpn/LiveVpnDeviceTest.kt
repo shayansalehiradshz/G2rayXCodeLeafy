@@ -254,6 +254,55 @@ class LiveVpnDeviceTest {
     fun selectedProfileStartsWithSmallProbes() = runLiveTest(startupOnly = true)
 
     @Test
+    fun optionalDomainBypassUsesPhysicalExitWithoutChangingDefaultVpnRouting() {
+        val args = InstrumentationRegistry.getArguments()
+        assumeTrue("Bypass checks require -e liveRouting true and -e liveVpn true",
+            args.getString("liveRouting") == "true" && args.getString("liveVpn") == "true")
+        val context = ApplicationProvider.getApplicationContext<G2RayApplication>()
+        val preferences = VpnEnginePreferences(context.secureStore)
+        val original = preferences.readSettings()
+        val fakeDns = args.getString("routingFakeDns") == "true"
+        try {
+            preferences.setRoutingPolicy(RoutingPolicy(bypassDomains = listOf("www.cloudflare.com")))
+            preferences.setFastDnsEnabled(fakeDns)
+            runLiveTest(acceptanceCheck = { _, client ->
+                withContext(Dispatchers.IO) {
+                    val network = requireNotNull(SocketProtector.underlyingNetworks.value)
+                    val url = "https://www.cloudflare.com/cdn-cgi/trace"
+                    val direct = network.openConnection(java.net.URL(url)) as java.net.HttpURLConnection
+                    val expectedIp = try {
+                        direct.connectTimeout = 10_000; direct.readTimeout = 10_000
+                        assertEquals("Physical trace endpoint unavailable", 200, direct.responseCode)
+                        direct.inputStream.use(::traceIp)
+                    } finally { direct.disconnect() }
+                    val bypassIp = client.newCall(Request.Builder().url(url).build()).execute().use { response ->
+                        assertEquals("Bypass trace endpoint unavailable", 200, response.code)
+                        requireNotNull(response.body).byteStream().use(::traceIp)
+                    }
+                    assertEquals("Domain rule did not use the physical exit", expectedIp, bypassIp)
+                    report("optional_domain_bypass_verified=true fake_dns=$fakeDns physical_ip_match=true")
+                }
+            })
+        } finally {
+            preferences.setRoutingPolicy(original.routingPolicy)
+            preferences.setFastDnsEnabled(original.fastDnsEnabled)
+        }
+    }
+
+    private fun traceIp(input: InputStream): String {
+        val bytes = java.io.ByteArrayOutputStream()
+        val buffer = ByteArray(1024)
+        while (true) {
+            val count = input.read(buffer)
+            if (count < 0) break
+            require(bytes.size() + count <= 16_384) { "Trace response exceeded its budget" }
+            bytes.write(buffer, 0, count)
+        }
+        return bytes.toString(Charsets.UTF_8.name()).lineSequence().firstOrNull { it.startsWith("ip=") }
+            ?.removePrefix("ip=")?.trim()?.takeIf { it.isNotBlank() } ?: error("Trace response omitted its IP")
+    }
+
+    @Test
     fun selectedProfileCarriesBoundedTransferSamples() {
         assumeTrue("Larger transfers require -e liveTransfers true",
             InstrumentationRegistry.getArguments().getString("liveTransfers") == "true")

@@ -27,6 +27,7 @@ import androidx.compose.material.icons.filled.NetworkCheck
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -62,35 +63,33 @@ internal fun copyConfigLinkToClipboard(context: Context, rawUri: String): Boolea
 @Composable
 fun HomeScreen(
     viewModel: G2RayViewModel,
+    connectRequest: Int = 0,
+    onConnectRequestHandled: () -> Unit = {},
     onNavigateToSettings: () -> Unit
 ) {
-    val activeAccount by viewModel.activeAccount.collectAsState()
-    val activeProfile by viewModel.activeProfile.collectAsState()
-    val activeApiKey by viewModel.activeApiKey.collectAsState()
-    val activeGitHubToken by viewModel.activeGitHubToken.collectAsState()
-    val accounts by viewModel.accounts.collectAsState()
-    val codespaceProfiles by viewModel.activeCodespaceProfiles.collectAsState()
-    val delayStates by viewModel.profileDelayStates.collectAsState()
-    val measurementNetworkKey by viewModel.measurementNetworkKey.collectAsState()
-    val controlPlane by viewModel.workerControlPlane.collectAsState()
-    val statusMessage by viewModel.statusMessage.collectAsState()
-    val isWakingUp by viewModel.isWakingUp.collectAsState()
-    val isVpnCoreAvailable by viewModel.isVpnCoreAvailable.collectAsState()
-    val vpnEngineMode by viewModel.vpnEngineMode.collectAsState()
-    val fastDnsEnabled by viewModel.fastDnsEnabled.collectAsState()
-    val ipv4OnlyEnabled by viewModel.ipv4OnlyEnabled.collectAsState()
-    val dpiCompatibilityEnabled by viewModel.dpiCompatibilityEnabled.collectAsState()
-    val autoRouteOptimizationEnabled by viewModel.autoRouteOptimizationEnabled.collectAsState()
-    val seamlessFailoverEnabled by viewModel.seamlessFailoverEnabled.collectAsState()
-    val isRouteOptimizing by viewModel.isRouteOptimizing.collectAsState()
-    val savedDataReady by viewModel.savedDataReady.collectAsState()
-    val savedDataError by viewModel.repositoryLoadError.collectAsState()
-    val isReloadingSavedData by viewModel.isReloadingSavedData.collectAsState()
-    val originalLegacyConfig by viewModel.legacyProfileForRecovery.collectAsState()
+    val activeAccount by viewModel.activeAccount.collectAsStateWithLifecycle()
+    val activeProfile by viewModel.activeProfile.collectAsStateWithLifecycle()
+    val activeApiKey by viewModel.activeApiKey.collectAsStateWithLifecycle()
+    val activeGitHubToken by viewModel.activeGitHubToken.collectAsStateWithLifecycle()
+    val accounts by viewModel.accounts.collectAsStateWithLifecycle()
+    val codespaceProfiles by viewModel.activeCodespaceProfiles.collectAsStateWithLifecycle()
+    val delayStates by viewModel.profileDelayStates.collectAsStateWithLifecycle()
+    val measurementNetworkKey by viewModel.measurementNetworkKey.collectAsStateWithLifecycle()
+    val controlPlane by viewModel.workerControlPlane.collectAsStateWithLifecycle()
+    val statusMessage by viewModel.statusMessage.collectAsStateWithLifecycle()
+    val isWakingUp by viewModel.isWakingUp.collectAsStateWithLifecycle()
+    val isVpnCoreAvailable by viewModel.isVpnCoreAvailable.collectAsStateWithLifecycle()
+    val vpnEngineMode by viewModel.vpnEngineMode.collectAsStateWithLifecycle()
+    val autoRouteOptimizationEnabled by viewModel.autoRouteOptimizationEnabled.collectAsStateWithLifecycle()
+    val isRouteOptimizing by viewModel.isRouteOptimizing.collectAsStateWithLifecycle()
+    val savedDataReady by viewModel.savedDataReady.collectAsStateWithLifecycle()
+    val savedDataError by viewModel.repositoryLoadError.collectAsStateWithLifecycle()
+    val isReloadingSavedData by viewModel.isReloadingSavedData.collectAsStateWithLifecycle()
+    val originalLegacyConfig by viewModel.legacyProfileForRecovery.collectAsStateWithLifecycle()
     val savedSettingsUsable = savedDataReady && !isReloadingSavedData
     var showCodespacePicker by remember { mutableStateOf(false) }
 
-    val vpnUiState by com.g2ray.client.model.VpnStateRepository.state.collectAsState()
+    val vpnUiState by com.g2ray.client.model.VpnStateRepository.state.collectAsStateWithLifecycle()
     val isVpnRunning = vpnUiState.tunnelState == TunnelState.Starting ||
         vpnUiState.tunnelState == TunnelState.Connected ||
         vpnUiState.tunnelState == TunnelState.Stopping
@@ -106,7 +105,7 @@ fun HomeScreen(
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
             viewModel.startVpn(context)
-        }
+        } else viewModel.reportVpnStartBlocked("VPN permission was not granted. Tap Start VPN to try again.")
     }
 
     fun continueWithVpnPermission() {
@@ -142,6 +141,12 @@ fun HomeScreen(
         }
 
         continueWithVpnPermission()
+    }
+    LaunchedEffect(connectRequest, savedSettingsUsable) {
+        if (connectRequest > 0 && savedSettingsUsable) {
+            onConnectRequestHandled()
+            if (!isVpnRunning) startVpnWithPermissions()
+        }
     }
 
     Scaffold(
@@ -179,6 +184,54 @@ fun HomeScreen(
                     }
                 )
             }
+            Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("VPN", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.weight(1f))
+                    FeatureInfoButton(FeatureHelp.Protection)
+                }
+                Text(if (isVpnCoreAvailable) vpnUiState.message else XrayCoreManager.MISSING_CORE_MESSAGE,
+                    style = MaterialTheme.typography.bodyMedium)
+                if (vpnUiState.tunnelState == TunnelState.Starting || isWakingUp) {
+                    LinearProgressIndicator(Modifier.fillMaxWidth())
+                }
+                Text("Route: ${vpnUiState.routeState.name}  |  Engine: ${vpnUiState.activeVpnEngine?.label ?: vpnEngineMode.label}",
+                    style = MaterialTheme.typography.bodySmall)
+                if (vpnUiState.tunnelState == TunnelState.Blocked) {
+                    Text("Traffic is blocked until VPN recovery succeeds.", color = MaterialTheme.colorScheme.error)
+                    Button(onClick = { startVpnWithPermissions() }, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
+                        enabled = savedSettingsUsable && activeProfile != null && isVpnCoreAvailable) { Text("Retry VPN") }
+                }
+                Button(
+                    onClick = {
+                        if (isVpnRunning || vpnUiState.tunnelState == TunnelState.Blocked) {
+                            if (vpnUiState.alwaysOnVpn == true) openVpnProtectionSettings(context)
+                            else viewModel.stopVpn(context)
+                        } else startVpnWithPermissions()
+                    },
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
+                    enabled = isVpnRunning || vpnUiState.tunnelState == TunnelState.Blocked ||
+                        (savedSettingsUsable && activeProfile != null && isVpnCoreAvailable)
+                ) {
+                    Text(when {
+                        (isVpnRunning || vpnUiState.tunnelState == TunnelState.Blocked) && vpnUiState.alwaysOnVpn == true -> "Manage always-on VPN"
+                        isVpnRunning || vpnUiState.tunnelState == TunnelState.Blocked -> "Disconnect VPN"
+                        else -> "Start VPN"
+                    })
+                }
+                if (vpnUiState.tunnelState == TunnelState.Connected && vpnUiState.tunnelVerified) {
+                    if (vpnUiState.tunnelTrafficSource == TunnelTrafficSource.HevTun) {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("Down  ${SpeedFormatter.formatBps(vpnUiState.downloadBps)}", style = MaterialTheme.typography.titleMedium)
+                            Text("Up  ${SpeedFormatter.formatBps(vpnUiState.uploadBps)}", style = MaterialTheme.typography.titleMedium)
+                        }
+                    } else Text("Route verified. Live byte counters are available with HEV.",
+                        style = MaterialTheme.typography.bodySmall)
+                }
+                Text("Android outside-VPN blocking: ${vpnBlockingStatusLabel(vpnUiState.blockConnectionsWithoutVpn)}",
+                    style = MaterialTheme.typography.bodySmall)
+                HorizontalDivider()
+            }
+
             // Section 1: Active Account & Wake Control
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -192,6 +245,7 @@ fun HomeScreen(
                     ) {
                         Text(
                             "Codespace Route Manager",
+                            modifier = Modifier.weight(1f),
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold
                         )
@@ -203,6 +257,10 @@ fun HomeScreen(
                     Spacer(modifier = Modifier.height(8.dp))
 
                     if (activeAccount != null) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(Modifier.weight(1f)) { QuotaStatus(viewModel, activeAccount!!.id) }
+                            FeatureInfoButton(FeatureHelp.Quota)
+                        }
                         Text(
                             text = "Codespace: ${activeAccount?.displayName}",
                             style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)
@@ -274,7 +332,7 @@ fun HomeScreen(
                     Spacer(modifier = Modifier.height(12.dp))
 
                     Text(
-                        text = "Status: $statusMessage",
+                        text = "Last action: $statusMessage",
                         style = MaterialTheme.typography.bodyMedium,
                         fontWeight = FontWeight.Medium
                     )
@@ -299,9 +357,13 @@ fun HomeScreen(
                         Button(
                             onClick = { viewModel.wakeUpCodespace() },
                             modifier = Modifier.fillMaxWidth(),
-                            enabled = savedSettingsUsable && activeAccount?.let(viewModel::wakeControlConfigured) == true
+                            enabled = savedSettingsUsable
                         ) {
                             Text("Wake Up Codespace")
+                        }
+                        if (activeAccount?.let(viewModel::wakeControlConfigured) != true) {
+                            Text("Wake needs a GitHub token or shared Worker in Settings. Working imported configs can still connect.",
+                                style = MaterialTheme.typography.bodySmall)
                         }
                     }
                 }
@@ -435,6 +497,7 @@ fun HomeScreen(
                             style = MaterialTheme.typography.bodyMedium,
                             modifier = Modifier.weight(1f)
                         )
+                        FeatureInfoButton(FeatureHelp.Optimize)
                         Switch(
                             checked = autoRouteOptimizationEnabled,
                             onCheckedChange = viewModel::setAutoRouteOptimizationEnabled,
@@ -501,16 +564,7 @@ fun HomeScreen(
                                     ) {
                                         Icon(Icons.Default.NetworkCheck, contentDescription = "Run accurate three-sample delay test")
                                     }
-                                    IconButton(onClick = {
-                                        val copied = copyConfigLinkToClipboard(context, profile.rawUri)
-                                        Toast.makeText(
-                                            context,
-                                            if (copied) "Config link copied" else "Clipboard is unavailable",
-                                            Toast.LENGTH_SHORT
-                                        ).show()
-                                    }) {
-                                        Icon(Icons.Default.ContentCopy, contentDescription = "Copy config link")
-                                    }
+                                    ConfigShareButton(profile.rawUri)
                                     IconButton(
                                         onClick = { pendingDeleteProfileId = profile.id },
                                         enabled = savedSettingsUsable && !isVpnRunning && !isRouteOptimizing &&
@@ -565,225 +619,7 @@ fun HomeScreen(
                 }
             }
 
-            // Section 3: Full-device VPN control
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            Icons.Default.NetworkCheck,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.onPrimaryContainer,
-                            modifier = Modifier.size(24.dp)
-                        )
-                        Spacer(modifier = Modifier.width(12.dp))
-                        Text(
-                            text = "Full-device VPN",
-                            style = MaterialTheme.typography.titleMedium,
-                            color = MaterialTheme.colorScheme.onPrimaryContainer,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = if (isVpnCoreAvailable) {
-                            vpnUiState.message
-                        } else {
-                            XrayCoreManager.MISSING_CORE_MESSAGE
-                        },
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onPrimaryContainer
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "Engine: ${vpnUiState.activeVpnEngine?.label ?: vpnEngineMode.label}",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = MaterialTheme.colorScheme.onPrimaryContainer
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "Android outside-VPN blocking: ${vpnBlockingStatusLabel(if (isVpnRunning || vpnUiState.tunnelState == TunnelState.Blocked) vpnUiState.blockConnectionsWithoutVpn else null)}",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onPrimaryContainer
-                    )
-                    TextButton(onClick = {
-                        if (!openVpnProtectionSettings(context)) {
-                            Toast.makeText(context, "Android VPN settings are unavailable", Toast.LENGTH_SHORT).show()
-                        }
-                    }) {
-                        Icon(Icons.Default.Lock, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text("VPN protection settings")
-                    }
-                    Spacer(modifier = Modifier.height(6.dp))
-                    SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-                        VpnEngineMode.entries.forEachIndexed { index, mode ->
-                            SegmentedButton(
-                                selected = vpnEngineMode == mode,
-                                onClick = { viewModel.setVpnEngineMode(mode) },
-                                shape = SegmentedButtonDefaults.itemShape(
-                                    index = index,
-                                    count = VpnEngineMode.entries.size
-                                ),
-                                enabled = savedSettingsUsable && !isVpnRunning
-                            ) {
-                                Text(mode.label)
-                            }
-                        }
-                    }
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text(
-                            text = "Fast DNS (experimental)",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onPrimaryContainer,
-                            modifier = Modifier.weight(1f)
-                        )
-                        Switch(
-                            checked = fastDnsEnabled,
-                            onCheckedChange = viewModel::setFastDnsEnabled,
-                            enabled = savedSettingsUsable && !isVpnRunning
-                        )
-                    }
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text(
-                            text = "IPv4-only compatibility",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onPrimaryContainer,
-                            modifier = Modifier.weight(1f)
-                        )
-                        Switch(
-                            checked = ipv4OnlyEnabled,
-                            onCheckedChange = viewModel::setIpv4OnlyEnabled,
-                            enabled = savedSettingsUsable && !isVpnRunning
-                        )
-                    }
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text(
-                            text = "DPI compatibility (experimental)",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onPrimaryContainer,
-                            modifier = Modifier.weight(1f)
-                        )
-                        Switch(
-                            checked = dpiCompatibilityEnabled,
-                            onCheckedChange = viewModel::setDpiCompatibilityEnabled,
-                            enabled = savedSettingsUsable && !isVpnRunning
-                        )
-                    }
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text(
-                            text = "Seamless route failover",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onPrimaryContainer,
-                            modifier = Modifier.weight(1f)
-                        )
-                        Switch(
-                            checked = seamlessFailoverEnabled,
-                            onCheckedChange = viewModel::setSeamlessFailoverEnabled,
-                            enabled = savedSettingsUsable && !isVpnRunning
-                        )
-                    }
-                    if (vpnUiState.tunnelState == TunnelState.Connected && vpnUiState.tunnelVerified) {
-                        Spacer(modifier = Modifier.height(8.dp))
-                        if (vpnUiState.tunnelTrafficSource == TunnelTrafficSource.HevTun) {
-                            Text(
-                                text = SpeedFormatter.formatNotification(
-                                    com.g2ray.client.vpn.TrafficSpeed(
-                                        rxBps = vpnUiState.downloadBps,
-                                        txBps = vpnUiState.uploadBps,
-                                        totalRxBytes = vpnUiState.totalRxBytes,
-                                        totalTxBytes = vpnUiState.totalTxBytes
-                                    )
-                                ),
-                                style = MaterialTheme.typography.titleSmall,
-                                color = MaterialTheme.colorScheme.onPrimaryContainer,
-                                fontWeight = FontWeight.Bold
-                            )
-                            Text(
-                                text = "Live HEV TUN counters for this VPN session.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onPrimaryContainer
-                            )
-                        } else {
-                            Text(
-                                text = "Route verified. Exact live speed is unavailable in Native mode; select HEV before connecting to show real tunnel counters.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onPrimaryContainer
-                            )
-                        }
-                    } else if (vpnUiState.tunnelState == TunnelState.Starting ||
-                        (vpnUiState.tunnelState == TunnelState.Connected && !vpnUiState.tunnelVerified)
-                    ) {
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            text = "Verifying the live tunnel route before reporting traffic...",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onPrimaryContainer
-                        )
-                    }
-                    Spacer(modifier = Modifier.height(12.dp))
-                    if (vpnUiState.tunnelState == TunnelState.Blocked) {
-                        Button(
-                            onClick = { startVpnWithPermissions() },
-                            modifier = Modifier.fillMaxWidth(),
-                            enabled = savedSettingsUsable && activeProfile != null && isVpnCoreAvailable
-                        ) { Text("Retry VPN") }
-                        TextButton(
-                            onClick = {
-                                if (vpnUiState.alwaysOnVpn == true) {
-                                    if (!openVpnProtectionSettings(context)) {
-                                        Toast.makeText(context, "Android VPN settings are unavailable", Toast.LENGTH_SHORT).show()
-                                    }
-                                } else viewModel.stopVpn(context)
-                            },
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text(if (vpnUiState.alwaysOnVpn == true) "Manage always-on VPN" else "Disconnect VPN")
-                        }
-                    } else if (isVpnRunning) {
-                        Button(
-                            onClick = {
-                                if (vpnUiState.alwaysOnVpn == true) {
-                                    if (!openVpnProtectionSettings(context)) {
-                                        Toast.makeText(context, "Android VPN settings are unavailable", Toast.LENGTH_SHORT).show()
-                                    }
-                                } else viewModel.stopVpn(context)
-                            },
-                            modifier = Modifier.fillMaxWidth(),
-                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
-                        ) {
-                            Text(if (vpnUiState.alwaysOnVpn == true) "Manage always-on VPN" else "Stop VPN")
-                        }
-                    } else {
-                        Button(
-                            onClick = { startVpnWithPermissions() },
-                            modifier = Modifier.fillMaxWidth(),
-                            enabled = savedSettingsUsable && activeProfile != null && isVpnCoreAvailable
-                        ) {
-                            Text("Start VPN")
-                        }
-                    }
-                }
-            }
+
         }
     }
 
@@ -796,13 +632,17 @@ fun HomeScreen(
                     accounts.filter { it.enabled }.sortedBy { it.priority }.forEach { account ->
                         TextButton(
                             onClick = {
-                                viewModel.selectAccount(account.id)
+                                if (account.id != activeAccount?.id) {
+                                    if (isVpnRunning || vpnUiState.tunnelState == TunnelState.Blocked) viewModel.connectToAccount(account.id)
+                                    else viewModel.selectAccount(account.id)
+                                }
                                 showCodespacePicker = false
                             },
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             Column(modifier = Modifier.fillMaxWidth()) {
                                 Text(account.displayName, fontWeight = FontWeight.Bold)
+                                QuotaStatus(viewModel, account.id)
                                 Text(
                                     account.lastWorkerMessage ?: account.codespaceName.orEmpty(),
                                     style = MaterialTheme.typography.bodySmall,
@@ -812,6 +652,11 @@ fun HomeScreen(
                             }
                         }
                     }
+                    if (accounts.none { it.enabled }) TextButton(onClick = {
+                        showCodespacePicker = false; onNavigateToSettings()
+                    }) { Text("Add or enable a Codespace in Settings") }
+                    if (isVpnRunning) Text("Choosing another Codespace disconnects and reconnects VPN; existing streams may need to resume.",
+                        style = MaterialTheme.typography.bodySmall)
                 }
             },
             confirmButton = { TextButton(onClick = { showCodespacePicker = false }) { Text("Close") } }

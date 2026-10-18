@@ -14,6 +14,39 @@ import org.robolectric.RobolectricTestRunner
 @RunWith(RobolectricTestRunner::class)
 class XrayConfigBuilderTest {
     @Test
+    fun explicitDomainBypassIsScopedAndKeepsDnsProxiedAcrossEngines() {
+        for (engine in ActiveVpnEngine.entries) for (fakeDns in listOf(false, true)) for (balanced in listOf(false, true)) {
+            val profile = testXhttpProfile().copy(address = "203.0.113.1")
+            val root = JSONObject(XrayConfigBuilder.buildVpnConfig(profile, engine = engine, fakeDnsEnabled = fakeDns,
+                fallbackProfiles = if (balanced) listOf(profile.copy(address = "203.0.113.2")) else emptyList(),
+                routingPolicy = RoutingPolicy(true, listOf("example.ir"))))
+            val rules = root.getJSONObject("routing").getJSONArray("rules")
+            assertEquals("dns-out", rules.getJSONObject(0).getString("outboundTag"))
+            assertFalse(rules.getJSONObject(1).optString("outboundTag") == "bypass")
+            val bypass = rules.getJSONObject(2)
+            assertEquals("bypass", bypass.getString("outboundTag"))
+            assertEquals(listOf("domain:ir", "domain:example.ir"), (0 until bypass.getJSONArray("domain").length()).map { bypass.getJSONArray("domain").getString(it) })
+            assertTrue(bypass.has("inboundTag"))
+            assertEquals("block", rules.getJSONObject(3).getString("outboundTag"))
+            val inbounds = root.getJSONArray("inbounds")
+            for (i in 0 until inbounds.length()) {
+                val inbound = inbounds.getJSONObject(i)
+                if (inbound.getString("tag") == "health-socks") continue
+                val sniffing = inbound.getJSONObject("sniffing")
+                assertTrue(sniffing.getBoolean("enabled"))
+                assertTrue(sniffing.getBoolean("routeOnly"))
+                assertFalse(sniffing.getBoolean("metadataOnly"))
+                assertTrue(sniffing.getJSONArray("destOverride").toString().contains("tls"))
+            }
+            System.getProperty("g2ray.configFixtureDir")?.let { directory ->
+                java.io.File(directory, "bypass-$engine-fake$fakeDns-balanced$balanced.json").apply {
+                    parentFile?.mkdirs(); writeText(root.toString(2))
+                }
+            }
+        }
+    }
+
+    @Test
     fun vpnIngressAndDnsHaveNoDirectOutboundAcrossEngineAndRoutingModes() {
         val selected = testXhttpProfile().copy(address = "203.0.113.1")
         for (transport in Transport.entries) for (engine in ActiveVpnEngine.entries) for (fakeDns in listOf(false, true))

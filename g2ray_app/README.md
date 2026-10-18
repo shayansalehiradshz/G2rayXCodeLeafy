@@ -21,11 +21,18 @@ backed by the official XTLS `libXray` Android wrapper.
    - **GitHub**: use no Worker. Paste a GitHub token with Codespaces read and
      Codespaces lifecycle admin write permission.
 4. Import your G2ray VLESS config by pasting the `vless://...` URI.
-5. Return to the Home screen and leave the VPN engine on **Auto** unless you
-   are comparing engines.
+5. Keep **Settings > Connection settings > Engine** on **Auto** unless you are
+   comparing engines, then return to Home.
 6. Tap **Start VPN**. The app probes the selected route before waking the
    Codespace, so an already-working route does not wait on a control plane.
 7. Approve Android's VPN permission prompt.
+
+Connection options and their information buttons are under **Settings > Connection
+settings**. Each config's **Share** button offers Copy link and an offline QR.
+The import screen also scans individual or all-config QRs. See the
+[daily-use workflows and options](WORKFLOWS_AND_OPTIONS_2026-10-18.md) for account
+switching, local usage estimates, Quick Settings, bypass routing, and protocol
+tradeoffs.
 
 Wake setup is optional for an imported profile whose server is already running.
 Start VPN tries that profile directly even when no Worker or GitHub token is
@@ -62,7 +69,7 @@ and show **Blocked** with **Retry VPN** and **Disconnect VPN** controls. They
 must not silently restore the phone's direct Internet exit. OS blocking remains
 necessary if the process dies or Android cannot create/retain the interface.
 
-On Home, open **VPN protection settings**, select G2Ray in Android's VPN settings,
+Open **Settings > Connection settings > Android VPN protection**, select G2Ray in Android's VPN settings,
 then enable **Always-on VPN** and **Block connections without VPN**. Both are
 system-controlled settings: the app cannot silently enable them. Without OS
 blocking, traffic may use the normal network after the VPN stops or its process

@@ -84,7 +84,7 @@ jobs:
           chmod +x "$tmp/core/xray"
           shopt -s nullglob
           fixtures=(app/build/vpn-config-fixtures/*.json)
-          [[ ${#fixtures[@]} -eq 32 ]]
+          [[ ${#fixtures[@]} -eq 40 ]]
           for config in "${fixtures[@]}"; do
             "$tmp/core/xray" run -test -config "$config"
           done

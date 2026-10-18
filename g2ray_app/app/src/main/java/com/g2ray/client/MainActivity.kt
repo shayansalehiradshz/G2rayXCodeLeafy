@@ -6,6 +6,9 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.LaunchedEffect
+import com.g2ray.client.vpn.VpnTileService
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
@@ -18,7 +21,7 @@ import androidx.navigation.compose.rememberNavController
 import com.g2ray.client.ui.G2RayViewModel
 import com.g2ray.client.ui.HomeScreen
 import com.g2ray.client.ui.SettingsScreen
-import com.g2ray.client.ui.theme.MyApplicationTheme
+import com.g2ray.client.ui.theme.G2RayTheme
 import com.g2ray.client.model.TunnelState
 import com.g2ray.client.model.VpnStateRepository
 import com.g2ray.client.vpn.G2RayVpnService
@@ -28,6 +31,13 @@ import kotlinx.coroutines.launch
 class MainActivity : ComponentActivity() {
 
     private val viewModel: G2RayViewModel by viewModels()
+    private val tileConnectRequest = mutableIntStateOf(0)
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.action == VpnTileService.ACTION_CONNECT_FROM_TILE) tileConnectRequest.intValue++
+    }
 
     override fun onStart() {
         super.onStart()
@@ -49,6 +59,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (intent.action == VpnTileService.ACTION_CONNECT_FROM_TILE) tileConnectRequest.intValue++
         enableEdgeToEdge()
 
         lifecycleScope.launch {
@@ -60,15 +71,26 @@ class MainActivity : ComponentActivity() {
         }
 
         setContent {
-            MyApplicationTheme {
+            G2RayTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     val navController = rememberNavController()
+                    LaunchedEffect(tileConnectRequest.intValue) {
+                        if (tileConnectRequest.intValue > 0) navController.navigate("home") {
+                            popUpTo("home") { inclusive = false }
+                            launchSingleTop = true
+                        }
+                    }
 
                     NavHost(navController = navController, startDestination = "home") {
                         composable("home") {
                             HomeScreen(
                                 viewModel = viewModel,
-                                onNavigateToSettings = { navController.navigate("settings") }
+                                connectRequest = tileConnectRequest.intValue,
+                                onConnectRequestHandled = {
+                                    tileConnectRequest.intValue = 0
+                                    intent.action = Intent.ACTION_MAIN
+                                },
+                                onNavigateToSettings = { navController.navigate("settings") { launchSingleTop = true } }
                             )
                         }
                         composable("settings") {

@@ -57,7 +57,7 @@ The Android VPN source is in [`g2ray_app`](g2ray_app/README.md) in this same rep
 
 The checked-in native HEV libraries have pinned checksum metadata. The large `libXray.aar`, SDK-local settings, signing keys, and APK outputs are intentionally not committed. Rebuild the pinned AAR using the app's script before producing a functional APK. Android CI checks source tests, lint, HEV checksums, and the core build contract without pretending that coreless tests prove a working VPN.
 
-For protection when the VPN stops or crashes, enable Android's **Always-on VPN** and **Block connections without VPN** through Home **VPN protection settings**. Importing a VLESS link alone does not enforce device-wide routing or a kill switch in another client. See the [Android and Windows leak-protection checklist](IP_LEAK_PROTECTION_2026-10-16.md); VPN use cannot be guaranteed undetectable.
+For protection when the VPN stops or crashes, enable Android's **Always-on VPN** and **Block connections without VPN** through **Settings > Connection settings > Android VPN protection**. Importing a VLESS link alone does not enforce device-wide routing or a kill switch in another client. See the [Android and Windows leak-protection checklist](IP_LEAK_PROTECTION_2026-10-16.md); VPN use cannot be guaranteed undetectable. [Daily-use workflows](g2ray_app/WORKFLOWS_AND_OPTIONS_2026-10-18.md) cover sharing/scanning QR codes, account switching, local usage estimates, Quick Settings, and opt-in bypass routing.
 
 For a **US exit**, choose a US Codespaces region before creation, then use
 **12) Server Location** or `bash ./g2ray.sh --exit-location --json` on that Codespace.

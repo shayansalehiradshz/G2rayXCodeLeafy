@@ -5049,6 +5049,53 @@ test_runtime_diagnostics_report_deployed_versions_and_policy() {
     pass "runtime diagnostics distinguish installed core, image pin, configured policy, and kernel state"
 }
 
+test_all_config_qr_preserves_links_and_usage_without_touching_runtime() {
+    (
+        reset_runtime_paths
+        local link payload decoded before
+        local QUOTA_CYCLE_FILE="$DATA_DIR/quota_cycle.txt"
+        local TOTAL_UPTIME_FILE="$DATA_DIR/total_uptime_sec.txt"
+        local SESSION_START_FILE="$DATA_DIR/session_start.txt"
+        local G2RAY_QUOTA_SECONDS=216000
+        current_quota_cycle > "$QUOTA_CYCLE_FILE"
+        printf '213660' > "$TOTAL_UPTIME_FILE"
+        date +%s > "$SESSION_START_FILE"
+        is_running() { return 0; }
+        before=$(cat "$TOTAL_UPTIME_FILE")
+        link='vless://00000000-0000-0000-0000-000000000001@example.test:443?encryption=none&type=xhttp&extra=%7B%22xmux%22%3A%7B%7D%7D#example'
+        write_codespace_import_bundle "$link" || fail "all-config bundle write failed"
+        payload=$(cat "$QR_DIR/all-configs.txt")
+        [[ "$payload" == g2ray://import/* ]] || fail "all-config QR prefix missing"
+        payload="${payload#g2ray://import/}"
+        while (( ${#payload} % 4 != 0 )); do payload+='='; done
+        decoded=$(printf '%s' "$payload" | tr '_-' '/+' | base64 -d | gzip -dc) || fail "QR decode failed"
+        [[ "$(printf '%s' "$decoded" | jq -r '.configs[0]')" == "$link" ]] || fail "QR lost original tuning"
+        [[ "$(printf '%s' "$decoded" | jq -r '.quota_estimate.budget_seconds')" == 216000 ]] || fail "QR lost quota budget"
+        [[ "$(cat "$TOTAL_UPTIME_FILE")" == "$before" ]] || fail "QR export changed runtime quota"
+        [[ "$(printf '%s' "$decoded" | jq -r '.quota_estimate.used_seconds')" -ge 213660 ]] || fail "QR lost used quota"
+        printf 'old-cycle' > "$QUOTA_CYCLE_FILE"
+        [[ "$(quota_snapshot_json)" == null ]] || fail "stale quota cycle was presented as current"
+    )
+    pass "all-config QR preserves links, tuning and scoped local usage"
+}
+
+test_all_config_qr_without_encoder_discards_stale_png() {
+    (
+        reset_runtime_paths
+        command() {
+            if [[ "${1:-}" == -v && "${2:-}" == qrencode ]]; then return 1; fi
+            builtin command "$@"
+        }
+        printf 'old config image' > "$QR_DIR/all-configs.png"
+        write_codespace_bundle_qr '{"schema_version":2,"configs":[]}' || fail "QR text fallback failed"
+        [[ -s "$QR_DIR/all-configs.txt" ]] || fail "QR text fallback was lost"
+        [[ ! -e "$QR_DIR/all-configs.png" ]] || fail "missing encoder retained a stale config image"
+    )
+    pass "all-config QR removes stale PNG when the encoder is unavailable"
+}
+
+test_all_config_qr_without_encoder_discards_stale_png
+test_all_config_qr_preserves_links_and_usage_without_touching_runtime
 test_xhttp_extra_requires_one_complete_object
 test_deadline_includes_exit_cleanup
 test_deadline_preserves_status_without_a_status_write

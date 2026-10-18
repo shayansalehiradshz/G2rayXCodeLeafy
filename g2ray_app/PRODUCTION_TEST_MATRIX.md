@@ -13,6 +13,9 @@ The [claim-review candidate record](CLAIM_REVIEW_2026-10-17.md) identifies the
 subsequent installed recovery fixes, pre-fix reproductions, stricter overlap
 acceptance, and new outage/core/idle results. Earlier media and AI observations
 remain tied to their original APK rather than silently validating the candidate.
+The [18 October workflow record](WORKFLOWS_AND_OPTIONS_2026-10-18.md#verification-for-this-revision)
+adds the settings/share/import/tile changes, opt-in bypass tests, matching
+installed APK, recovery samples, and the acceptance boundaries for that revision.
 
 ## Automated gates
 
@@ -96,6 +99,44 @@ current failure. Reject dialer/control-plane binds that finish across handoff.
 Publishing a replacement network must not clear its first genuine dialer error.
 Descriptor ordering fixtures simulate binding; real descriptor protection and
 duplication still require packaged-core/device acceptance.
+
+## Settings, Sharing, Usage, and Bypass
+
+Run the non-network UI checks on an unlocked phone with saved fixture or daily-use
+accounts. They must preserve the selected account/profile and original prefs:
+
+```text
+adb shell am instrument -w -r -e class com.g2ray.client.ui.UiControlsDeviceTest com.g2ray.client.test/androidx.test.runner.AndroidJUnitRunner
+```
+
+Verify the inner Settings back stack, key access, info dialogs, retained import
+draft after recreation, visible Parse for large input, Share/Copy/QR without
+selection changes, and absence of the native duplicate action bar. Open the real
+camera scanner, cancel it, then scan an individual and all-config QR from another
+display. Confirm the explicit destination account and imported advanced fields.
+
+Add the Quick Settings tile through the app's Android prompt. Test one click at
+a time: stopped -> permission/start -> verified; connected -> disconnect. Repeat
+with always-on, where the tile must open the app rather than fight OS policy.
+Check notification Disconnect and explicit Stop during a pending account switch;
+neither may start the replacement account later. Test rotation after a consumed
+tile start so it cannot reconnect unexpectedly.
+
+The opt-in live domain-bypass selector is
+`LiveVpnDeviceTest#optionalDomainBypassUsesPhysicalExitWithoutChangingDefaultVpnRouting`.
+It requires `liveVpn=true`, `liveRouting=true`, `smallProbesOnly=true`, explicit
+`engine=hev|xray_native`, and `routingFakeDns=true|false`. Run all four combinations.
+It compares public exits without printing them and restores its original
+preferences. It is not per-app-UID or independent leak acceptance. Separately
+exclude a disposable network-test app, prove only its traffic is excluded, then
+repeat with Android lockdown. Restore the original routing policy afterwards.
+
+Usage is an estimated, timestamped local snapshot. Test matching/mismatched bundle
+identity, clock rollback, month rollover, corrupt snapshot, stopped-host mode,
+near-budget warning, explicit provider quota block, and successful wake clearing
+that block. An estimate reaching zero must not be labelled an authoritative
+GitHub block or silently delete profiles. Exercise two real accounts with valid
+credentials separately before claiming automatic billing or quota acceptance.
 
 ## Isolated Linux retained-flow diagnosis
 
