@@ -59,6 +59,15 @@ working transport, DNS, fragmentation, failover, or route-optimization defaults.
    Invalid or expired-cycle snapshots remain unavailable; export still does
    not mutate the uptime counters. The bundle/QR round-trip test checks this
    activity flag as well as the original links, tuning, and usage data.
+8. **Cached Android config fixtures:** the next hosted Android run restored
+   `testDebugUnitTest` from cache but had no generated config files, so the
+   mandatory 40-variant core check correctly failed. Locally, changing the
+   requested fixture path reproduced an `UP-TO-DATE` success with that path
+   absent. When the fixture-export property is requested, the debug test task
+   now explicitly passes it to the test JVM and declares the fixture directory
+   as an output. The core check keeps its 40-file requirement and now explains
+   a missing-output failure. This changes build verification, not the installed
+   app's data path. See [Gradle's input/output contract](https://docs.gradle.org/current/userguide/incremental_build.html).
 
 Four new regression tests failed against the baseline before their fixes.
 The quota save guard, tile rejection path, and metadata ownership/schema rules
@@ -134,6 +143,12 @@ site will use the same location database forever.
   app and instrumentation APK built with the matching pinned native inputs.
 - Lint: zero errors, 25 warnings. All 40 generated configuration variants were
   accepted by the real Xray 26.7.28 loader, not just parsed as JSON.
+- After the fixture-output fix, all 712 Android cases executed successfully
+  again and produced 40 newly validated fixtures. Moving only that generated
+  fixture directory into a retained backup reproduced missing outputs. The
+  identical command then restored all 40 byte-identical files `FROM-CACHE`,
+  with the configuration cache reused. The cached restore is not counted as
+  another 712 fresh executions. No cache or native validation was disabled.
 - The installed app passed all six UI/packaged-core checks. Three additional
   small-probe idle tests passed on the actual Galaxy A52s/Android 14. Saved
   engine/DNS/IPv4 settings were retained. These tests were plugged in with the

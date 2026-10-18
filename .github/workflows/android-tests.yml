@@ -84,7 +84,10 @@ jobs:
           chmod +x "$tmp/core/xray"
           shopt -s nullglob
           fixtures=(app/build/vpn-config-fixtures/*.json)
-          [[ ${#fixtures[@]} -eq 40 ]]
+          if [[ ${#fixtures[@]} -ne 40 ]]; then
+            printf 'Expected 40 generated VPN config fixtures, found %s. Check test-task output generation/cache restoration.\n' "${#fixtures[@]}" >&2
+            exit 1
+          fi
           for config in "${fixtures[@]}"; do
             "$tmp/core/xray" run -test -config "$config"
           done

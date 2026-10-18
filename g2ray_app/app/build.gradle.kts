@@ -157,9 +157,17 @@ dependencies {
 }
 
 val enabledRobolectricSdks = providers.gradleProperty("robolectricSdks")
+val configFixtureDirectory = providers.systemProperty("g2ray.configFixtureDir").orNull?.let { file(it) }
 tasks.withType<Test>().configureEach {
     // Optional local SDK selection; CI exercises every declared SDK by default.
     enabledRobolectricSdks.orNull?.let { systemProperty("robolectric.enabledSdks", it) }
+    if (name == "testDebugUnitTest") {
+        configFixtureDirectory?.let { directory ->
+            // Cached JUnit results must also restore the pinned-core validator's fixtures.
+            systemProperty("g2ray.configFixtureDir", directory.absolutePath)
+            outputs.dir(directory).withPropertyName("vpnConfigFixtures")
+        }
+    }
 }
 
 val verifyLibXrayBuildContract = tasks.register<VerifyLibXrayBuildContractTask>("verifyLibXrayBuildContract") {
