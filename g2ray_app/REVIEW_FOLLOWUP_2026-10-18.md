@@ -233,3 +233,46 @@ The [workflow notes](WORKFLOWS_AND_OPTIONS_2026-10-18.md) and
 gates. GitHub also documents a maximum active Codespace lifetime; a single host
 cannot promise uninterrupted hosting:
 [Codespace lifecycle](https://docs.github.com/en/codespaces/about-codespaces/understanding-the-codespace-lifecycle).
+
+## Two additional reviews of `2fc7148`
+
+The later 96/100 and 67/100 reports describe the same revision. Neither rating,
+nor the proposed 82-85 ceiling, is a measured performance scale. The second
+review explicitly did not run Android builds or phone tests. Its source review
+and reported shell/Worker runs are useful independent checks, not additional
+device acceptance. No new production data-path defect was established in these
+reports, and no transport/DNS/default change is warranted by them.
+
+| Claim | Assessment |
+| --- | --- |
+| The eight recent fixes and reconciled test count are real | Supported by the source, executed evidence, and hosted workflows recorded above. This does not establish absence of other bugs. |
+| Fully done, 100% production completeness, zero leaks, no regressions anywhere | Not established. The documented acceptance gaps and observed slow response remain. Unchanged data-plane files reduce this patch's scope, but control-plane changes can still affect runtime behavior. |
+| A clean residential/datacenter US IP is never blacklisted by AI providers | Unsupported. A cloud exit is not thereby a residential address. Address reputation, account policy, location databases, and destination behavior can vary. |
+| Exactly 15-25 ms overhead, guaranteed 10-15 second account switches, or a constant 40-second cold-wake floor | Unsupported as universal numbers. GitHub scheduling, route readiness, quota, network conditions, and destination timing vary. Samples must be attributed to their actual test. |
+| Bash 5 timestamps are monotonic | Incorrect. `EPOCHREALTIME` is Unix-epoch wall time. The wrapper additionally checks clock errors/backward time and uses a polling backstop; it is not a kernel monotonic-clock implementation. See [Bash variables](https://www.gnu.org/software/bash/manual/html_node/Bash-Variables.html). |
+| The deadline defect only falsely timed out on-time tasks | Incomplete. The reproduced failure also falsely accepted late cleanup. Completion timestamps distinguish both cases. |
+| Auto selects HEV for proven maximum throughput with seamless fallback | Auto preference and a bounded engine fallback exist. That is not proof HEV is always fastest or that fallback preserves every established connection. |
+| IPv4-only off guarantees faster IPv6 routes to destination sites | Unsupported. It is the fresh client default, but current generated server DNS and freedom egress use `UseIPv4`. Capturing IPv6 on Android is not proof of end-to-end IPv6 egress. No default changed. |
+| Route optimization continuously evaluates the best route | Misleading. Optional heavy scans are bounded, cooldown/readiness/network scoped, and prohibited while the VPN is active. It is not continuous throughput benchmarking. |
+| No artificial limits or tuning anywhere | Too broad. The exported XHTTP tuning includes POST-size/interval and connection-reuse parameters. Their actual throughput/lifetime effects require the pinned core and a measurement, not an assertion of either no constraints or a fixed global speed cap. |
+| Diagnostics off gives literally zero memory or battery cost | Off cancels observation and clears the bounded event history. It is not a proof of zero application overhead; normal VPN health/recovery work continues. |
+| Codespaces always means exactly two CPU cores and a universal 60-hour allowance | The local 60-hour value is an estimate, not authoritative per-account billing or a claim about every machine/plan. |
+| The pasted cloud-AI API EOF proves a VPN defect | Not established by the message alone. It needs timestamps, the actual request path, and correlated network/service evidence. Do not add transport changes to mask an unattributed upstream error. |
+
+The useful portability finding was confirmed in the test source: sixteen calls
+assumed a bare `python` command. The behavior runner now selects a working
+Python 3 interpreter (`python3`, then `python` with version validation) and uses
+it consistently. No user-installed alias is required. This is a test-runner
+improvement, not a VPN speed fix; no production code or app binary is changed.
+CI's behavior step deliberately rejects a bare `python` invocation so that
+Python-3-only compatibility cannot silently regress on a runner with both names.
+The full local run passed all 210 behavior checks with that rejection enabled
+and exited cleanly. All 66 static checks passed again. Three isolated checks of
+the actual selection block covered preferring `python3`, falling back after an
+unusable `python3`, and failing early with neither candidate usable. No Android
+rebuild or new phone acceptance is claimed for this test/docs-only follow-up.
+
+The [reverse-proxy guide](../REVERSE_PROXY_EXPERIMENT_2026-10-18.md) separates
+fronting GitHub's existing route from a local Tunnel connector, explains the
+current origin-override plan requirement, and preserves the direct route for
+A/B and rollback. It is an undeployed procedure, not claimed network acceptance.

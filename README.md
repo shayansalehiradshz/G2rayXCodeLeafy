@@ -326,6 +326,10 @@ higher process-start cost; functional assertions and Linux CI remain unchanged.
 
 Local verification commands:
 
+The behavior suite requires Python 3. It selects a working `python3` command,
+or falls back to `python` only when that command runs Python 3; no local alias
+or system-wide symlink is needed.
+
 ```bash
 bash -n ./g2ray.sh
 bash -n ./scripts/post-start.sh
@@ -362,6 +366,11 @@ Option `17) Route Candidates` opens the Route Candidates manager. It shows measu
 Option `19) Toggle WebSocket Fallback` enables or disables the advanced WS fallback from inside the panel and saves that preference under `data/`. When a config already exists, the panel reapplies the transport change with the same UUID so existing clients are not invalidated just because fallback mode changed. After enabling it, make sure Codespaces shows the optional WS port public, then import the WS links printed after the XHTTP links. Each WS route is printed with `h2`, `h1.1`, and blank ALPN for client compatibility comparisons. Classic WebSocket uses HTTP/1.1; the pinned Xray core's fingerprinted WebSocket handshake normalizes these single/blank ALPN variants to HTTP/1.1. A working `h2`-labelled WS link is therefore not proof of HTTP/2 WebSocket support, and these variants may behave identically. Keep the variant that is reliable in repeated client tests. Compare WS with XHTTP on your own network; a single short delay test does not establish sustained throughput or long-session stability.
 
 Option `20) Cloudflare WS Front` stores a Cloudflare-proxied front hostname such as `ws.example.com` and prints the exact Codespaces WS origin hostname it must target. When WS fallback is enabled and a front hostname is saved, the config screen adds `Cloudflare WebSocket front link` variants before the direct WS fallback links. Configure Cloudflare DNS as a proxied CNAME to the `-8443.app.github.dev` origin, then add an Origin Rule for that hostname that overrides the origin Host header/SNI to the same Codespaces `-8443.app.github.dev` hostname. If your Cloudflare plan cannot set Host/SNI override rules, a simple proxied CNAME is not expected to be reliable because Codespaces routing still needs the original `app.github.dev` host identity at the origin.
+
+For a simple explanation, setup prerequisites, a separate `cloudflared` connector
+option, comparison criteria, and rollback, see the [reverse-proxy experiment guide](REVERSE_PROXY_EXPERIMENT_2026-10-18.md).
+Neither arrangement is deployed by saving the front-domain field, and neither
+is a measured speed improvement until tested on the client's network.
 
 Option `21) XHTTP Link Mode` changes only the mode exported to clients once the server has its current auto-mode inbound. The active UUID and healthy server process are preserved. This gives compatible clients room to compare `packet-up`, `stream-up`, or `stream-one` without making the server itself reject the other modes; it does not make an untested mode automatically faster.
 

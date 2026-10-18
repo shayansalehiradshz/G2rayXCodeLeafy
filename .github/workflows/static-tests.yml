@@ -62,7 +62,11 @@ jobs:
         run: bash ./tests/g2ray_static_tests.sh
 
       - name: Run behavior regression tests
-        run: bash ./tests/g2ray_behavior_tests.sh
+        run: |
+          # Linux hosts need not provide the legacy python alias.
+          python() { printf 'Unexpected bare python invocation\n' >&2; return 127; }
+          export -f python
+          bash ./tests/g2ray_behavior_tests.sh
 
       - name: Verify exit-country diagnostics without Internet requests
         run: bash ./tests/exit_location_tests.sh

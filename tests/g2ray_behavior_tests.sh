@@ -20,6 +20,16 @@ pass() {
     echo "PASS: $*"
 }
 
+TEST_PYTHON=""
+for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1 &&
+        "$candidate" -c 'import sys; sys.exit(sys.version_info.major != 3)' >/dev/null 2>&1; then
+        TEST_PYTHON="$candidate"
+        break
+    fi
+done
+[[ -n "$TEST_PYTHON" ]] || fail "Python 3 is required; install python3 or a Python 3 python command"
+
 reset_runtime_paths() {
     DATA_DIR="$TMP_ROOT/data"
     LOG_DIR="$TMP_ROOT/logs"
@@ -2129,7 +2139,7 @@ JSON
 test_boot_status_helpers_record_silent_start_result() {
     reset_runtime_paths
     write_boot_status "route_settling" "silent_start" "Route still settling" "404" "33"
-    python -m json.tool "$BOOT_STATUS_FILE" >/dev/null || fail "boot status is not valid JSON"
+    "$TEST_PYTHON" -m json.tool "$BOOT_STATUS_FILE" >/dev/null || fail "boot status is not valid JSON"
     grep -Fq '"status": "route_settling"' "$BOOT_STATUS_FILE" || fail "boot status missing status"
     boot_status_summary | grep -Fq 'route_settling' || fail "boot status summary missing status"
     pass "boot status helpers persist readable startup state"
@@ -2160,7 +2170,7 @@ test_generate_config_replaces_stale_no_config_boot_status() {
         xray_validate_config_file() { return 0; }
         xhttp_probe_metrics() { printf '200 12 ready\n'; }
         generate_config >/dev/null
-        python -m json.tool "$BOOT_STATUS_FILE" >/dev/null || fail "generated boot status is not valid JSON"
+        "$TEST_PYTHON" -m json.tool "$BOOT_STATUS_FILE" >/dev/null || fail "generated boot status is not valid JSON"
         grep -Fq '"status": "ready"' "$BOOT_STATUS_FILE" || fail "generate_config did not mark boot status ready"
         grep -Fq '"reason": "generate_config"' "$BOOT_STATUS_FILE" || fail "generate_config did not replace stale silent_start reason"
         ! boot_status_summary | grep -Fq 'no_config' || fail "diagnostics would still show stale no_config boot status"
@@ -2560,8 +2570,8 @@ test_config_exports_write_local_only_metadata() {
     GITHUB_USER="tester"
     write_config_exports_from_links "vless://example-one" "vless://example-two" >/dev/null
 
-    python -m json.tool "$CONFIG_META_FILE" >/dev/null || fail "config metadata is not valid JSON"
-    python -m json.tool "$CODESPACE_BUNDLE_FILE" >/dev/null || fail "Codespace import bundle is not valid JSON"
+    "$TEST_PYTHON" -m json.tool "$CONFIG_META_FILE" >/dev/null || fail "config metadata is not valid JSON"
+    "$TEST_PYTHON" -m json.tool "$CODESPACE_BUNDLE_FILE" >/dev/null || fail "Codespace import bundle is not valid JSON"
     grep -Fq '"codespace_name": "behavior-space"' "$CODESPACE_BUNDLE_FILE" \
         || fail "Codespace import bundle is missing its Codespace name"
     grep -Fq '"configs": [' "$CODESPACE_BUNDLE_FILE" \
@@ -2638,7 +2648,7 @@ test_config_exports_are_stable_client_artifacts() {
     mapfile -t mobile_lines < "$MOBILE_CONFIG_FILE"
     [[ "${mobile_lines[0]:-}" == "$link1" && "${mobile_lines[1]:-}" == "$link2" ]] \
         || fail "mobile export did not preserve generated link ordering"
-    python - "$SUBSCRIPTION_FILE" "$link1" "$link2" <<'PY' || fail "subscription export does not decode to expected VLESS links"
+    "$TEST_PYTHON" - "$SUBSCRIPTION_FILE" "$link1" "$link2" <<'PY' || fail "subscription export does not decode to expected VLESS links"
 import base64, pathlib, sys
 decoded = base64.b64decode(pathlib.Path(sys.argv[1]).read_text()).decode().splitlines()
 if decoded != [sys.argv[2], sys.argv[3]]:
@@ -3291,7 +3301,7 @@ test_websocket_fallback_adds_config_and_public_port() {
             return 0
         }
         generate_config >/dev/null
-        python -m json.tool "$CONFIG_FILE" >/dev/null || fail "generated WS fallback config is not valid JSON"
+        "$TEST_PYTHON" -m json.tool "$CONFIG_FILE" >/dev/null || fail "generated WS fallback config is not valid JSON"
         grep -Fq '"tag": "vless-ws"' "$CONFIG_FILE" || fail "WS fallback did not add vless-ws inbound"
         grep -Fq '"network": "ws"' "$CONFIG_FILE" || fail "WS fallback inbound is not WebSocket"
         grep -Fq '"path": "/ws"' "$CONFIG_FILE" || fail "WS fallback inbound does not use /ws path"
@@ -3314,7 +3324,7 @@ test_config_metadata_sanitizes_invalid_max_fallback_links() {
     GITHUB_USER="tester"
 
     write_config_metadata 1 "abc123"
-    python -m json.tool "$CONFIG_META_FILE" >/dev/null || fail "metadata JSON broke when max fallback links was invalid"
+    "$TEST_PYTHON" -m json.tool "$CONFIG_META_FILE" >/dev/null || fail "metadata JSON broke when max fallback links was invalid"
     grep -Fq '"max_fallback_links": 20' "$CONFIG_META_FILE" \
         || fail "invalid max fallback link setting was not sanitized to default 20"
     pass "config metadata sanitizes invalid max fallback link settings"
@@ -3357,7 +3367,7 @@ test_bench_json_reports_deterministic_budgets() {
     fi
     bench_file="$TMP_ROOT/bench.json"
     printf '%s\n' "$output" > "$bench_file"
-    python - "$bench_file" <<'PY' || fail "bench_json did not return valid budget JSON"
+    "$TEST_PYTHON" - "$bench_file" <<'PY' || fail "bench_json did not return valid budget JSON"
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as handle:
     data = json.load(handle)
@@ -3393,7 +3403,7 @@ PY
     fi
     [[ ! -e "$bench_root/data" && ! -e "$bench_root/logs" ]] \
         || fail "bench --json --mock created runtime dirs in the command working tree"
-    python - "$command_output" <<'PY' || fail "bench --json --mock command did not return valid passing JSON"
+    "$TEST_PYTHON" - "$command_output" <<'PY' || fail "bench --json --mock command did not return valid passing JSON"
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as handle:
     data = json.load(handle)
@@ -3634,7 +3644,7 @@ test_doctor_json_reports_probe_state() {
     }
     background_supervisor_status() { printf 'pid=1 running=heartbeat version=ok token=present heartbeat_age=1s\n'; }
     output="$(print_doctor_json)"
-    python -m json.tool <<< "$output" >/dev/null || fail "doctor json became invalid when probe reason is present"
+    "$TEST_PYTHON" -m json.tool <<< "$output" >/dev/null || fail "doctor json became invalid when probe reason is present"
     grep -Fq '"codespace": "behavior-space"' <<< "$output" || fail "doctor json missing codespace"
     grep -Fq '"edge_probe": {"http_status": 404' <<< "$output" || fail "doctor json missing edge probe"
     grep -Fq '"next_action_code": "wait_route_or_recover"' <<< "$output" || fail "doctor json missing actionable next_action_code"
@@ -3654,7 +3664,7 @@ test_doctor_json_sanitizes_invalid_port() {
     xhttp_probe_metrics() { printf '0 0\n'; }
     background_supervisor_status() { printf 'pid=none running=false version=missing token=missing heartbeat_age=unknown\n'; }
     output="$(print_doctor_json)"
-    python -m json.tool <<< "$output" >/dev/null || fail "doctor json is invalid with nonnumeric XRAY_PORT"
+    "$TEST_PYTHON" -m json.tool <<< "$output" >/dev/null || fail "doctor json is invalid with nonnumeric XRAY_PORT"
     grep -Fq '"port": 443' <<< "$output" || fail "doctor json did not sanitize invalid XRAY_PORT to 443"
     pass "doctor json remains valid with invalid port input"
 }
@@ -3863,7 +3873,7 @@ test_recover_now_json_reports_ready_contract() {
         output="$(recover_now_json)"
         rc=$?
         [[ "$rc" -eq 0 ]] || fail "ready recover_now_json returned $rc"
-        python -m json.tool <<< "$output" >/dev/null || fail "recover_now_json returned invalid JSON"
+        "$TEST_PYTHON" -m json.tool <<< "$output" >/dev/null || fail "recover_now_json returned invalid JSON"
         grep -Fq '"ok": true' <<< "$output" || fail "recover_now_json did not report ok=true"
         grep -Fq '"status": "ready"' <<< "$output" || fail "recover_now_json did not report ready status"
         grep -Fq '"route_ready": true' <<< "$output" || fail "recover_now_json did not report route_ready=true"
@@ -3893,7 +3903,7 @@ test_recover_now_json_reports_settling_contract() {
             rc=$?
         fi
         [[ "$rc" -ne 0 ]] || fail "settling recover_now_json returned zero"
-        python -m json.tool <<< "$output" >/dev/null || fail "settling recover_now_json returned invalid JSON"
+        "$TEST_PYTHON" -m json.tool <<< "$output" >/dev/null || fail "settling recover_now_json returned invalid JSON"
         grep -Fq '"ok": false' <<< "$output" || fail "recover_now_json did not report ok=false while settling"
         grep -Fq '"status": "settling"' <<< "$output" || fail "recover_now_json did not report settling status"
         grep -Fq '"route_ready": false' <<< "$output" || fail "recover_now_json did not report route_ready=false"
@@ -3917,7 +3927,7 @@ test_recover_now_json_treats_followup_ready_probe_as_success() {
         output="$(recover_now_json)"
         rc=$?
         [[ "$rc" -eq 0 ]] || fail "ready follow-up probe should make recover_now_json exit zero, got $rc"
-        python -m json.tool <<< "$output" >/dev/null || fail "follow-up ready recover_now_json returned invalid JSON"
+        "$TEST_PYTHON" -m json.tool <<< "$output" >/dev/null || fail "follow-up ready recover_now_json returned invalid JSON"
         grep -Fq '"ok": true' <<< "$output" || fail "follow-up ready recover_now_json did not report ok=true"
         grep -Fq '"status": "ready"' <<< "$output" || fail "follow-up ready recover_now_json did not report ready"
         grep -Fq '"exit_code": 0' <<< "$output" || fail "follow-up ready recover_now_json did not expose final exit_code=0"
@@ -4070,7 +4080,7 @@ test_structured_log_jsonl_is_parseable_with_special_chars() {
     reset_runtime_paths
     log_event INFO $'route_unusable detail="bad route" path=C:\\tmp\\x\nnext-line'
     log_event WARN "fallback_route_unusable ip=20.0.0.1 xhttp_probe=404"
-    python - "$STRUCTURED_LOG_FILE" <<'PY' || fail "structured event log contains invalid JSONL"
+    "$TEST_PYTHON" - "$STRUCTURED_LOG_FILE" <<'PY' || fail "structured event log contains invalid JSONL"
 import json
 import sys
 path = sys.argv[1]
@@ -4137,7 +4147,7 @@ test_support_bundle_redacts_sensitive_material() {
     grep -R -Fq '<vless-redacted>' "$extract" || fail "support bundle did not mark redacted VLESS links"
     grep -R -Fq '<codespace-redacted>' "$extract" || fail "support bundle did not mark redacted Codespace identity"
     grep -R -Fq '<ip-redacted>' "$extract" || fail "support bundle did not mark redacted route IPs"
-    python - "$extract/logs/g2ray-events.jsonl" <<'PY' || fail "support bundle redaction corrupted structured JSONL"
+    "$TEST_PYTHON" - "$extract/logs/g2ray-events.jsonl" <<'PY' || fail "support bundle redaction corrupted structured JSONL"
 import json
 import sys
 with open(sys.argv[1], encoding="utf-8") as fh:
