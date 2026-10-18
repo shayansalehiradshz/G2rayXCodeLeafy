@@ -692,8 +692,20 @@ tcp_fast_open_outbound_enabled() {
     (( (value & 1) == 1 ))
 }
 
+deadline_time_us() {
+    local stamp="${EPOCHREALTIME:-}"
+    if [[ "$stamp" =~ ^([0-9]+)\.([0-9]{6})$ ]]; then
+        printf -v "$1" '%s%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    else
+        stamp=$(date +%s%6N 2>/dev/null) || return 1
+        [[ "$stamp" =~ ^[0-9]{10,18}$ ]] || return 1
+        printf -v "$1" '%s' "$stamp"
+    fi
+}
+
 run_with_deadline() {
     local seconds="${1:-30}" pid waited_ticks=0 max_ticks status=0 status_file command_name monitor_was_enabled=false
+    local start_us now_us completed_us budget_us
     shift || return 1
     [[ "$seconds" =~ ^[0-9]+$ && "$seconds" -gt 0 ]] || seconds=30
     max_ticks=$((seconds * 10))
@@ -702,7 +714,12 @@ run_with_deadline() {
         log_event ERROR "deadline_init_failed command=${command_name}"
         return 125
     }
-    rm -f "$status_file" 2>/dev/null || true
+    if ! deadline_time_us start_us; then
+        rm -f "$status_file" 2>/dev/null || true
+        log_event ERROR "deadline_clock_init_failed command=${command_name}"
+        return 125
+    fi
+    budget_us=$((seconds * 1000000))
     [[ "$-" == *m* ]] && monitor_was_enabled=true
     # Job control gives this wrapper a dedicated process group. Descendants
     # keep that identity after their parent exits during TERM handling.
@@ -710,9 +727,13 @@ run_with_deadline() {
     (
         set +m
         set +e
-        "$@"
+        # Do not launch work before the parent verifies our isolated group.
+        while [[ ! -s "$status_file" ]]; do sleep 0.01; done
+        # Command-local EXIT traps must finish before recording completion.
+        ( "$@" )
         status=$?
-        printf '%s\n' "$status" > "$status_file" 2>/dev/null || true
+        deadline_time_us completed_us || completed_us=0
+        printf '%s\n' "$status" "$completed_us" > "$status_file" 2>/dev/null || true
         exit "$status"
     ) &
     pid=$!
@@ -726,17 +747,35 @@ run_with_deadline() {
         log_event ERROR "deadline_group_init_failed command=${command_name}"
         return 125
     fi
+    if ! builtin printf 'ready\n' > "$status_file"; then
+        kill -KILL "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        rm -f "$status_file" 2>/dev/null || true
+        log_event ERROR "deadline_group_init_failed command=${command_name}"
+        return 125
+    fi
     # Reporting the command's status does not finish the wrapper: EXIT traps
     # and cleanup may still be running. Keep its entire lifetime bounded.
     while [[ ! -s "$status_file" ]] || kill -0 "$pid" 2>/dev/null; do
-        if (( waited_ticks >= max_ticks )); then
+        if ! deadline_time_us now_us || (( now_us < start_us )); then
+            status=125
+        elif (( now_us - start_us >= budget_us || waited_ticks >= max_ticks )); then
+            status=124
+        else
+            status=0
+        fi
+        if (( status != 0 )); then
             kill -TERM -- "-$pid" 2>/dev/null || true
             sleep 0.2
             kill -KILL -- "-$pid" 2>/dev/null || true
             wait "$pid" 2>/dev/null || true
             rm -f "$status_file" 2>/dev/null || true
-            log_event WARN "deadline_exceeded command=${command_name} timeout_sec=${seconds}"
-            return 124
+            if (( status == 124 )); then
+                log_event WARN "deadline_exceeded command=${command_name} timeout_sec=${seconds}"
+            else
+                log_event ERROR "deadline_clock_failed command=${command_name}"
+            fi
+            return "$status"
         fi
         if ! kill -0 "$pid" 2>/dev/null; then
             wait "$pid" 2>/dev/null || status=$?
@@ -746,9 +785,17 @@ run_with_deadline() {
         sleep 0.1
         waited_ticks=$((waited_ticks + 1))
     done
-    status=$(cat "$status_file" 2>/dev/null || printf '1')
+    { read -r status && read -r completed_us; } < "$status_file" || completed_us=0
     wait "$pid" 2>/dev/null || status=$?
     rm -f "$status_file" 2>/dev/null || true
+    if [[ ! "$completed_us" =~ ^[0-9]+$ ]] || (( completed_us < start_us )); then
+        log_event ERROR "deadline_clock_failed command=${command_name}"
+        return 125
+    fi
+    if (( completed_us - start_us >= budget_us )); then
+        log_event WARN "deadline_exceeded command=${command_name} timeout_sec=${seconds}"
+        return 124
+    fi
     [[ "$status" =~ ^[0-9]+$ ]] || status=1
     return "$status"
 }

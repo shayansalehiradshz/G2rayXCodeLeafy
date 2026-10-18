@@ -8,6 +8,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
@@ -48,7 +49,12 @@ private fun ConfigShareDialog(rawUri: String, onDismiss: () -> Unit) {
     }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(if (qrRequested) "Config QR" else "Share config") },
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(if (qrRequested) "Config QR" else "Share config", Modifier.weight(1f))
+                FeatureInfoButton(FeatureHelp.Share)
+            }
+        },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 if (qrRequested) {

@@ -184,17 +184,17 @@ class G2RayViewModel internal constructor(
     val diagnosticsEnabled = _diagnosticsEnabled.asStateFlow()
     internal val quotaEstimates = com.g2ray.client.data.QuotaEstimateStore((application as G2RayApplication).secureStore)
     private var accountSwitchJob: Job? = null
-    internal fun saveQuotaFromBundle(accountId: String, input: String) {
+    internal fun saveQuotaFromBundle(accountId: String, input: String) =
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
                 val bundle = org.json.JSONObject(com.g2ray.client.parser.ConfigImportPayload.expand(input))
+                if (bundle.optInt("schema_version") !in 1..2) return@runCatching
                 val expected = accounts.value.firstOrNull { it.id == accountId }?.codespaceName ?: return@runCatching
                 if (bundle.optString("codespace_name") != expected) return@runCatching
                 val quota = bundle.optJSONObject("quota_estimate") ?: return@runCatching
                 quotaEstimates.save(accountId, com.g2ray.client.data.QuotaEstimateStore.fromJson(quota))
             }
         }
-    }
 
     fun saveRoutingPolicy(policy: com.g2ray.client.vpn.RoutingPolicy, onResult: (Result<Unit>) -> Unit) {
         if (!configurationMutationAllowedNow()) {

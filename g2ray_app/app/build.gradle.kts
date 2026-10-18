@@ -130,7 +130,8 @@ dependencies {
     implementation(libs.androidx.navigation.compose)
     implementation(libs.androidx.security.crypto)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
-    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+    implementation(libs.zxing.embedded)
+    implementation(libs.zxing.core)
 
     // Networking
     implementation(libs.retrofit)

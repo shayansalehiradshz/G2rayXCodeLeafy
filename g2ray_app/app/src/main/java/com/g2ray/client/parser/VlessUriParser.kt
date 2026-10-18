@@ -81,10 +81,10 @@ object VlessUriParser {
     }
 
     fun parseFirstProfile(input: String): Result<G2RayProfile> {
-        val source = runCatching { ConfigImportPayload.profileText(input) }.getOrElse { return Result.failure(it) }
         if (input.length > MAX_IMPORT_INPUT_CHARS) {
             return Result.failure(IllegalArgumentException("Config import text is too large"))
         }
+        val source = runCatching { ConfigImportPayload.profileText(input) }.getOrElse { return Result.failure(it) }
         val candidates = extractVlessLines(source)
 
         for (candidate in candidates) {
@@ -104,11 +104,11 @@ object VlessUriParser {
     }
 
     fun parseAllProfiles(input: String): List<Result<G2RayProfile>> {
-        val source = runCatching { ConfigImportPayload.profileText(input) }
-            .getOrElse { return listOf(Result.failure(it)) }
         if (input.length > MAX_IMPORT_INPUT_CHARS) {
             return listOf(Result.failure(IllegalArgumentException("Config import text is too large")))
         }
+        val source = runCatching { ConfigImportPayload.profileText(input) }
+            .getOrElse { return listOf(Result.failure(it)) }
         var candidates = extractVlessLines(source, MAX_PROFILE_CANDIDATES + 1)
         if (candidates.isEmpty()) {
             val decoded = tryDecodeBase64Subscription(source)

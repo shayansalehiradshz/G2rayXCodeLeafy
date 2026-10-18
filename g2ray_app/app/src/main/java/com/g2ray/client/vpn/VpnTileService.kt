@@ -49,28 +49,45 @@ class VpnTileService : TileService() {
             val state = VpnStateRepository.state.value
             if (state.tunnelState == TunnelState.Stopping) return@unlockAndRun
             if (state.alwaysOnVpn != true && state.tunnelState in setOf(TunnelState.Connected, TunnelState.Starting, TunnelState.Blocked)) {
-                startService(Intent(this, G2RayVpnService::class.java).setAction(G2RayVpnService.ACTION_STOP))
+                requestStopOrOpenApp(
+                    { startService(Intent(this, G2RayVpnService::class.java).setAction(G2RayVpnService.ACTION_STOP)) },
+                    { openApp(connect = false) }
+                )
             } else {
-                val intent = Intent(this, MainActivity::class.java).apply {
-                    action = if (state.alwaysOnVpn == true) Intent.ACTION_MAIN else ACTION_CONNECT_FROM_TILE
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-                }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                    startActivityAndCollapse(PendingIntent.getActivity(
-                        this, 7, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT))
-                } else {
-                    launchBeforeAndroid14(intent)
-                }
+                openApp(connect = state.alwaysOnVpn != true)
             }
         }
     }
 
     override fun onDestroy() { scope.cancel(); super.onDestroy() }
 
+    private fun openApp(connect: Boolean) {
+        val intent = Intent(this, MainActivity::class.java).apply {
+            action = if (connect) ACTION_CONNECT_FROM_TILE else Intent.ACTION_MAIN
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startActivityAndCollapse(PendingIntent.getActivity(
+                this, 7, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT))
+        } else launchBeforeAndroid14(intent)
+    }
+
     // The PendingIntent overload does not exist before API 34.
     @SuppressLint("StartActivityAndCollapseDeprecated")
     @Suppress("DEPRECATION")
     private fun launchBeforeAndroid14(intent: Intent) = startActivityAndCollapse(intent)
 
-    companion object { const val ACTION_CONNECT_FROM_TILE = "com.g2ray.client.CONNECT_FROM_TILE" }
+    companion object {
+        const val ACTION_CONNECT_FROM_TILE = "com.g2ray.client.CONNECT_FROM_TILE"
+
+        internal fun requestStopOrOpenApp(requestStop: () -> Unit, openApp: () -> Unit) {
+            try {
+                requestStop()
+            } catch (_: IllegalStateException) {
+                openApp()
+            } catch (_: SecurityException) {
+                openApp()
+            }
+        }
+    }
 }

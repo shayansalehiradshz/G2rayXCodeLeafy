@@ -13,6 +13,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -45,7 +46,7 @@ internal fun ConnectionSettingsScreen(vm: G2RayViewModel, onBack: () -> Unit) {
     val vpn by VpnStateRepository.state.collectAsStateWithLifecycle()
     val enabled = vpn.tunnelState in setOf(TunnelState.Disabled, TunnelState.Disconnected, TunnelState.Error)
     val context = LocalContext.current
-    var tileMessage by remember { mutableStateOf<String?>(null) }
+    var tileMessage by rememberSaveable { mutableStateOf<String?>(null) }
     Scaffold(topBar = { TopAppBar(title = { Text("Connection settings") }, navigationIcon = {
         IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
     }) }) { padding ->

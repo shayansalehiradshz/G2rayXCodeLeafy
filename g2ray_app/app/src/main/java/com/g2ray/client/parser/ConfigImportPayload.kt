@@ -34,12 +34,16 @@ internal object ConfigImportPayload {
     }
 
     fun profileText(input: String): String {
+        val compact = input.trimStart().startsWith(PREFIX)
         val expanded = expand(input)
         val trimmed = expanded.trim()
-        if (!trimmed.startsWith('{')) return expanded
-        val json = runCatching { JSONObject(trimmed) }.getOrNull() ?: return expanded
-        val configs = json.optJSONArray("configs") ?: return expanded
-        require(json.optInt("schema_version") in 1..2 && configs.length() <= 500) { "Unsupported config bundle" }
+        val json = if (trimmed.startsWith('{')) runCatching { JSONObject(trimmed) }.getOrNull() else null
+        val configs = json?.optJSONArray("configs")
+        val supported = (json?.optInt("schema_version") ?: -1) in 1..2 && configs != null
+        require(!compact || supported) { "Unsupported config bundle" }
+        if (configs == null) return expanded
+        // Plain foreign JSON is a link container, not a trusted bundle schema.
+        require(configs.length() <= 500) { "A single import can contain at most 500 configs" }
         return (0 until configs.length()).joinToString("\n") { configs.getString(it) }
     }
 }

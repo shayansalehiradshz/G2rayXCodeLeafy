@@ -20,7 +20,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.Cloud
-import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.NetworkCheck
@@ -224,8 +223,13 @@ fun HomeScreen(
                             Text("Down  ${SpeedFormatter.formatBps(vpnUiState.downloadBps)}", style = MaterialTheme.typography.titleMedium)
                             Text("Up  ${SpeedFormatter.formatBps(vpnUiState.uploadBps)}", style = MaterialTheme.typography.titleMedium)
                         }
+                        Text("Session: ${android.text.format.Formatter.formatFileSize(context, vpnUiState.totalRxBytes)} down / " +
+                            "${android.text.format.Formatter.formatFileSize(context, vpnUiState.totalTxBytes)} up",
+                            style = MaterialTheme.typography.bodySmall)
                     } else Text("Route verified. Live byte counters are available with HEV.",
                         style = MaterialTheme.typography.bodySmall)
+                } else if (vpnUiState.tunnelState == TunnelState.Connected) {
+                    Text("Verifying the live tunnel route...", style = MaterialTheme.typography.bodySmall)
                 }
                 Text("Android outside-VPN blocking: ${vpnBlockingStatusLabel(vpnUiState.blockConnectionsWithoutVpn)}",
                     style = MaterialTheme.typography.bodySmall)
@@ -453,11 +457,12 @@ fun HomeScreen(
 
             if (activeAccount != null) {
                 Column(modifier = Modifier.fillMaxWidth()) {
-                    Text(
-                        "Configs for ${activeAccount?.displayName}",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Configs for ${activeAccount?.displayName}",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                        FeatureInfoButton(FeatureHelp.Ping)
+                    }
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.End

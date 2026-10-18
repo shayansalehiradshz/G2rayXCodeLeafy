@@ -53,6 +53,35 @@ import java.util.concurrent.atomic.AtomicBoolean
 @Config(application = G2RayApplication::class, sdk = [31])
 class SavedDataRecoveryViewModelTest {
     @Test
+    fun onlyKnownMatchingBundlesCanUpdateAnAccountsUsageEstimate() {
+        val repository = repositoryWithProfile()
+        val accountId = repository.activeSelection.value.accountId!!
+        val quotaStore = com.g2ray.client.data.QuotaEstimateStore(InMemorySecureStore())
+        withViewModel(repository, InMemorySecureStore()) { viewModel, _ ->
+            G2RayViewModel::class.java.getDeclaredField("quotaEstimates").apply { isAccessible = true }
+                .set(viewModel, quotaStore)
+            val now = System.currentTimeMillis()
+            val quota = org.json.JSONObject().put("used_seconds", 3600).put("budget_seconds", 216000)
+                .put("sampled_at_ms", now).put("cycle", com.g2ray.client.data.quotaCycle(now))
+                .put("assumed_running", false)
+            val bundle = org.json.JSONObject().put("codespace_name", "fixture-space").put("quota_estimate", quota)
+            runBlocking {
+                for (schema in listOf<Int?>(null, 99)) {
+                    schema?.let { bundle.put("schema_version", it) }
+                    viewModel.saveQuotaFromBundle(accountId, bundle.toString()).join()
+                    assertNull(quotaStore.read(accountId))
+                }
+                bundle.put("schema_version", 2).put("codespace_name", "other-space")
+                viewModel.saveQuotaFromBundle(accountId, bundle.toString()).join()
+                assertNull(quotaStore.read(accountId))
+                bundle.put("codespace_name", "fixture-space")
+                viewModel.saveQuotaFromBundle(accountId, bundle.toString()).join()
+                assertEquals(3600L, quotaStore.read(accountId)?.usedSeconds)
+            }
+        }
+    }
+
+    @Test
     fun codespaceSwitchWithoutConfigsLeavesTheWorkingSessionAlone() {
         val repository = repositoryWithProfile()
         val empty = repository.addAccount("Empty", "", "empty-space")

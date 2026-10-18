@@ -34,7 +34,7 @@ internal fun RoutingSettingsScreen(vm: G2RayViewModel, onBack: () -> Unit) {
     var domains by rememberSaveable { mutableStateOf(policy.bypassDomains.joinToString("\n")) }
     var excluded by rememberSaveable { mutableStateOf(ArrayList(policy.excludedPackages)) }
     var search by rememberSaveable { mutableStateOf("") }
-    var status by remember { mutableStateOf("") }
+    var status by rememberSaveable { mutableStateOf("") }
     var saving by remember { mutableStateOf(false) }
     val apps by produceState<Result<List<BypassApp>>?>(null) {
         value = withContext(Dispatchers.IO) { runCatching {

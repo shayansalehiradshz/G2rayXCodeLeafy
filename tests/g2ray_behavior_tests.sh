@@ -4511,6 +4511,38 @@ test_deadline_preserves_status_without_a_status_write() {
     pass 'deadline preserves command exit status when its status write fails'
 }
 
+test_deadline_uses_completion_time_when_parent_is_delayed() {
+    (
+        reset_runtime_paths
+        local delayed=false rc=0
+        deadline_delayed_cleanup() { trap 'sleep 2' EXIT; return 0; }
+        kill() {
+            if [[ "${1:-}" == -0 && "${2:-}" != -- && "$delayed" == false ]]; then
+                delayed=true
+                sleep 3
+            fi
+            builtin kill "$@"
+        }
+        run_with_deadline 1 deadline_delayed_cleanup || rc=$?
+        [[ "$rc" == 124 ]] || fail "a delayed parent accepted cleanup after its deadline: $rc"
+        delayed=false
+        run_with_deadline 1 true || fail 'a delayed parent rejected a task that completed within its deadline'
+    )
+    pass 'deadline distinguishes actual completion from delayed parent scheduling'
+}
+
+test_deadline_fails_closed_without_a_clock() {
+    (
+        reset_runtime_paths
+        deadline_time_us() { return 1; }
+        local rc=0
+        run_with_deadline 1 touch "$TMP_ROOT/deadline-clock-must-not-run" || rc=$?
+        [[ "$rc" == 125 && ! -e "$TMP_ROOT/deadline-clock-must-not-run" ]] \
+            || fail 'deadline ran without a usable clock'
+    )
+    pass 'deadline clock initialization failure never runs an unbounded task'
+}
+
 test_deadline_rejects_unverified_process_group() {
     (
         reset_runtime_paths
@@ -4520,10 +4552,14 @@ test_deadline_rejects_unverified_process_group() {
             fi
             builtin kill "$@"
         }
-        deadline_test_work() { while :; do :; done; }
+        deadline_test_work() {
+            printf 'started\n' > "$TMP_ROOT/deadline-unverified-started"
+            while :; do :; done
+        }
         local rc=0 started="$SECONDS"
         run_with_deadline 10 deadline_test_work || rc=$?
         [[ "$rc" == 125 ]] || fail "unverified deadline group returned $rc instead of initialization failure"
+        [[ ! -e "$TMP_ROOT/deadline-unverified-started" ]] || fail 'unverified deadline group launched its command'
         (( SECONDS - started < 5 )) || fail 'unverified process group waited for the command deadline'
         grep -Fq 'deadline_group_init_failed' "$LOG_FILE" || fail 'group initialization failure was not reported'
     )
@@ -5099,6 +5135,8 @@ test_all_config_qr_preserves_links_and_usage_without_touching_runtime
 test_xhttp_extra_requires_one_complete_object
 test_deadline_includes_exit_cleanup
 test_deadline_preserves_status_without_a_status_write
+test_deadline_uses_completion_time_when_parent_is_delayed
+test_deadline_fails_closed_without_a_clock
 test_degraded_probe_keeps_healthy_baseline_at_threshold
 test_optional_legacy_bundle_failure_preserves_current_exports
 test_codespace_bundle_rejects_missing_or_empty_links
