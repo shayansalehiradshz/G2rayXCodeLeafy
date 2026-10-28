@@ -139,6 +139,10 @@ class SocksRunningRouteProbe : RunningRouteProbe {
             current?.let(::closeClient)
             return OkHttpClient.Builder()
                 .proxy(Proxy(Proxy.Type.SOCKS, InetSocketAddress.createUnresolved("127.0.0.1", socksPort)))
+                // A stale pooled socket should fail this bounded health probe
+                // once, then let the quorum/recovery loop decide. OkHttp's
+                // transparent retry can otherwise hide a mobile-NAT reset.
+                .retryOnConnectionFailure(false)
                 .connectTimeout(3, TimeUnit.SECONDS)
                 .readTimeout(3, TimeUnit.SECONDS)
                 .callTimeout(4, TimeUnit.SECONDS)
