@@ -108,6 +108,23 @@ class G2RayVpnServiceTest {
     }
 
     @Test
+    fun singleProfileStartupBudgetDoesNotResolveOptionalBackups() = runBlocking {
+        val selected = liveProfile("203.0.113.1")
+        val backup = liveProfile("backup.example")
+        val lookups = mutableListOf<String>()
+        val result = G2RayVpnService.resolveRuntimeProfilesForStartup(
+            profiles = listOf(selected, backup),
+            maxProfiles = 1
+        ) {
+            lookups += it
+            listOf(it)
+        }
+
+        assertEquals(listOf(selected), result)
+        assertEquals(listOf(selected.address), lookups)
+    }
+
+    @Test
     fun optionalBlockingLookupIsInterruptedWhenItsGraceExpires() = runBlocking {
         val selected = liveProfile("203.0.113.1")
         val slow = liveProfile("slow.example")

@@ -580,9 +580,11 @@ class G2RayVpnService : VpnService() {
             resolve: suspend (String) -> List<String>
         ): List<G2RayProfile> = withContext(Dispatchers.IO) { supervisorScope {
             require(profiles.isNotEmpty()) { "A selected VPN profile is required" }
+            require(maxProfiles > 0) { "At least one runtime profile is required" }
             require(optionalGraceMs > 0 && primaryGraceMs > 0 && fallbackWaitMs > 0)
             val template = VlessUriParser.transportTemplateKey(profiles.first())
-            val eligible = profiles.take(MAX_LIVE_ROUTE_PROFILES).filterIndexed { index, profile ->
+            val profileBudget = maxProfiles.coerceAtMost(MAX_LIVE_ROUTE_PROFILES)
+            val eligible = profiles.take(profileBudget).filterIndexed { index, profile ->
                 index == 0 || VlessUriParser.transportTemplateKey(profile) == template
             }
             val tasks = eligible.map { it.address }.distinct().associateWith { address ->
