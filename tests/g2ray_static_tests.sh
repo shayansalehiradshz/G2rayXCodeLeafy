@@ -331,6 +331,19 @@ test_shell_files_are_lf_normalized() {
     pass 'shell files are LF-normalized for Linux Bash'
 }
 
+test_patch_files_are_lf_normalized() {
+    local file
+    grep_fixed '*.patch text eol=lf' "$GITATTRIBUTES" \
+        || fail '.gitattributes does not force patch files to LF'
+    while IFS= read -r file; do
+        [[ -f "$ROOT_DIR/$file" ]] || continue
+        if LC_ALL=C grep -q $'\r' "$ROOT_DIR/$file"; then
+            fail "tracked patch file contains CRLF bytes: $file"
+        fi
+    done < <(git -C "$ROOT_DIR" ls-files '*.patch' 2>/dev/null)
+    pass 'patch files are LF-normalized for portable application'
+}
+
 test_panel_script_is_executable() {
     git -C "$ROOT_DIR" ls-files --stage -- g2ray.sh | grep -q '^100755 ' \
         || fail 'g2ray.sh is not tracked as executable, so ./g2ray.sh fails after git pull in Linux Codespaces'
@@ -2180,6 +2193,7 @@ test_exit_trap_preserves_failures
 test_generated_files_are_ignored
 test_support_bundle_has_safe_entrypoint
 test_shell_files_are_lf_normalized
+test_patch_files_are_lf_normalized
 test_panel_script_is_executable
 test_xray_version_can_be_pinned
 test_generated_config_uses_resilient_dns_fallback
