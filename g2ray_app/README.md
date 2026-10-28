@@ -122,7 +122,10 @@ portable rather than simpler.
 - **HEV** keeps the choice explicit for testing. It uses loopback SOCKS between
   HEV and Xray and exposes true VPN TUN upload/download counters.
 - **Native** uses Xray's Android TUN inbound directly. It is the default Auto
-  data path; the app does not invent device-wide throughput figures for it.
+  data path. When Android exposes per-UID counters, the app shows an explicitly
+  approximate rate for it; those counters can include small control-plane bytes
+  and are not a tunnel-only benchmark. If the counters are unavailable, the UI
+  says so instead of inventing a number.
 
 Physical-device tests found retained-connection idle stalls in Native and a
 HEV screen-off case. Fresh connections still worked. Both engines now use

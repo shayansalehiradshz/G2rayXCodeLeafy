@@ -152,8 +152,9 @@ object SpeedFormatter {
         }
     }
 
-    fun formatNotification(speed: TrafficSpeed): String {
-        return "Tunnel rate DL ${formatBps(speed.rxBps)}  UL ${formatBps(speed.txBps)}"
+    fun formatNotification(speed: TrafficSpeed, approximate: Boolean = false): String {
+        val prefix = if (approximate) "Approx. tunnel rate" else "Tunnel rate"
+        return "$prefix DL ${formatBps(speed.rxBps)}  UL ${formatBps(speed.txBps)}"
     }
 }
 
@@ -162,7 +163,10 @@ internal fun MutableStateFlow<AppConnectionState>.updateTunnelTraffic(speed: Tra
     update { previous ->
         if (
             !previous.tunnelVerified || previous.tunnelState != TunnelState.Connected ||
-            previous.tunnelTrafficSource != TunnelTrafficSource.HevTun
+            previous.tunnelTrafficSource !in setOf(
+                TunnelTrafficSource.HevTun,
+                TunnelTrafficSource.NativeUid
+            )
         ) {
             previous
         } else {

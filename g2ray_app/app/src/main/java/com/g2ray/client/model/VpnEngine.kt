@@ -24,7 +24,9 @@ enum class ActiveVpnEngine(val label: String) {
 
 enum class TunnelTrafficSource {
     Unavailable,
-    HevTun
+    HevTun,
+    /** Android per-UID physical counters; useful for native-TUN estimates, not exact tunnel bytes. */
+    NativeUid
 }
 
 object VpnEngineSelector {

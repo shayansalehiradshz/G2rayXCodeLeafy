@@ -249,6 +249,23 @@ class TrafficSpeedTest {
     }
 
     @Test
+    fun updateTunnelTraffic_acceptsNativeUidApproximateSamples() {
+        val connected = connectedState().copy(
+            activeVpnEngine = ActiveVpnEngine.XrayNative,
+            tunnelTrafficSource = TunnelTrafficSource.NativeUid
+        )
+        val flow = MutableStateFlow(connected)
+
+        flow.updateTunnelTraffic(TrafficSpeed(
+            rxBps = 7_000, txBps = 2_000, totalRxBytes = 12_000, totalTxBytes = 3_000
+        ))
+
+        assertEquals(connected.copy(
+            downloadBps = 7_000, uploadBps = 2_000, totalRxBytes = 12_000, totalTxBytes = 3_000
+        ), flow.value)
+    }
+
+    @Test
     fun updateTunnelTraffic_cannotShowHevNumbersForUnverifiedOrNativeTunnel() {
         val connected = connectedState()
         listOf(

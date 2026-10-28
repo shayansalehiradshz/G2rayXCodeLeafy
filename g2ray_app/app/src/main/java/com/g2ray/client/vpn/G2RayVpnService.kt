@@ -1636,8 +1636,11 @@ class G2RayVpnService : VpnService() {
             tunnelState == TunnelState.Disconnected || tunnelState == TunnelState.Disabled -> RouteState.Unknown
             else -> RouteState.Settling
         }
-        val hasMeasuredTunnelTraffic = tunnelState == TunnelState.Connected &&
-            tunnelVerified && activeEngine == ActiveVpnEngine.Hev && hevTunnelRunning
+        val hasMeasuredTunnelTraffic = tunnelState == TunnelState.Connected && tunnelVerified && when (activeEngine) {
+            ActiveVpnEngine.Hev -> hevTunnelRunning
+            ActiveVpnEngine.XrayNative -> nativeTrafficSource.snapshot() != null
+            null -> false
+        }
         VpnStateRepository.state.update { previous ->
             previous.copy(
                 routeState = routeState,
@@ -1653,10 +1656,11 @@ class G2RayVpnService : VpnService() {
                     TunnelState.Disabled, TunnelState.Disconnected, TunnelState.Error, TunnelState.Blocked -> null
                     else -> activeEngine
                 },
-                tunnelTrafficSource = if (hasMeasuredTunnelTraffic) {
-                    TunnelTrafficSource.HevTun
-                } else {
-                    TunnelTrafficSource.Unavailable
+                tunnelTrafficSource = when {
+                    !hasMeasuredTunnelTraffic -> TunnelTrafficSource.Unavailable
+                    activeEngine == ActiveVpnEngine.Hev -> TunnelTrafficSource.HevTun
+                    activeEngine == ActiveVpnEngine.XrayNative -> TunnelTrafficSource.NativeUid
+                    else -> TunnelTrafficSource.Unavailable
                 }
             )
         }
@@ -1786,16 +1790,21 @@ class G2RayVpnService : VpnService() {
      */
     private fun startNativeTrafficUpdates() {
         if (trafficJob?.isActive == true) return
+        val sampler = TrafficSpeedSampler(nativeTrafficSource)
+        speedSampler = sampler
         trafficJob = scope.launch {
             var previous = nativeTrafficSource.snapshot()
+            sampler.sample()
             var lastActivityAtMs = SystemClock.elapsedRealtime()
             var lastRxProgressAtMs = lastActivityAtMs
             var txBytesSinceLastRx = 0L
+            var notificationTick = 0
             while (isActive && core.state.value == TunnelCoreState.Connected) {
                 delay(1_000L)
                 val nowMs = SystemClock.elapsedRealtime()
+                val speed = sampler.sample()
                 val current = nativeTrafficSource.snapshot()
-                if (previous == null || current == null) {
+                if (previous == null || current == null || !speed.sampleValid) {
                     previous = current
                     lastActivityAtMs = nowMs
                     lastRxProgressAtMs = nowMs
@@ -1846,6 +1855,14 @@ class G2RayVpnService : VpnService() {
                     requestPromptRouteReverification(RouteReverifyReason.ActiveStall, nowMs)
                 }
                 previous = current
+                withContext(Dispatchers.Main) {
+                    notificationTick++
+                    if (notificationTick >= 4) {
+                        notificationTick = 0
+                        updateNotification(SpeedFormatter.formatNotification(speed, approximate = true))
+                    }
+                    publishSpeed(speed)
+                }
             }
         }
     }

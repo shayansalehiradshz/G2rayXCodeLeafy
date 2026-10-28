@@ -218,16 +218,25 @@ fun HomeScreen(
                     })
                 }
                 if (vpnUiState.tunnelState == TunnelState.Connected && vpnUiState.tunnelVerified) {
-                    if (vpnUiState.tunnelTrafficSource == TunnelTrafficSource.HevTun) {
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text("Down  ${SpeedFormatter.formatBps(vpnUiState.downloadBps)}", style = MaterialTheme.typography.titleMedium)
-                            Text("Up  ${SpeedFormatter.formatBps(vpnUiState.uploadBps)}", style = MaterialTheme.typography.titleMedium)
+                    when (vpnUiState.tunnelTrafficSource) {
+                        TunnelTrafficSource.HevTun,
+                        TunnelTrafficSource.NativeUid -> {
+                            val approximate = vpnUiState.tunnelTrafficSource == TunnelTrafficSource.NativeUid
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                Text("${if (approximate) "Approx. " else ""}Down  ${SpeedFormatter.formatBps(vpnUiState.downloadBps)}", style = MaterialTheme.typography.titleMedium)
+                                Text("${if (approximate) "Approx. " else ""}Up  ${SpeedFormatter.formatBps(vpnUiState.uploadBps)}", style = MaterialTheme.typography.titleMedium)
+                            }
+                            Text("Session: ${android.text.format.Formatter.formatFileSize(context, vpnUiState.totalRxBytes)} down / " +
+                                "${android.text.format.Formatter.formatFileSize(context, vpnUiState.totalTxBytes)} up",
+                                style = MaterialTheme.typography.bodySmall)
+                            if (approximate) {
+                                Text("Native-TUN rate uses Android app counters and may include small control-plane traffic.",
+                                    style = MaterialTheme.typography.bodySmall)
+                            }
                         }
-                        Text("Session: ${android.text.format.Formatter.formatFileSize(context, vpnUiState.totalRxBytes)} down / " +
-                            "${android.text.format.Formatter.formatFileSize(context, vpnUiState.totalTxBytes)} up",
+                        TunnelTrafficSource.Unavailable -> Text("Route verified. Live byte counters are unavailable on this device.",
                             style = MaterialTheme.typography.bodySmall)
-                    } else Text("Route verified. Live byte counters are available with HEV.",
-                        style = MaterialTheme.typography.bodySmall)
+                    }
                 } else if (vpnUiState.tunnelState == TunnelState.Connected) {
                     Text("Verifying the live tunnel route...", style = MaterialTheme.typography.bodySmall)
                 }
