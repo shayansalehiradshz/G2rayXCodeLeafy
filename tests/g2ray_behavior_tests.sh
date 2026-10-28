@@ -662,6 +662,16 @@ test_xhttp_upload_tuning_is_reversible_and_bundle_compatible() {
     printf '11111111-2222-4333-8444-555555555555\n' > "$UUID_FILE"
     write_test_vless_config
     jq -e '.scMaxEachPostBytes == 60000 and .scMinPostsIntervalMs == 10 and .xmux.maxConnections >= 1 and .xmux.maxConnections <= 6 and .xmux.hKeepAlivePeriod > 0' <<< "$XHTTP_TUNED_EXTRA_JSON" >/dev/null || fail 'measured tuning is invalid or unbounded'
+
+    unset G2RAY_XHTTP_LINK_TUNING
+    link=$(generate_link_for_address 20.0.0.1)
+    [[ "$link" != *'&extra='* ]] || fail 'XHTTP tuning unexpectedly enabled by default'
+
+    G2RAY_XHTTP_LINK_TUNING=unexpected-value
+    link=$(generate_link_for_address 20.0.0.1)
+    [[ "$link" != *'&extra='* ]] || fail 'invalid XHTTP tuning preference enabled tuning'
+
+    G2RAY_XHTTP_LINK_TUNING=on
     link=$(generate_link_for_address 20.0.0.1)
     [[ "$link" == *"extra=$(url_encode_query_value "$XHTTP_TUNED_EXTRA_JSON")"* ]] || fail 'tuned links lost their extra object'
     write_codespace_import_bundle "$link"

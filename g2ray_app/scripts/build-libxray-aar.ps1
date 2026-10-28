@@ -11,6 +11,7 @@ param(
 $ErrorActionPreference = "Stop"
 $AndroidControllerPatch = Join-Path $PSScriptRoot "patches\libxray-android-controller.patch"
 $XrayObserverPatch = Join-Path $PSScriptRoot "patches\xray-observer-detached-snapshot.patch"
+$LibXrayMeasurePatch = Join-Path $PSScriptRoot "patches\libxray-measure-status.patch"
 
 function Assert-PinnedMobileTool {
     param(
@@ -53,6 +54,9 @@ if (-not (Test-Path -LiteralPath $AndroidControllerPatch -PathType Leaf)) {
 }
 if (-not (Test-Path -LiteralPath $XrayObserverPatch -PathType Leaf)) {
     throw "The required Xray observer patch is missing at '$XrayObserverPatch'."
+}
+if (-not (Test-Path -LiteralPath $LibXrayMeasurePatch -PathType Leaf)) {
+    throw "The required libXray measurement patch is missing at '$LibXrayMeasurePatch'."
 }
 if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
     throw "Go $GoVersion is required but the go command was not found."
@@ -110,6 +114,17 @@ if ($LASTEXITCODE -ne 0) {
 }
 $xrayObserverPatchHash = (Get-FileHash $XrayObserverPatch -Algorithm SHA256).Hash
 Write-Host "Applied Xray observer snapshot patch $xrayObserverPatchHash at $resolvedXrayCoreRef"
+
+git -C $WorkDir apply --check $LibXrayMeasurePatch
+if ($LASTEXITCODE -ne 0) {
+    throw "The pinned libXray source no longer accepts the measurement-status patch."
+}
+git -C $WorkDir apply $LibXrayMeasurePatch
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not apply the libXray measurement-status patch."
+}
+$libXrayMeasurePatchHash = (Get-FileHash $LibXrayMeasurePatch -Algorithm SHA256).Hash
+Write-Host "Applied libXray measurement-status patch $libXrayMeasurePatchHash at $resolvedRef"
 
 git -C $WorkDir apply --check $AndroidControllerPatch
 if ($LASTEXITCODE -ne 0) {
@@ -238,6 +253,7 @@ libxray.gobind=$GomobileVersion
 libxray.android.controller.patch.sha256=$androidControllerPatchHash
 libxray.xray.ref=$resolvedXrayCoreRef
 libxray.xray.observer.patch.sha256=$xrayObserverPatchHash
+libxray.measure.patch.sha256=$libXrayMeasurePatchHash
 "@ | Set-Content (Join-Path $OutputDir "libXray.properties") -Encoding ascii
 Write-Host "Copied libXray.aar to $OutputDir"
 Write-Host "libXray commit: $resolvedRef"

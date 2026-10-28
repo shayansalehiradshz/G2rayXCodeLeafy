@@ -39,6 +39,11 @@ class SocksRoutePerformanceProbe(
         require(socksPort in 1..65_535) { "SOCKS port must be valid" }
         val client = clientBuilder()
             .proxy(Proxy(Proxy.Type.SOCKS, InetSocketAddress.createUnresolved("127.0.0.1", socksPort)))
+            // A redirect is not a route-quality result. Keep the probe on the
+            // exact endpoint so an error page or alternate host cannot hide a
+            // bad route and produce a misleading throughput sample.
+            .followRedirects(false)
+            .followSslRedirects(false)
             .connectTimeout(5, TimeUnit.SECONDS)
             .readTimeout(10, TimeUnit.SECONDS)
             .writeTimeout(10, TimeUnit.SECONDS)

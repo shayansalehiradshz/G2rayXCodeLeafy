@@ -53,6 +53,22 @@ class G2RayVpnServiceTest {
     }
 
     @Test
+    fun selectedProfileGetsASeparateGraceBeforeAReadyBackupWins() = runBlocking {
+        val primary = liveProfile("primary.example")
+        val backup = liveProfile("203.0.113.2")
+        val result = withTimeout(2_000) {
+            G2RayVpnService.resolveRuntimeProfilesForStartup(
+                listOf(primary, backup),
+                optionalGraceMs = 50
+            ) {
+                if (it == primary.address) delay(700)
+                listOf(it)
+            }
+        }
+        assertEquals(listOf(primary, backup), result)
+    }
+
+    @Test
     fun startupDoesNotWaitForSlowOptionalDnsAndKeepsReadyBackup() = runBlocking {
         val selected = liveProfile("203.0.113.1")
         val slow = liveProfile("slow.example")

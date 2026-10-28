@@ -277,6 +277,11 @@ class G2RayVpnService : VpnService() {
         private const val ACTIVE_STALL_INTERACTIVE_MIN_TX_PACKETS = 4L
         private const val MAX_LIVE_ROUTE_PROFILES = 3
         private const val OPTIONAL_ENDPOINT_DNS_GRACE_MS = 500L
+        // A ready backup may win the first lookup race, but the user-selected
+        // endpoint gets a little longer to arrive before startup commits to a
+        // different route. This bounds cold-start delay without waiting for
+        // unrelated optional backups.
+        private const val PRIMARY_ENDPOINT_DNS_GRACE_MS = 1_000L
         private const val FALLBACK_ENDPOINT_DNS_WAIT_MS = 10_000L
         // Chunked video commonly pauses its downlink for several seconds while
         // the local buffer drains. Ten seconds still catches a real request
@@ -570,11 +575,12 @@ class G2RayVpnService : VpnService() {
             profiles: List<G2RayProfile>,
             maxProfiles: Int = MAX_LIVE_ROUTE_PROFILES,
             optionalGraceMs: Long = OPTIONAL_ENDPOINT_DNS_GRACE_MS,
+            primaryGraceMs: Long = PRIMARY_ENDPOINT_DNS_GRACE_MS,
             fallbackWaitMs: Long = FALLBACK_ENDPOINT_DNS_WAIT_MS,
             resolve: suspend (String) -> List<String>
         ): List<G2RayProfile> = withContext(Dispatchers.IO) { supervisorScope {
             require(profiles.isNotEmpty()) { "A selected VPN profile is required" }
-            require(optionalGraceMs > 0 && fallbackWaitMs > 0)
+            require(optionalGraceMs > 0 && primaryGraceMs > 0 && fallbackWaitMs > 0)
             val template = VlessUriParser.transportTemplateKey(profiles.first())
             val eligible = profiles.take(MAX_LIVE_ROUTE_PROFILES).filterIndexed { index, profile ->
                 index == 0 || VlessUriParser.transportTemplateKey(profile) == template
@@ -592,6 +598,7 @@ class G2RayVpnService : VpnService() {
             }
             val completed = Channel<Unit>(Channel.UNLIMITED)
             tasks.values.forEach { task -> task.invokeOnCompletion { completed.trySend(Unit) } }
+            var readyCandidateFound = false
             try {
                 withTimeoutOrNull(fallbackWaitMs) {
                     while (true) {
@@ -599,11 +606,26 @@ class G2RayVpnService : VpnService() {
                         val usable = finished.any { task ->
                             task.await().getOrNull()?.any(String::isNotBlank) == true
                         }
-                        if (usable || finished.size == tasks.size) break
+                        if (usable) {
+                            readyCandidateFound = true
+                            break
+                        }
+                        if (finished.size == tasks.size) break
                         completed.receive()
                     }
                 }
-                withTimeoutOrNull(optionalGraceMs) { tasks.values.awaitAll() }
+                if (readyCandidateFound) {
+                    // Do not let a fast backup permanently displace the
+                    // selected profile just because its DNS answer was a few
+                    // hundred milliseconds slower.
+                    withTimeoutOrNull(primaryGraceMs) {
+                        tasks.getValue(eligible.first().address).await()
+                    }
+                    // Keep the existing short grace for compatible optional
+                    // backups, which improves seamless failover without
+                    // turning startup into a serial DNS scan.
+                    withTimeoutOrNull(optionalGraceMs) { tasks.values.awaitAll() }
+                }
             } finally {
                 completed.close()
             }

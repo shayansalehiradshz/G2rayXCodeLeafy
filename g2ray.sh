@@ -521,10 +521,15 @@ xhttp_link_tuning_enabled() {
     if [[ -z "$value" && -f "$XHTTP_LINK_TUNING_FILE" ]]; then
         value=$(awk 'NF{gsub(/[[:space:]]/,"");print;exit}' "$XHTTP_LINK_TUNING_FILE" 2>/dev/null || true)
     fi
-    value=$(printf '%s' "${value:-on}" | tr '[:upper:]' '[:lower:]')
+    # Keep the measured upload tuning available as an explicit A/B option, but
+    # do not impose xmux/extra on new links by default.  xmux can improve large
+    # uploads on some paths while increasing head-of-line blocking and tail
+    # latency for browsing, feeds, and long-lived AI streams on others.
+    value=$(printf '%s' "${value:-off}" | tr '[:upper:]' '[:lower:]')
     case "$value" in
         0|false|no|off|disabled) return 1 ;;
-        *) return 0 ;;
+        1|true|yes|on|enabled) return 0 ;;
+        *) return 1 ;;
     esac
 }
 
@@ -549,7 +554,7 @@ xhttp_link_tuning_summary() {
     elif xhttp_link_tuning_enabled; then
         printf 'on (60 KB upload POSTs + HTTP/2 health check)'
     else
-        printf 'off (Xray client defaults; ~4x slower uploads through GitHub edge)'
+        printf 'off (unmodified Xray client defaults; lower contention; enable for upload A/B)'
     fi
 }
 

@@ -29,7 +29,7 @@ index 80d81e22..5b50f1f9 100644
  }
  
  func (o *Observer) Type() interface{} {
-@@ -178,9 +189,17 @@ func (o *Observer) probe(outbound string) ProbeResult {
+@@ -178,9 +189,18 @@ func (o *Observer) probe(outbound string) ProbeResult {
  		if err != nil {
  			return errors.New("outbound failed to relay connection").Base(err)
  		}
@@ -41,6 +41,7 @@ index 80d81e22..5b50f1f9 100644
  		if response.Body != nil {
  			response.Body.Close()
  		}
++		httpTransport.CloseIdleConnections()
 +		if !statusOK {
 +			return errors.New("outbound returned unexpected HTTP status ", status)
 +		}

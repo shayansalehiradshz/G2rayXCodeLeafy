@@ -25,6 +25,10 @@ public abstract class VerifyLibXrayBuildContractTask extends DefaultTask {
     @PathSensitive(PathSensitivity.RELATIVE)
     public abstract RegularFileProperty getObserverPatch();
 
+    @InputFile
+    @PathSensitive(PathSensitivity.RELATIVE)
+    public abstract RegularFileProperty getMeasurePatch();
+
     @TaskAction
     public void verifyContract() throws Exception {
         String script = Files.readString(
@@ -58,9 +62,13 @@ public abstract class VerifyLibXrayBuildContractTask extends DefaultTask {
         require(script.contains("git -C $xrayCoreDir apply --check $XrayObserverPatch") &&
                 script.contains("git -C $xrayCoreDir apply $XrayObserverPatch"),
             "The production libXray build does not validate and apply the Xray observer patch.");
+        require(script.contains("git -C $WorkDir apply --check $LibXrayMeasurePatch") &&
+                script.contains("git -C $WorkDir apply $LibXrayMeasurePatch"),
+            "The production libXray build does not validate and apply the measurement-status patch.");
         require(script.contains("libxray.xray.ref=") &&
-                script.contains("libxray.xray.observer.patch.sha256="),
-            "The libXray artifact metadata does not attest the Xray observer patch.");
+                script.contains("libxray.xray.observer.patch.sha256=") &&
+                script.contains("libxray.measure.patch.sha256="),
+            "The libXray artifact metadata does not attest all native source patches.");
         String controllerPatch = Files.readString(
             getControllerPatch().getAsFile().get().toPath(),
             StandardCharsets.UTF_8
@@ -76,6 +84,13 @@ public abstract class VerifyLibXrayBuildContractTask extends DefaultTask {
         );
         require(!observerPatch.isBlank() && observerPatch.contains("GetObservation"),
             "The Xray observer patch is empty or does not cover GetObservation.");
+        String measurePatch = Files.readString(
+            getMeasurePatch().getAsFile().get().toPath(),
+            StandardCharsets.UTF_8
+        );
+        require(!measurePatch.isBlank() && measurePatch.contains("PingHTTPRequest") &&
+                measurePatch.contains("CheckRedirect") && measurePatch.contains("StatusCode"),
+            "The libXray measurement patch is empty or does not validate HTTP results.");
     }
 
     private static void require(boolean condition, String message) {

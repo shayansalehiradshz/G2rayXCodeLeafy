@@ -458,6 +458,10 @@ test_connection_keepalive_and_halfclose_are_tuned() {
         || fail 'exported links cannot carry an explicitly requested XHTTP extra object'
     grep_fixed 'G2RAY_XHTTP_LINK_TUNING' "$SCRIPT" \
         || fail 'measured XHTTP link tuning has no compatibility escape hatch'
+    grep_fixed 'value:-off' "$SCRIPT" \
+        || fail 'XHTTP link tuning is still enabled by default'
+    grep_fixed '1|true|yes|on|enabled' "$SCRIPT" \
+        || fail 'XHTTP link tuning enables unexpected preference values'
     grep_fixed 'xhttp_link_tuning_enabled || return 0' "$SCRIPT" \
         || fail 'XHTTP link tuning cannot be disabled without changing the server'
     pass 'TCP keepalive, half-close timeouts, and reversible XHTTP link tuning are present'

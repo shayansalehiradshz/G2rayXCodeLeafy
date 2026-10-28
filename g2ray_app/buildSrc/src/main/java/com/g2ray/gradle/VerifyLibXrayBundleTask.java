@@ -54,6 +54,10 @@ public abstract class VerifyLibXrayBundleTask extends DefaultTask {
     @PathSensitive(PathSensitivity.RELATIVE)
     public abstract RegularFileProperty getObserverPatch();
 
+    @InputFile
+    @PathSensitive(PathSensitivity.RELATIVE)
+    public abstract RegularFileProperty getMeasurePatch();
+
     @Input
     public abstract Property<Boolean> getRequired();
 
@@ -124,6 +128,15 @@ public abstract class VerifyLibXrayBundleTask extends DefaultTask {
         if (!actualObserverPatchHash.equalsIgnoreCase(expectedObserverPatchHash)) {
             throw new GradleException(
                 "The bundled libXray AAR was not built with the current Xray observer patch"
+            );
+        }
+        String expectedMeasurePatchHash = properties
+            .getProperty("libxray.measure.patch.sha256", "")
+            .trim();
+        String actualMeasurePatchHash = sha256(getMeasurePatch().getAsFile().get().toPath());
+        if (!actualMeasurePatchHash.equalsIgnoreCase(expectedMeasurePatchHash)) {
+            throw new GradleException(
+                "The bundled libXray AAR was not built with the current measurement-status patch"
             );
         }
 
