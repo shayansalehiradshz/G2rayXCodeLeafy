@@ -1,13 +1,13 @@
 # libXray AAR
 
-Rebuild the pinned, Android-controller- and Xray-observer-patched `libXray.aar` here using
+Rebuild the pinned, Android-controller-, Xray-observer-, and measurement-patched `libXray.aar` here using
 [`scripts/build-libxray-aar.ps1`](../../scripts/build-libxray-aar.ps1) before
 building a functional VPN APK. A generic upstream/latest AAR is not equivalent
 to the attested build recorded in `libXray.properties`.
 
 The Gradle build includes `app/libs/libXray.aar` automatically when the file
 exists. Both `assembleDebug` and `assembleFunctionalDebug` require the AAR to
-exist and match `libXray.properties`, including the pinned Xray observer patch.
+exist and match `libXray.properties`, including the pinned Xray observer and measurement patches.
 The build also inspects the AAR's Java
 API for a supported modern `invoke(String)` or legacy lifecycle contract, then
 verifies the bundled HEV native libraries. Unit-test tasks remain available
