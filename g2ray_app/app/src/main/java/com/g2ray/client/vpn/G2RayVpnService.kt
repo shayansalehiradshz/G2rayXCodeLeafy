@@ -1917,10 +1917,11 @@ class G2RayVpnService : VpnService() {
     }
 
     /**
-     * Starts the requested packet engine and proves the full-device data path,
-     * then lets Auto fall back once to native Xray TUN only when HEV itself
-     * failed to become healthy. A shared upstream route failure is handled by
-     * normal route recovery so exact HEV traffic counters remain available.
+     * Starts the requested packet engine and proves the full-device data path.
+     * Auto prefers native Xray TUN for the lower-overhead data path, then lets
+     * it fall back once to HEV only when the packet engine itself failed to
+     * become healthy. A shared upstream route failure is handled by normal
+     * route recovery instead of wasting time on an engine swap.
      */
     private suspend fun startBestEngineAndVerify(
         profile: G2RayProfile,
@@ -1931,21 +1932,25 @@ class G2RayVpnService : VpnService() {
         if (!isTunnelCurrent(lifecycleToken, tun)) {
             return RunningRouteResult(false, "VPN lifecycle changed before engine startup")
         }
+        val hevAvailable = HevTunController.isAvailable()
         val selectedEngine = preferredEngine ?: VpnEngineSelector.resolve(
             requestedEngineMode,
-            HevTunController.isAvailable()
+            hevAvailable
         )
         val firstResult = startEngineAndVerify(profile, tun, selectedEngine, lifecycleToken)
+        val alternateEngine = VpnEngineSelector.fallbackEngine(
+            mode = requestedEngineMode,
+            active = selectedEngine,
+            hevAvailable = hevAvailable,
+            activePacketEngineReady = hevTunnelRunning
+        )
         if (
             firstResult.success ||
             !firstResult.retryAllowed ||
             firstResult.failureScope == RouteFailureScope.DialerBinding ||
             firstResult.failureScope == RouteFailureScope.EndpointResolution ||
-            !VpnEngineSelector.shouldFallbackToNative(
-                mode = requestedEngineMode,
-                active = selectedEngine,
-                activePacketEngineReady = hevTunnelRunning
-            )
+            firstResult.failureScope !in setOf(RouteFailureScope.PacketEngine, RouteFailureScope.Unknown) ||
+            alternateEngine == null
         ) {
             return firstResult
         }
@@ -1959,7 +1964,7 @@ class G2RayVpnService : VpnService() {
         if (!isTunnelCurrent(lifecycleToken, tun)) {
             return RunningRouteResult(false, "VPN lifecycle changed during engine fallback")
         }
-        return startEngineAndVerify(profile, tun, ActiveVpnEngine.XrayNative, lifecycleToken)
+        return startEngineAndVerify(profile, tun, alternateEngine, lifecycleToken)
     }
 
     private suspend fun startEngineAndVerify(

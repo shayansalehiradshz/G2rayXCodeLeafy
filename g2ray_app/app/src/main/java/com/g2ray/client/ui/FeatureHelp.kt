@@ -11,7 +11,7 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 
 internal enum class FeatureHelp(val title: String, val explanation: String) {
-    Engine("VPN engine", "Auto is recommended: it selects the supported packet engine and can fall back when startup fails. HEV and Native are manual alternatives for troubleshooting. Change engines only while disconnected; neither is always fastest on every phone."),
+    Engine("VPN engine", "Auto is recommended: it tries the lower-overhead Native Xray TUN path first and falls back to HEV if that packet path cannot become healthy. HEV and Native remain manual choices for troubleshooting. Change engines only while disconnected; the best path can still vary by phone and Android build."),
     FastDns("Fast DNS", "Default: off. Answers supported DNS queries locally with synthetic addresses and lets the Codespace resolve names. It can shorten first visits to new domains. Turn it off if an app cannot connect or retains old synthetic addresses. Restart affected apps after changing it."),
     Ipv4("IPv4-only compatibility", "Default: off. Disables IPv6 in the VPN; Android blocks it instead of allowing it to bypass the tunnel. Try it only if your phone or exit has broken IPv6. It can prevent access to IPv6-only services; it does not lower every ping."),
     Dpi("DPI compatibility", "Default: off. Changes TLS fragmentation and fingerprinting to help on networks that interfere with the normal handshake. Enable only when ordinary configs fail on your network. It can add CPU work and latency on an already-working connection."),

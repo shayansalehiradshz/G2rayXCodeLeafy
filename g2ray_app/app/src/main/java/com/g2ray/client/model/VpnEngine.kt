@@ -2,8 +2,9 @@ package com.g2ray.client.model
 
 /**
  * The requested packet-forwarding implementation for Android's VPN file
- * descriptor. Auto is the normal choice: it selects HEV when it is bundled
- * and falls back to Xray's native TUN implementation when it is not.
+ * descriptor. Auto is the normal choice: it tries Xray's native TUN path
+ * first because it avoids the extra HEV userspace forwarding hop, then falls
+ * back to HEV when the native packet path cannot become healthy.
  */
 enum class VpnEngineMode(val storageValue: String, val label: String) {
     Auto("auto", "Auto"),
@@ -28,18 +29,21 @@ enum class TunnelTrafficSource {
 
 object VpnEngineSelector {
     fun resolve(mode: VpnEngineMode, hevAvailable: Boolean): ActiveVpnEngine = when (mode) {
-        VpnEngineMode.Auto -> if (hevAvailable) ActiveVpnEngine.Hev else ActiveVpnEngine.XrayNative
+        VpnEngineMode.Auto -> ActiveVpnEngine.XrayNative
         VpnEngineMode.Hev -> if (hevAvailable) ActiveVpnEngine.Hev else ActiveVpnEngine.XrayNative
         VpnEngineMode.XrayNative -> ActiveVpnEngine.XrayNative
     }
 
-    fun shouldFallbackToNative(
+    fun fallbackEngine(
         mode: VpnEngineMode,
         active: ActiveVpnEngine,
+        hevAvailable: Boolean,
         activePacketEngineReady: Boolean
-    ): Boolean {
-        return mode == VpnEngineMode.Auto &&
-            active == ActiveVpnEngine.Hev &&
-            !activePacketEngineReady
+    ): ActiveVpnEngine? {
+        if (mode != VpnEngineMode.Auto || activePacketEngineReady) return null
+        return when (active) {
+            ActiveVpnEngine.XrayNative -> ActiveVpnEngine.Hev.takeIf { hevAvailable }
+            ActiveVpnEngine.Hev -> ActiveVpnEngine.XrayNative
+        }
     }
 }
