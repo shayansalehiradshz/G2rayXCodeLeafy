@@ -536,10 +536,16 @@ class WorkerRouteCoordinator(
                     retryCooldown.remainingMs()?.let(onRetryAfter)
                 }
             }
-            if (endpoint == WorkerRouteEndpoint.WAKE && response.code() in 500..599 &&
-                call.errorBody?.reason in setOf("github_start_request_unreachable", "github_start_request_failed")
+            if (endpoint == WorkerRouteEndpoint.WAKE &&
+                (response.code() == 502 ||
+                    call.errorBody?.reason in setOf("github_start_request_unreachable", "github_start_request_failed"))
             ) {
-                throw UncertainWakeException(IOException("GitHub start outcome is unknown."))
+                // A gateway-style wake failure may still hide an accepted
+                // state-changing POST. Reconcile through health; never send
+                // the same wake to another alias in this attempt.
+                throw UncertainWakeException(IOException(
+                    "Worker wake outcome is unknown${call.errorBody?.reason?.let { ": $it" }.orEmpty()}."
+                ))
             }
             val canTryFallback = index + 1 < baseUrls.size &&
                 response.code() in 500..599

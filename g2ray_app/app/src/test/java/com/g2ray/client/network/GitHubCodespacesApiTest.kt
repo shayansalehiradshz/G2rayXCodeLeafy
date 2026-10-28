@@ -333,7 +333,7 @@ class GitHubCodespacesApiTest {
     }
 
     @Test
-    fun transientStartServerErrorIsRetriedInsteadOfPollingShutdownUntilTimeout() = runTest {
+    fun transientStartServerErrorIsReconciledWithoutRetryingTheStartPost() = runTest {
         var elapsed = 0L
         val api = FakeGitHubApi(
             getResponses = ArrayDeque(
@@ -360,11 +360,11 @@ class GitHubCodespacesApiTest {
 
         assertTrue(outcome is GitHubCodespaceOutcome.Ready)
         assertEquals(3, api.getCalls)
-        assertEquals(2, api.startCalls)
+        assertEquals(1, api.startCalls)
     }
 
     @Test
-    fun repeatedStartServerErrorsFailAsControlPlaneUnavailable() = runTest {
+    fun uncertainStartServerErrorFailsWithoutRepeatingTheStartPost() = runTest {
         var elapsed = 0L
         val api = FakeGitHubApi(
             getResponses = ArrayDeque(
@@ -384,8 +384,9 @@ class GitHubCodespacesApiTest {
 
         assertTrue(outcome is GitHubCodespaceOutcome.Failed)
         assertTrue((outcome as GitHubCodespaceOutcome.Failed).controlPlaneUnavailable)
-        assertEquals(503, outcome.httpCode)
-        assertEquals(3, api.startCalls)
+        assertEquals(null, outcome.httpCode)
+        assertTrue(outcome.message.contains("HTTP 503"))
+        assertEquals(1, api.startCalls)
     }
 
     @Test

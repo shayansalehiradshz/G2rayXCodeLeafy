@@ -60,6 +60,15 @@ fun verifyLibXrayBundle(required: Boolean) {
     check(sha256(libXrayAar) == expectedHash) {
         "app/libs/libXray.aar does not match the pinned SHA-256; rebuild it with scripts/build-libxray-aar.ps1"
     }
+    check(metadata.getProperty("libxray.ref") == "80263da83e96b2972455b0a94b13ee1a10e51391") {
+        "libXray metadata has an unapproved libXray source revision"
+    }
+    check(metadata.getProperty("libxray.go") == "go1.26.10") {
+        "libXray metadata has an unapproved Go toolchain revision"
+    }
+    check(metadata.getProperty("libxray.xray.ref") == "5ca6f4b7d4dc20a881d4330e498892697627ec0c") {
+        "libXray metadata has an unapproved Xray source revision"
+    }
     check(!metadata.getProperty("libxray.xray.ref").isNullOrBlank()) {
         "libXray metadata is missing libxray.xray.ref"
     }

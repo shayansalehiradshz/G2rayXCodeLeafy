@@ -151,7 +151,6 @@ class GitHubCodespaceCoordinator(
         var uncertainStartFailure: String? = if (reconcileUncertainWorkerWake) "Worker wake response was lost" else null
         var uncertainStoppedChecks = 0
         var consecutiveServerErrors = 0
-        var startServerErrors = 0
 
         while (attempts < maxAttempts && nowMs() - startedAt < maxWaitMs) {
             attempts++
@@ -242,7 +241,6 @@ class GitHubCodespaceCoordinator(
                         }
                         if (startResponse.isSuccessful) {
                             startRequested = true
-                            startServerErrors = 0
                             val started = startResponse.body()
                             if (
                                 started != null &&
@@ -253,13 +251,16 @@ class GitHubCodespaceCoordinator(
                             }
                         } else if (startResponse.code() in setOf(304, 409)) {
                             startRequested = true
-                            startServerErrors = 0
                         } else if (startResponse.code() in 500..599) {
-                            startServerErrors++
-                            if (startServerErrors >= 3 || startResponse.headers()["Retry-After"] != null) {
+                            // A start POST can be accepted even when its
+                            // response is a 5xx. Poll status and never retry
+                            // the state-changing POST in this operation.
+                            startRequested = true
+                            uncertainStartFailure = "GitHub start returned HTTP ${startResponse.code()}"
+                            if (startResponse.headers()["Retry-After"] != null) {
                                 return failureFrom(startResponse, controlPlaneUnavailable = true)
                             }
-                            sleep((startServerErrors * 1_000L).coerceAtMost(3_000L))
+                            sleep(POLL_INTERVAL_MS)
                             continue
                         } else {
                             return failureFrom(startResponse)

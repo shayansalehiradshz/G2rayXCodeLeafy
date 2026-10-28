@@ -962,6 +962,24 @@ class WorkerRouteCoordinatorTest {
     }
 
     @Test
+    fun genericWorker502DoesNotSendWakeToAnotherAlias() = runTest {
+        val api = FakeWorkerApiService(wakeHandler = { url ->
+            if (url.contains("primary.example")) {
+                workerError(502, """{"error":"temporary gateway failure"}""", emptyMap())
+            } else {
+                error("A generic 502 must not trigger a second wake POST")
+            }
+        }, healthHandler = {
+            Response.success(WorkerWakeResponse(ok = true, state = "Starting", route_ready = false))
+        })
+        val result = WorkerRouteCoordinator(api, nowMs = { 0L }, sleep = {})
+            .ensureRouteReady(listOf("primary.example", "backup.example"), "secret")
+        assertTrue(result is WorkerRouteOutcome.TimedOut || result is WorkerRouteOutcome.Failed)
+        assertEquals(1, api.calls.count { it.endsWith("/wake") })
+        assertTrue(api.calls.none { it.contains("backup.example") && it.endsWith("/wake") })
+    }
+
+    @Test
     fun settlingRouteStopsAtTheConfiguredDeadline() = runTest {
         var elapsedMs = 0L
         val settling = WorkerWakeResponse(
