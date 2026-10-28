@@ -2257,14 +2257,34 @@ class G2RayVpnService : VpnService() {
             networkKey = networkKey,
             nowMs = nowMs
         )
-        val verifiedCandidates = storedCandidates.mapNotNull { stored ->
+        val parsedCandidates = storedCandidates.mapNotNull { stored ->
+            VlessUriParser.parse(stored.rawUri).getOrNull()?.let { parsed -> stored to parsed }
+        }
+        val verifiedCandidates = parsedCandidates.mapNotNull { (stored, parsed) ->
             val observed = sessionHealth[stored.rawUri]
             val verified = observed?.lastAttemptSucceeded == true ||
                 persistedRouteMeasurementFresh(stored, nowMs, networkKey = networkKey)
             if (!verified) return@mapNotNull null
-            VlessUriParser.parse(stored.rawUri).getOrNull()
+            parsed
         }
-        return selectSeamlessRouteProfiles(selected, verifiedCandidates)
+        val verifiedUris = verifiedCandidates.mapTo(hashSetOf()) { it.rawUri }
+        // The observer measures from the phone, which is the only vantage
+        // point that can rank edge IPs for this client. Fill unused bounded
+        // slots with fresh, unfailed public-IP profiles so a route that has
+        // never been Ping-All tested can still win without delaying startup.
+        val exploratoryCandidates = parsedCandidates.asSequence()
+            .filter { (stored, parsed) ->
+                parsed.rawUri !in verifiedUris &&
+                    VlessUriParser.isUsablePublicIpv4(parsed.address) &&
+                    sessionHealth[stored.rawUri]?.lastAttemptSucceeded != false &&
+                    stored.delayFailureCount == 0
+            }
+            .map { it.second }
+            .toList()
+        return selectSeamlessRouteProfiles(
+            selected,
+            verifiedCandidates + exploratoryCandidates
+        )
     }
 
     private fun stopActivePacketEngine() {
