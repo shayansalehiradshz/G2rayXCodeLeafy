@@ -43,11 +43,19 @@ object ProfileHealth {
         result.delayMs != null -> buildString {
             append("${result.delayMs} ms")
             if (result.sampleCount == 1) append(" (quick)")
-            else result.p95Ms?.let { append(" (p95 ${it} ms)") }
+            else tailLabel(result)?.let { append(" ($it)") }
         }
         result.error == "Stale; refresh" -> "Stale; refresh"
         result.error != null -> "Unavailable"
         else -> "Not tested"
+    }
+
+    fun tailLabel(result: ProfileDelayState): String? {
+        val tail = result.p95Ms ?: return null
+        val successes = result.successfulSamples
+        if (successes <= 0 || successes > result.sampleCount) return null
+        // Nearest-rank p95 is the maximum when there are fewer than 20 successes.
+        return if (successes < 20) "worst of $successes: $tail ms" else "p95 $tail ms"
     }
 
     fun isDelayFresh(testedAt: Long?, now: Long = System.currentTimeMillis()): Boolean {

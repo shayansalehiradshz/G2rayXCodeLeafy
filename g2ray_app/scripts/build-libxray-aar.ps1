@@ -3,12 +3,14 @@ param(
     [string]$WorkDir = "$PSScriptRoot\..\build\libxray-src",
     [string]$NdkVersion = "28.2.13676358",
     [string]$LibXrayRef = "80263da83e96b2972455b0a94b13ee1a10e51391",
-    [string]$GoVersion = "go1.26.5",
-    [string]$GomobileVersion = "v0.0.0-20260611195102-4dd8f1dbf5d2"
+    [string]$GoVersion = "go1.26.10",
+    [string]$GomobileVersion = "v0.0.0-20260611195102-4dd8f1dbf5d2",
+    [string]$XrayCoreRef = "5ca6f4b7d4dc20a881d4330e498892697627ec0c"
 )
 
 $ErrorActionPreference = "Stop"
 $AndroidControllerPatch = Join-Path $PSScriptRoot "patches\libxray-android-controller.patch"
+$XrayObserverPatch = Join-Path $PSScriptRoot "patches\xray-observer-detached-snapshot.patch"
 
 function Assert-PinnedMobileTool {
     param(
@@ -49,6 +51,9 @@ if (-not (Test-Path $env:ANDROID_NDK_HOME)) {
 if (-not (Test-Path -LiteralPath $AndroidControllerPatch -PathType Leaf)) {
     throw "The required Android controller patch is missing at '$AndroidControllerPatch'."
 }
+if (-not (Test-Path -LiteralPath $XrayObserverPatch -PathType Leaf)) {
+    throw "The required Xray observer patch is missing at '$XrayObserverPatch'."
+}
 if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
     throw "Go $GoVersion is required but the go command was not found."
 }
@@ -59,6 +64,7 @@ if ($LASTEXITCODE -ne 0 -or $actualGoVersion -ne $GoVersion) {
 
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 New-Item -ItemType Directory -Force -Path (Split-Path $WorkDir -Parent) | Out-Null
+$xrayCoreDir = Join-Path (Split-Path $WorkDir -Parent) "Xray-core"
 
 if (-not (Test-Path $WorkDir)) {
     git clone https://github.com/XTLS/libXray.git $WorkDir
@@ -79,6 +85,31 @@ if ($LibXrayRef -eq "main") {
     Write-Warning "LibXrayRef is 'main'. For production, rerun with -LibXrayRef <tested-commit-sha> and record that SHA."
 }
 Write-Host "Building libXray ref $LibXrayRef ($resolvedRef)"
+
+if (-not (Test-Path $xrayCoreDir)) {
+    git clone https://github.com/XTLS/Xray-core.git $xrayCoreDir
+} else {
+    git -C $xrayCoreDir fetch --tags --force origin
+}
+git -C $xrayCoreDir checkout --force $XrayCoreRef
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not check out pinned Xray-core ref $XrayCoreRef."
+}
+git -C $xrayCoreDir clean -ffdx
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not clean the disposable Xray-core build checkout."
+}
+$resolvedXrayCoreRef = (git -C $xrayCoreDir rev-parse HEAD).Trim()
+git -C $xrayCoreDir apply --check $XrayObserverPatch
+if ($LASTEXITCODE -ne 0) {
+    throw "The pinned Xray-core source no longer accepts the observer snapshot patch."
+}
+git -C $xrayCoreDir apply $XrayObserverPatch
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not apply the Xray observer snapshot patch."
+}
+$xrayObserverPatchHash = (Get-FileHash $XrayObserverPatch -Algorithm SHA256).Hash
+Write-Host "Applied Xray observer snapshot patch $xrayObserverPatchHash at $resolvedXrayCoreRef"
 
 git -C $WorkDir apply --check $AndroidControllerPatch
 if ($LASTEXITCODE -ne 0) {
@@ -179,7 +210,7 @@ try {
     Pop-Location
 }
 
-python (Join-Path $WorkDir "build\main.py") android
+python (Join-Path $WorkDir "build\main.py") android local
 if ($LASTEXITCODE -ne 0) {
     throw "libXray Android build failed with exit code $LASTEXITCODE."
 }
@@ -205,6 +236,8 @@ libxray.go=$postBuildGoVersion
 libxray.gomobile=$GomobileVersion
 libxray.gobind=$GomobileVersion
 libxray.android.controller.patch.sha256=$androidControllerPatchHash
+libxray.xray.ref=$resolvedXrayCoreRef
+libxray.xray.observer.patch.sha256=$xrayObserverPatchHash
 "@ | Set-Content (Join-Path $OutputDir "libXray.properties") -Encoding ascii
 Write-Host "Copied libXray.aar to $OutputDir"
 Write-Host "libXray commit: $resolvedRef"

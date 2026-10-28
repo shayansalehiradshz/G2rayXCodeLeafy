@@ -5230,6 +5230,50 @@ test_quota_snapshot_tracks_host_activity_not_engine_state() {
     pass 'quota snapshot projects host usage independently of the engine state'
 }
 
+test_unchanged_export_repairs_initially_missing_quota_snapshot() {
+    (
+        reset_runtime_paths
+        local calls_file="$TMP_ROOT/quota-export-calls.txt" calls
+        CODESPACE_NAME="behavior-space"
+        PORT_DOMAIN="behavior-space-443.app.github.dev"
+        WS_PORT_DOMAIN="behavior-space-8443.app.github.dev"
+        GITHUB_USER="tester"
+        printf '11111111-2222-4333-8444-555555555555\n' > "$UUID_FILE"
+        write_test_vless_config
+        : > "$calls_file"
+        generate_ordered_links() {
+            printf 'call\n' >> "$calls_file"
+            printf 'vless://example@20.0.0.1:443?encryption=none#one\n'
+        }
+
+        rm -f "$QUOTA_CYCLE_FILE"
+        refresh_config_exports_if_changed >/dev/null || fail 'initial quota-less export failed'
+        [[ "$(jq -r '.quota_estimate' "$CODESPACE_BUNDLE_FILE")" == null ]] \
+            || fail 'uninitialized tracker fabricated a quota estimate'
+        refresh_config_exports_if_changed >/dev/null || fail 'unchanged quota-less export failed'
+        calls=$(wc -l < "$calls_file" | tr -d ' ')
+        [[ "$calls" -eq 1 ]] || fail 'unavailable quota caused repeated export regeneration'
+
+        current_quota_cycle > "$QUOTA_CYCLE_FILE"
+        refresh_config_exports_if_changed >/dev/null || fail 'initialized quota export failed'
+        [[ "$(jq -r '.quota_estimate.cycle' "$CODESPACE_BUNDLE_FILE")" == "$(current_quota_cycle)" ]] \
+            || fail 'initialized quota was not included in the existing bundle'
+        refresh_config_exports_if_changed >/dev/null || fail 'unchanged quota-bearing export failed'
+        calls=$(wc -l < "$calls_file" | tr -d ' ')
+        [[ "$calls" -eq 2 ]] || fail 'quota snapshot repair did not regenerate exactly once'
+
+        jq '.quota_estimate.cycle = "2000-01"' "$CODESPACE_BUNDLE_FILE" > "$TMP_ROOT/old-quota-bundle.json"
+        mv "$TMP_ROOT/old-quota-bundle.json" "$CODESPACE_BUNDLE_FILE"
+        refresh_config_exports_if_changed >/dev/null || fail 'old-cycle quota export failed'
+        [[ "$(jq -r '.quota_estimate.cycle' "$CODESPACE_BUNDLE_FILE")" == "$(current_quota_cycle)" ]] \
+            || fail 'previous-month quota was not replaced'
+        refresh_config_exports_if_changed >/dev/null || fail 'current-cycle quota export failed'
+        calls=$(wc -l < "$calls_file" | tr -d ' ')
+        [[ "$calls" -eq 3 ]] || fail 'old-cycle quota repair did not regenerate exactly once'
+    )
+    pass 'unchanged exports repair newly available or previous-cycle quota snapshots once'
+}
+
 test_all_config_qr_without_encoder_discards_stale_png() {
     (
         reset_runtime_paths
@@ -5247,6 +5291,7 @@ test_all_config_qr_without_encoder_discards_stale_png() {
 
 test_all_config_qr_without_encoder_discards_stale_png
 test_quota_snapshot_tracks_host_activity_not_engine_state
+test_unchanged_export_repairs_initially_missing_quota_snapshot
 test_all_config_qr_preserves_links_and_usage_without_touching_runtime
 test_xhttp_extra_requires_one_complete_object
 test_deadline_includes_exit_cleanup

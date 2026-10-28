@@ -3,6 +3,8 @@ package com.g2ray.client.network
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import okhttp3.OkHttpClient
 import retrofit2.Response
 import retrofit2.Retrofit
@@ -130,6 +132,7 @@ class GitHubCodespaceCoordinator(
         token: String,
         maxWaitMs: Long = 3 * 60 * 1000L,
         maxAttempts: Int = 60,
+        reconcileUncertainWorkerWake: Boolean = false,
         onProgress: (GitHubCodespaceProgress) -> Unit = {}
     ): GitHubCodespaceOutcome {
         val normalizedName = codespaceName.trim()
@@ -144,7 +147,9 @@ class GitHubCodespaceCoordinator(
         val authorization = "Bearer $normalizedToken"
         val startedAt = nowMs()
         var attempts = 0
-        var startRequested = false
+        var startRequested = reconcileUncertainWorkerWake
+        var uncertainStartFailure: String? = if (reconcileUncertainWorkerWake) "Worker wake response was lost" else null
+        var uncertainStoppedChecks = 0
         var consecutiveServerErrors = 0
         var startServerErrors = 0
 
@@ -165,6 +170,7 @@ class GitHubCodespaceCoordinator(
             val statusResponse = try {
                 apiService.getCodespace(normalizedName, authorization)
             } catch (error: IOException) {
+                currentCoroutineContext().ensureActive()
                 return GitHubCodespaceOutcome.Failed(
                     message = "Could not reach GitHub: ${error.localizedMessage ?: "network unavailable"}",
                     controlPlaneUnavailable = true
@@ -186,6 +192,9 @@ class GitHubCodespaceCoordinator(
 
             val codespace = statusResponse.body()
                 ?: return GitHubCodespaceOutcome.Failed("GitHub returned an empty Codespace response.")
+            if (uncertainStartFailure != null &&
+                (codespace.pending_operation == true || codespace.state.orEmpty().lowercase() !in setOf("shutdown", "stopped"))
+            ) uncertainStoppedChecks = 0
             when (codespace.state.orEmpty().lowercase()) {
                 "available" -> if (codespace.pending_operation != true) {
                     return GitHubCodespaceOutcome.Ready(codespace)
@@ -201,7 +210,18 @@ class GitHubCodespaceCoordinator(
                     )
                 }
                 "shutdown", "stopped" -> {
-                    if (!startRequested) {
+                    if (uncertainStartFailure != null && codespace.pending_operation != true) {
+                        uncertainStoppedChecks++
+                        if (uncertainStoppedChecks >= 2) {
+                            return GitHubCodespaceOutcome.Failed(
+                                message = "GitHub start response was lost and the Codespace is still stopped: $uncertainStartFailure",
+                                controlPlaneUnavailable = true,
+                                response = codespace,
+                                retryAfterMs = POLL_INTERVAL_MS
+                            )
+                        }
+                    }
+                    if (!startRequested && codespace.pending_operation != true) {
                         onProgress(
                             GitHubCodespaceProgress(
                                 phase = GitHubCodespacePhase.STARTING,
@@ -212,10 +232,13 @@ class GitHubCodespaceCoordinator(
                         val startResponse = try {
                             apiService.startCodespace(normalizedName, authorization)
                         } catch (error: IOException) {
-                            return GitHubCodespaceOutcome.Failed(
-                                message = "GitHub start request failed: ${error.localizedMessage ?: "network unavailable"}",
-                                controlPlaneUnavailable = true
-                            )
+                            currentCoroutineContext().ensureActive()
+                            // The server may have accepted the POST even if its response was lost.
+                            // Check status before allowing a later recovery attempt to retry it.
+                            uncertainStartFailure = error.localizedMessage ?: "network unavailable"
+                            startRequested = true
+                            sleep(minOf(POLL_INTERVAL_MS, (maxWaitMs - (nowMs() - startedAt)).coerceAtLeast(0L)))
+                            continue
                         }
                         if (startResponse.isSuccessful) {
                             startRequested = true

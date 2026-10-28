@@ -90,13 +90,15 @@ internal data class WorkerWakeInvocation(
     val secret: String,
     val codespaceId: String?,
     val maxWaitMs: Long,
-    val expectedCodespaceName: String? = null
+    val expectedCodespaceName: String? = null,
+    val preflightBeforeWake: Boolean = false
 )
 
 internal data class GitHubWakeInvocation(
     val codespaceName: String,
     val token: String,
-    val maxWaitMs: Long
+    val maxWaitMs: Long,
+    val reconcileUncertainWorkerWake: Boolean = false
 )
 
 class CodespaceWakeCoordinator internal constructor(
@@ -120,6 +122,7 @@ class CodespaceWakeCoordinator internal constructor(
                 secret = request.secret,
                 codespaceId = request.codespaceId,
                 expectedCodespaceName = request.expectedCodespaceName,
+                preflightBeforeWake = request.preflightBeforeWake,
                 maxWaitMs = request.maxWaitMs,
                 onProgress = progress
             )
@@ -129,6 +132,7 @@ class CodespaceWakeCoordinator internal constructor(
                 codespaceName = request.codespaceName,
                 token = request.token,
                 maxWaitMs = request.maxWaitMs,
+                reconcileUncertainWorkerWake = request.reconcileUncertainWorkerWake,
                 onProgress = progress
             )
         }
@@ -166,6 +170,7 @@ class CodespaceWakeCoordinator internal constructor(
             return CodespaceWakeOutcome.Failed(missingConfigurationMessage(request.mode), retryAllowed = false)
         }
 
+        var reconcileUncertainWorkerWake = false
         for (backend in order) {
             when (backend) {
                 WakeControlBackend.WORKER -> {
@@ -175,7 +180,8 @@ class CodespaceWakeCoordinator internal constructor(
                             secret = request.workerSecret.orEmpty(),
                             codespaceId = request.workerCodespaceId ?: request.githubCodespaceName,
                             maxWaitMs = maxWaitMs,
-                            expectedCodespaceName = request.githubCodespaceName.takeIf { it.isNotBlank() }
+                            expectedCodespaceName = request.githubCodespaceName.takeIf { it.isNotBlank() },
+                            preflightBeforeWake = request.mode == CodespaceWakeMode.AUTO && request.githubDirectConfigured
                         )
                     ) { progress ->
                         retryCooldown.record(progress.retryAfterMs)
@@ -211,8 +217,10 @@ class CodespaceWakeCoordinator internal constructor(
                             if (outcome.retryAllowed) retryCooldown.record(outcome.retryAfterMs)
                             val directFallbackAvailable = request.mode == CodespaceWakeMode.AUTO &&
                                 request.githubDirectConfigured &&
-                                outcome.controlPlaneUnavailable
+                                outcome.controlPlaneUnavailable &&
+                                !(outcome.wakeMayBeInFlight && (retryCooldown.remainingMs() ?: 0L) > 0L)
                             if (directFallbackAvailable) {
+                                reconcileUncertainWorkerWake = outcome.wakeMayBeInFlight
                                 onProgress(
                                     CodespaceWakeProgress(
                                         backend = WakeControlBackend.GITHUB_DIRECT,
@@ -241,7 +249,8 @@ class CodespaceWakeCoordinator internal constructor(
                         GitHubWakeInvocation(
                             codespaceName = request.githubCodespaceName,
                             token = request.githubToken.orEmpty(),
-                            maxWaitMs = maxWaitMs
+                            maxWaitMs = maxWaitMs,
+                            reconcileUncertainWorkerWake = reconcileUncertainWorkerWake
                         )
                     ) { progress ->
                         onProgress(

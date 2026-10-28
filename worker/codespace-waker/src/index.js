@@ -1856,7 +1856,12 @@ async function fetchWithTimeout(input, init = {}, timeoutMs = FETCH_TIMEOUT_MS, 
 }
 
 async function githubFetchWithRetry(input, init = {}, timeoutMs = FETCH_TIMEOUT_MS, env = {}) {
-  const attempts = configuredNumber(env, "GITHUB_API_RETRY_ATTEMPTS", 2, 1, 4);
+  // A failed POST can still have started the Codespace. Only retry reads here;
+  // callers can reconcile an uncertain start using the status endpoint.
+  const method = String(init.method || "GET").toUpperCase();
+  const attempts = method === "GET" || method === "HEAD"
+    ? configuredNumber(env, "GITHUB_API_RETRY_ATTEMPTS", 2, 1, 4)
+    : 1;
   let lastError = null;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {

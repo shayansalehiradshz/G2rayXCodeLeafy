@@ -8,11 +8,158 @@ import com.g2ray.client.model.ActiveVpnEngine
 import com.g2ray.client.model.G2RayProfile
 import com.g2ray.client.model.StoredG2RayProfile
 import com.g2ray.client.model.Transport
+import com.g2ray.client.network.interruptibleDnsLookup
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 
 @RunWith(RobolectricTestRunner::class)
 class G2RayVpnServiceTest {
+    @Test
+    fun slowPrimaryDoesNotBlockReadyCompatibleBackup() = runBlocking {
+        val primary = liveProfile("primary.example")
+        val backup = liveProfile("203.0.113.2")
+        val interrupted = java.util.concurrent.atomic.AtomicBoolean(false)
+        val result = withTimeout(2_000) {
+            G2RayVpnService.resolveRuntimeProfilesForStartup(listOf(primary, backup), optionalGraceMs = 150) {
+                interruptibleDnsLookup {
+                    if (it == primary.address) {
+                        try { Thread.sleep(10_000) } catch (error: InterruptedException) {
+                            interrupted.set(true)
+                            throw error
+                        }
+                    }
+                    listOf(it)
+                }
+            }
+        }
+        assertEquals(listOf(backup), result)
+        assertTrue(interrupted.get())
+    }
+
+    @Test
+    fun primaryKeepsPriorityWhenItResolvesWithinBackupGrace() = runBlocking {
+        val primary = liveProfile("primary.example")
+        val backup = liveProfile("203.0.113.2")
+        val result = G2RayVpnService.resolveRuntimeProfilesForStartup(listOf(primary, backup), optionalGraceMs = 500) {
+            if (it == primary.address) delay(50)
+            listOf(it)
+        }
+        assertEquals(listOf(primary, backup), result)
+    }
+
+    @Test
+    fun startupDoesNotWaitForSlowOptionalDnsAndKeepsReadyBackup() = runBlocking {
+        val selected = liveProfile("203.0.113.1")
+        val slow = liveProfile("slow.example")
+        val backup = liveProfile("203.0.113.2")
+        var cancelled = false
+        val result = withTimeout(1_500) {
+            G2RayVpnService.resolveRuntimeProfilesForStartup(
+                listOf(selected, slow, backup), optionalGraceMs = 100
+            ) {
+                if (it == slow.address) {
+                    try { delay(10_000) } finally { cancelled = true }
+                }
+                listOf(it)
+            }
+        }
+        assertEquals(listOf(selected, backup), result)
+        assertTrue(cancelled)
+    }
+
+    @Test
+    fun startupUsesCompatibleBackupWhenPrimaryFailsAndBoundsOtherLookups() = runBlocking {
+        val selected = liveProfile("primary.example")
+        val backup = liveProfile("203.0.113.2")
+        val slow = liveProfile("slow.example")
+        val result = withTimeout(1_500) {
+            G2RayVpnService.resolveRuntimeProfilesForStartup(
+                listOf(selected, backup, slow), optionalGraceMs = 50, fallbackWaitMs = 100
+            ) {
+                when (it) {
+                    selected.address -> throw java.net.UnknownHostException("Primary DNS failed")
+                    slow.address -> { delay(10_000); listOf(it) }
+                    else -> listOf(it)
+                }
+            }
+        }
+        assertEquals(listOf(backup), result)
+    }
+
+    @Test
+    fun optionalBlockingLookupIsInterruptedWhenItsGraceExpires() = runBlocking {
+        val selected = liveProfile("203.0.113.1")
+        val slow = liveProfile("slow.example")
+        val interrupted = java.util.concurrent.atomic.AtomicBoolean(false)
+        val result = withTimeout(2_000) {
+            G2RayVpnService.resolveRuntimeProfilesForStartup(listOf(selected, slow), optionalGraceMs = 150) {
+                interruptibleDnsLookup {
+                    if (it == slow.address) {
+                        try { Thread.sleep(10_000) } catch (error: InterruptedException) {
+                            interrupted.set(true)
+                            throw error
+                        }
+                    }
+                    listOf(it)
+                }
+            }
+        }
+        assertEquals(listOf(selected), result)
+        assertTrue(interrupted.get())
+    }
+
+    @Test
+    fun allFailedStartupLookupsPreserveThePrimaryError() = runBlocking {
+        val primary = liveProfile("primary.example")
+        val backup = liveProfile("backup.example")
+        val error = runCatching {
+            G2RayVpnService.resolveRuntimeProfilesForStartup(listOf(primary, backup), fallbackWaitMs = 100) {
+                throw java.net.UnknownHostException(if (it == primary.address) "Primary failed" else "Backup failed")
+            }
+        }.exceptionOrNull()
+        assertTrue(error is java.net.UnknownHostException)
+        assertEquals("Primary failed", error?.message)
+    }
+
+    @Test
+    fun startupDoesNotResolveUnrelatedTemplatesAndDeduplicatesHostLookups() = runBlocking {
+        val selected = liveProfile("front.example")
+        val sameHost = selected.copy()
+        val unrelated = liveProfile("other.example").copy(uuid = "00000000-0000-4000-8000-000000000002")
+        val lookups = mutableListOf<String>()
+        val result = G2RayVpnService.resolveRuntimeProfilesForStartup(listOf(selected, sameHost, unrelated)) {
+            lookups += it
+            listOf("203.0.113.1")
+        }
+        assertEquals(listOf("front.example"), lookups)
+        assertEquals(selected.copy(address = "203.0.113.1"), result.first())
+        assertTrue(result.none { it.uuid == unrelated.uuid })
+    }
+
+    @Test
+    fun stoppingStartupCancelsEndpointLookups() = runBlocking {
+        var primaryCancelled = false
+        var backupCancelled = false
+        val job = launch {
+            G2RayVpnService.resolveRuntimeProfilesForStartup(
+                listOf(liveProfile("primary.example"), liveProfile("backup.example"))
+            ) {
+                try { delay(10_000); listOf(it) } finally {
+                    if (it == "primary.example") primaryCancelled = true else backupCancelled = true
+                }
+            }
+        }
+        delay(50)
+        job.cancelAndJoin()
+        assertTrue(primaryCancelled)
+        assertTrue(backupCancelled)
+    }
+
     @Test
     fun legacyTimestampWithoutNetworkProvenanceCannotVerifyAStandbyRoute() {
         val legacy = storedProfile("legacy", "203.0.113.2", 80).copy(

@@ -58,6 +58,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.Job
@@ -69,6 +72,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicLong
@@ -272,6 +276,8 @@ class G2RayVpnService : VpnService() {
         private const val ACTIVE_STALL_INTERACTIVE_MIN_TX_BYTES = 2L * 1024L
         private const val ACTIVE_STALL_INTERACTIVE_MIN_TX_PACKETS = 4L
         private const val MAX_LIVE_ROUTE_PROFILES = 3
+        private const val OPTIONAL_ENDPOINT_DNS_GRACE_MS = 500L
+        private const val FALLBACK_ENDPOINT_DNS_WAIT_MS = 10_000L
         // Chunked video commonly pauses its downlink for several seconds while
         // the local buffer drains. Ten seconds still catches a real request
         // stall promptly without probing healthy playback every chunk boundary.
@@ -559,6 +565,60 @@ class G2RayVpnService : VpnService() {
                 groups.forEach { group -> group.drop(1).forEach { addEndpoint(it) } }
             }
         }
+
+        internal suspend fun resolveRuntimeProfilesForStartup(
+            profiles: List<G2RayProfile>,
+            maxProfiles: Int = MAX_LIVE_ROUTE_PROFILES,
+            optionalGraceMs: Long = OPTIONAL_ENDPOINT_DNS_GRACE_MS,
+            fallbackWaitMs: Long = FALLBACK_ENDPOINT_DNS_WAIT_MS,
+            resolve: suspend (String) -> List<String>
+        ): List<G2RayProfile> = withContext(Dispatchers.IO) { supervisorScope {
+            require(profiles.isNotEmpty()) { "A selected VPN profile is required" }
+            require(optionalGraceMs > 0 && fallbackWaitMs > 0)
+            val template = VlessUriParser.transportTemplateKey(profiles.first())
+            val eligible = profiles.take(MAX_LIVE_ROUTE_PROFILES).filterIndexed { index, profile ->
+                index == 0 || VlessUriParser.transportTemplateKey(profile) == template
+            }
+            val tasks = eligible.map { it.address }.distinct().associateWith { address ->
+                async {
+                    try {
+                        Result.success(resolve(address))
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        Result.failure(error)
+                    }
+                }
+            }
+            val completed = Channel<Unit>(Channel.UNLIMITED)
+            tasks.values.forEach { task -> task.invokeOnCompletion { completed.trySend(Unit) } }
+            try {
+                withTimeoutOrNull(fallbackWaitMs) {
+                    while (true) {
+                        val finished = tasks.values.filter { it.isCompleted }
+                        val usable = finished.any { task ->
+                            task.await().getOrNull()?.any(String::isNotBlank) == true
+                        }
+                        if (usable || finished.size == tasks.size) break
+                        completed.receive()
+                    }
+                }
+                withTimeoutOrNull(optionalGraceMs) { tasks.values.awaitAll() }
+            } finally {
+                completed.close()
+            }
+            tasks.values.filterNot { it.isCompleted }.forEach { it.cancel() }
+            val results = tasks.mapValues { (_, task) ->
+                if (task.isCancelled) {
+                    Result.failure<List<String>>(java.net.UnknownHostException("Endpoint lookup timed out"))
+                } else {
+                    task.await()
+                }
+            }
+            resolveRuntimeProfiles(eligible, maxProfiles) { address ->
+                results.getValue(address).getOrThrow()
+            }
+        } }
 
         internal fun persistedRouteScore(profile: StoredG2RayProfile, networkKey: String? = null, nowMs: Long = System.currentTimeMillis()): Long {
             if (!persistedRouteHistoryFresh(profile, nowMs, networkKey)) return Long.MAX_VALUE
@@ -1896,11 +1956,11 @@ class G2RayVpnService : VpnService() {
         val resolutionStartedAt = SystemClock.elapsedRealtime()
         val resolutionNetworkGeneration = underlyingNetworkGeneration.get()
         val runtimeProfiles = try {
-            interruptibleDnsLookup {
-                resolveRuntimeProfiles(
-                    liveRouteProfilesFor(profile),
-                    maxProfiles = if (seamlessFailoverEnabled) MAX_LIVE_ROUTE_PROFILES else 1
-                ) { address -> SocketProtector.resolveTunnelEndpoints(address, MAX_LIVE_ROUTE_PROFILES) }
+            resolveRuntimeProfilesForStartup(
+                liveRouteProfilesFor(profile),
+                maxProfiles = if (seamlessFailoverEnabled) MAX_LIVE_ROUTE_PROFILES else 1
+            ) { address ->
+                interruptibleDnsLookup { SocketProtector.resolveTunnelEndpoints(address, MAX_LIVE_ROUTE_PROFILES) }
             }
         } catch (cancelled: CancellationException) {
             throw cancelled

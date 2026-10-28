@@ -35,6 +35,10 @@ public abstract class VerifyLibXrayBundleTask extends DefaultTask {
     @PathSensitive(PathSensitivity.RELATIVE)
     public abstract RegularFileProperty getControllerPatch();
 
+    @InputFile
+    @PathSensitive(PathSensitivity.RELATIVE)
+    public abstract RegularFileProperty getObserverPatch();
+
     @Input
     public abstract Property<Boolean> getRequired();
 
@@ -90,6 +94,20 @@ public abstract class VerifyLibXrayBundleTask extends DefaultTask {
         if (!actualPatchHash.equalsIgnoreCase(expectedPatchHash)) {
             throw new GradleException(
                 "The bundled libXray AAR was not built with the current Android controller patch"
+            );
+        }
+
+        String xrayRef = properties.getProperty("libxray.xray.ref", "").trim();
+        if (xrayRef.isEmpty()) {
+            throw new GradleException("libXray metadata is missing libxray.xray.ref");
+        }
+        String expectedObserverPatchHash = properties
+            .getProperty("libxray.xray.observer.patch.sha256", "")
+            .trim();
+        String actualObserverPatchHash = sha256(getObserverPatch().getAsFile().get().toPath());
+        if (!actualObserverPatchHash.equalsIgnoreCase(expectedObserverPatchHash)) {
+            throw new GradleException(
+                "The bundled libXray AAR was not built with the current Xray observer patch"
             );
         }
 

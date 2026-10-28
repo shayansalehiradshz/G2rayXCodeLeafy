@@ -34,6 +34,7 @@ data class WorkerWakeResponse(
     val codespace: String? = null,
     val start_accepted: Boolean? = null,
     val state: String? = null,
+    val pending_operation: Boolean? = null,
     val route_ready: Boolean? = null,
     val retry_after_seconds: Int? = null,
     val retry_after_epoch: Long? = null,

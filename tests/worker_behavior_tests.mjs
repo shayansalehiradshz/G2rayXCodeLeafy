@@ -556,25 +556,14 @@ async function testGithubHttp429Classification() {
   console.log("PASS: Worker classifies GitHub HTTP 429 rate limits");
 }
 
-async function testGithubStartRetriesTransientServerFailure() {
+async function testGithubStartDoesNotRetryAmbiguousServerFailure() {
   let startCalls = 0;
-  let cancelledResponseBodies = 0;
   globalThis.fetch = async (input) => {
     const url = String(input);
     if (url.includes("/start")) {
       startCalls += 1;
-      if (startCalls === 1) {
-        return new Response(new ReadableStream({
-          cancel() {
-            cancelledResponseBodies += 1;
-          }
-        }), {
-          status: 503,
-          headers: { "content-type": "application/json" }
-        });
-      }
-      return new Response(JSON.stringify({ state: "Available" }), {
-        status: 200,
+      return new Response(JSON.stringify({ message: "upstream temporarily unavailable" }), {
+        status: 503,
         headers: { "content-type": "application/json" }
       });
     }
@@ -596,18 +585,14 @@ async function testGithubStartRetriesTransientServerFailure() {
     throw new Error(`unexpected fetch ${url}`);
   };
 
-  const response = await worker.fetch(makeRequest("/api/wake"), baseEnv({
-    WAKE_FAST_PATH: "0",
-    GITHUB_API_RETRY_BACKOFF_MS: "0"
-  }), {});
+  const response = await worker.fetch(makeRequest("/api/wake"), baseEnv({ WAKE_FAST_PATH: "0" }), {});
   const body = await responseJson(response);
-  assert.equal(response.status, 202);
-  assert.equal(startCalls, 2);
-  assert.equal(cancelledResponseBodies, 1);
-  assert.equal(body.start_accepted, true);
-  assert.equal(body.route_ready, false);
-  assert.equal(body.next_action_code, "wait_codespace_available");
-  console.log("PASS: Worker retries transient GitHub start server failures once");
+  assert.equal(response.status, 502);
+  assert.equal(startCalls, 1);
+  assert.equal(body.start_accepted, undefined);
+  assert.equal(body.reason, "github_start_request_failed");
+  assert.equal(body.route_ready, undefined);
+  console.log("PASS: Worker does not retry an ambiguous GitHub start POST");
 }
 
 async function testQuotaBlockIncludesSurvivalFields() {
@@ -2606,7 +2591,7 @@ try {
   await testHealthSkipRoutePreservesGithubFailureGuidance();
   await testAuthorizedWakeCooldownIsOptional();
   await testGithubHttp429Classification();
-  await testGithubStartRetriesTransientServerFailure();
+  await testGithubStartDoesNotRetryAmbiguousServerFailure();
   await testQuotaBlockIncludesSurvivalFields();
   await testRetentionMissingFieldsAreUnknown();
   await testMonthlyResetEstimateCrossesYear();

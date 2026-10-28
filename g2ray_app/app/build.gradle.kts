@@ -16,6 +16,7 @@ val libXrayAar = file("libs/libXray.aar")
 val libXrayPropertiesFile = file("libs/libXray.properties")
 val libXrayBuildScript = rootProject.file("scripts/build-libxray-aar.ps1")
 val libXrayControllerPatch = rootProject.file("scripts/patches/libxray-android-controller.patch")
+val libXrayObserverPatch = rootProject.file("scripts/patches/xray-observer-detached-snapshot.patch")
 val hevMetadataFile = file("libs/hev.properties")
 val hevJniLibsDirectory = file("src/main/jniLibs")
 val releaseRequested = gradle.startParameter.taskNames.any { it.contains("Release", ignoreCase = true) }
@@ -58,6 +59,16 @@ fun verifyLibXrayBundle(required: Boolean) {
     check(!expectedHash.isNullOrBlank()) { "libXray metadata is missing libxray.sha256" }
     check(sha256(libXrayAar) == expectedHash) {
         "app/libs/libXray.aar does not match the pinned SHA-256; rebuild it with scripts/build-libxray-aar.ps1"
+    }
+    check(!metadata.getProperty("libxray.xray.ref").isNullOrBlank()) {
+        "libXray metadata is missing libxray.xray.ref"
+    }
+    val expectedObserverPatchHash = metadata.getProperty("libxray.xray.observer.patch.sha256")?.trim()?.uppercase()
+    check(!expectedObserverPatchHash.isNullOrBlank()) {
+        "libXray metadata is missing libxray.xray.observer.patch.sha256"
+    }
+    check(sha256(libXrayObserverPatch) == expectedObserverPatchHash) {
+        "The bundled libXray AAR was not built with the current Xray observer patch"
     }
 }
 
@@ -175,6 +186,7 @@ val verifyLibXrayBuildContract = tasks.register<VerifyLibXrayBuildContractTask>(
     description = "Verifies that the production libXray builder uses a pinned, attested toolchain."
     buildScript.set(libXrayBuildScript)
     controllerPatch.set(libXrayControllerPatch)
+    observerPatch.set(libXrayObserverPatch)
 }
 
 val verifyBundledCore = tasks.register<VerifyLibXrayBundleTask>("verifyBundledCore") {
@@ -183,6 +195,7 @@ val verifyBundledCore = tasks.register<VerifyLibXrayBundleTask>("verifyBundledCo
     aarFile.set(libXrayAar)
     metadataFile.set(libXrayPropertiesFile)
     controllerPatch.set(libXrayControllerPatch)
+    observerPatch.set(libXrayObserverPatch)
     required.set(true)
 }
 

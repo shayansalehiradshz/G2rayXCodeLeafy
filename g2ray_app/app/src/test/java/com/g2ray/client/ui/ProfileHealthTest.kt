@@ -47,6 +47,16 @@ class ProfileHealthTest {
     }
 
     @Test
+    fun delayTailLabelsReflectSuccessfulSampleCount() {
+        val small = ProfileDelayState(delayMs = 100, p95Ms = 220, successfulSamples = 3, sampleCount = 5)
+        assertEquals("100 ms (worst of 3: 220 ms)", ProfileHealth.delayLabel(small))
+        assertEquals("p95 220 ms", ProfileHealth.tailLabel(small.copy(successfulSamples = 20, sampleCount = 20)))
+        assertEquals(null, ProfileHealth.tailLabel(small.copy(successfulSamples = 0)))
+        assertEquals(null, ProfileHealth.tailLabel(small.copy(successfulSamples = 6)))
+        assertEquals(null, ProfileHealth.tailLabel(small.copy(p95Ms = null)))
+    }
+
+    @Test
     fun olderUiSnapshotDoesNotOverrideNewerPersistedMeasurement() {
         val now = 1_000_000L
         val result = ProfileHealth.displayDelay(profile(now, 3, 3), ProfileDelayState(

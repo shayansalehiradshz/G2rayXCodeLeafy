@@ -2,6 +2,8 @@ package com.g2ray.client.network
 
 import com.g2ray.client.model.CodespaceWakeMode
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.Assert.assertEquals
@@ -107,6 +109,9 @@ class GitHubCodespacesApiTest {
     ) : GitHubCodespacesApiService {
         var getCalls = 0
         var startCalls = 0
+        var getCallsAtFirstStart: Int? = null
+        var startIOException: java.io.IOException? = null
+        var cancelBeforeStartIOException = false
 
         override suspend fun getCodespace(
             codespaceName: String,
@@ -121,6 +126,9 @@ class GitHubCodespacesApiTest {
             authorization: String
         ): Response<GitHubCodespaceResponse> {
             startCalls++
+            if (getCallsAtFirstStart == null) getCallsAtFirstStart = getCalls
+            if (cancelBeforeStartIOException) kotlinx.coroutines.currentCoroutineContext().cancel()
+            startIOException?.let { throw it }
             return startResponses.removeFirst()
         }
     }
@@ -169,6 +177,112 @@ class GitHubCodespacesApiTest {
         assertTrue(outcome is GitHubCodespaceOutcome.Ready)
         assertEquals(2, api.getCalls)
         assertEquals(0, api.startCalls)
+    }
+
+    @Test
+    fun stoppedCodespaceWithPendingOperationIsNotStartedAgain() = runTest {
+        val api = FakeGitHubApi(ArrayDeque(listOf(
+            Response.success(GitHubCodespaceResponse(state = "Shutdown", pending_operation = true)),
+            Response.success(GitHubCodespaceResponse(state = "Available", pending_operation = false))
+        )))
+        val outcome = GitHubCodespaceCoordinator(api, nowMs = { 0L }, sleep = {})
+            .ensureAvailable("demo", "token")
+        assertTrue(outcome is GitHubCodespaceOutcome.Ready)
+        assertEquals(2, api.getCalls)
+        assertEquals(0, api.startCalls)
+    }
+
+    @Test
+    fun stoppedCodespaceStartsAfterItsPendingOperationClears() = runTest {
+        val api = FakeGitHubApi(
+            getResponses = ArrayDeque(listOf(
+                Response.success(GitHubCodespaceResponse(state = "Stopped", pending_operation = true)),
+                Response.success(GitHubCodespaceResponse(state = "Stopped", pending_operation = false)),
+                Response.success(GitHubCodespaceResponse(state = "Available", pending_operation = false))
+            )),
+            startResponses = ArrayDeque(listOf(Response.success(202, GitHubCodespaceResponse(state = "Starting"))))
+        )
+        val outcome = GitHubCodespaceCoordinator(api, nowMs = { 0L }, sleep = {})
+            .ensureAvailable("demo", "token")
+        assertTrue(outcome is GitHubCodespaceOutcome.Ready)
+        assertEquals(3, api.getCalls)
+        assertEquals(1, api.startCalls)
+        assertEquals(2, api.getCallsAtFirstStart)
+    }
+
+    @Test
+    fun lostStartResponseChecksStatusAndAcceptsAnAlreadyRunningCodespace() = runTest {
+        var elapsed = 0L
+        val api = FakeGitHubApi(ArrayDeque(listOf(
+            Response.success(GitHubCodespaceResponse(state = "Shutdown")),
+            Response.success(GitHubCodespaceResponse(state = "Starting", pending_operation = true)),
+            Response.success(GitHubCodespaceResponse(state = "Available", pending_operation = false))
+        ))).apply { startIOException = java.io.IOException("response lost") }
+        val result = GitHubCodespaceCoordinator(api, nowMs = { elapsed }, sleep = { elapsed += it })
+            .ensureAvailable("demo", "token")
+        assertTrue(result is GitHubCodespaceOutcome.Ready)
+        assertEquals(1, api.startCalls)
+        assertEquals(3, api.getCalls)
+    }
+
+    @Test
+    fun cancelledStartIoFailureDoesNotPollOrReturnARecoveryResult() = runTest {
+        var returned = false
+        val api = FakeGitHubApi(ArrayDeque(listOf(Response.success(GitHubCodespaceResponse(state = "Shutdown")))))
+            .apply { startIOException = java.io.IOException("cancelled"); cancelBeforeStartIOException = true }
+        val job = launch {
+            GitHubCodespaceCoordinator(api, nowMs = { 0L }, sleep = {}).ensureAvailable("demo", "token")
+            returned = true
+        }
+        job.join()
+        assertTrue(job.isCancelled)
+        assertEquals(false, returned)
+        assertEquals(1, api.getCalls)
+        assertEquals(1, api.startCalls)
+    }
+
+    @Test
+    fun lostStartResponseDoesNotRepeatStartWhileStopped() = runTest {
+        var elapsed = 0L
+        val api = FakeGitHubApi(ArrayDeque(List(3) {
+            Response.success(GitHubCodespaceResponse(state = "Shutdown", pending_operation = false))
+        })).apply { startIOException = java.io.IOException("response lost") }
+        val result = GitHubCodespaceCoordinator(api, nowMs = { elapsed }, sleep = { elapsed += it })
+            .ensureAvailable("demo", "token") as GitHubCodespaceOutcome.Failed
+        assertTrue(result.retryAllowed)
+        assertTrue(result.controlPlaneUnavailable)
+        assertEquals(3_000L, result.retryAfterMs)
+        assertEquals(1, api.startCalls)
+        assertEquals(3, api.getCalls)
+        assertEquals(6_000L, elapsed)
+    }
+
+    @Test
+    fun lostStartResponseStillHonorsStatusRateLimits() = runTest {
+        var elapsed = 0L
+        val api = FakeGitHubApi(ArrayDeque(listOf(
+            Response.success(GitHubCodespaceResponse(state = "Shutdown")),
+            error(429, "rate limit", mapOf("Retry-After" to "120"))
+        ))).apply { startIOException = java.io.IOException("response lost") }
+        val result = GitHubCodespaceCoordinator(api, nowMs = { elapsed }, sleep = { elapsed += it })
+            .ensureAvailable("demo", "token") as GitHubCodespaceOutcome.Failed
+        assertEquals(429, result.httpCode)
+        assertEquals(120_000L, result.retryAfterMs)
+        assertEquals(1, api.startCalls)
+    }
+
+    @Test
+    fun uncertainWorkerWakeNeverImmediatelyStartsStoppedCodespace() = runTest {
+        var elapsed = 0L
+        val api = FakeGitHubApi(ArrayDeque(List(2) {
+            Response.success(GitHubCodespaceResponse(state = "Shutdown", pending_operation = false))
+        }))
+        val result = GitHubCodespaceCoordinator(api, nowMs = { elapsed }, sleep = { elapsed += it })
+            .ensureAvailable("demo", "token", reconcileUncertainWorkerWake = true) as GitHubCodespaceOutcome.Failed
+        assertTrue(result.retryAllowed)
+        assertEquals(3_000L, result.retryAfterMs)
+        assertEquals(0, api.startCalls)
+        assertEquals(2, api.getCalls)
     }
 
     @Test

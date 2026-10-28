@@ -7,6 +7,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Dns
@@ -19,6 +21,8 @@ import retrofit2.Retrofit
 import retrofit2.converter.moshi.MoshiConverterFactory
 import java.io.IOException
 import java.net.InetAddress
+import java.net.ConnectException
+import java.net.UnknownHostException
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.URI
@@ -56,7 +60,8 @@ sealed interface WorkerRouteOutcome {
         val httpCode: Int? = null,
         val response: WorkerWakeResponse? = null,
         val retryAllowed: Boolean = wakeHttpFailureRetryAllowed(httpCode),
-        val retryAfterMs: Long? = null
+        val retryAfterMs: Long? = null,
+        val wakeMayBeInFlight: Boolean = false
     ) : WorkerRouteOutcome
 
     data class TimedOut(val message: String, val retryAfterMs: Long? = null) : WorkerRouteOutcome
@@ -230,6 +235,7 @@ class WorkerRouteCoordinator(
     private val sleep: suspend (Long) -> Unit = { delay(it) },
     private val nowEpochMs: () -> Long = System::currentTimeMillis
 ) {
+    private class UncertainWakeException(cause: IOException) : IOException("Worker wake response was lost.", cause)
     private data class WorkerCall(
         val response: Response<WorkerWakeResponse>,
         val errorBody: WorkerWakeResponse?,
@@ -248,6 +254,7 @@ class WorkerRouteCoordinator(
         maxWaitMs: Long = 3 * 60 * 1000L,
         maxAttempts: Int = 40,
         expectedCodespaceName: String? = null,
+        preflightBeforeWake: Boolean = false,
         onProgress: (WorkerRouteProgress) -> Unit = {}
     ): WorkerRouteOutcome {
         val normalizedBases = workerBaseUrls
@@ -263,8 +270,64 @@ class WorkerRouteCoordinator(
         var orderedBases = normalizedBases
         var endpoint = WorkerRouteEndpoint.WAKE
         var attempts = 0
+        var uncertainWake = false
+        var stoppedChecks = 0
         val startedAt = nowMs()
         val retryCooldown = WakeRetryCooldown(nowMs)
+
+        if (preflightBeforeWake) {
+            onProgress(WorkerRouteProgress(WorkerRoutePhase.WAKING, "Checking Worker availability...", 0))
+            val preflightBudget = minOf(8_000L, (maxWaitMs / 3L).coerceAtLeast(1L))
+            val preflight = try {
+                withTimeoutOrNull(preflightBudget) {
+                    callWithFailover(orderedBases, WorkerRouteEndpoint.HEALTH, secret, codespaceId,
+                        retryCooldown, checkRoute = false) { retryAfterMs ->
+                        onProgress(WorkerRouteProgress(WorkerRoutePhase.WAKING,
+                            "Worker requested a retry delay.", 0, retryAfterMs))
+                    }
+                }
+            } catch (error: IOException) {
+                if ((retryCooldown.remainingMs() ?: 0L) > 0L) {
+                    return WorkerRouteOutcome.TimedOut("Worker health check failed while a retry delay is active.",
+                        retryCooldown.remainingMs())
+                }
+                return WorkerRouteOutcome.Failed(
+                    error.localizedMessage ?: "Worker health check could not connect.",
+                    controlPlaneUnavailable = true, retryAfterMs = retryCooldown.remainingMs()
+                )
+            }
+            if (preflight == null) {
+                if ((retryCooldown.remainingMs() ?: 0L) > 0L) {
+                    return WorkerRouteOutcome.TimedOut("Worker health check timed out while a retry delay is active.",
+                        retryCooldown.remainingMs())
+                }
+                return WorkerRouteOutcome.Failed("Worker health check timed out before any wake request was sent.",
+                    controlPlaneUnavailable = true, retryAfterMs = retryCooldown.remainingMs())
+            }
+            val response = preflight.response
+            val body = if (response.isSuccessful) response.body() else preflight.errorBody
+            if (response.isSuccessful && !expectedCodespaceName.isNullOrBlank() && body?.codespace != expectedCodespaceName) {
+                return WorkerRouteOutcome.Failed(
+                    "Worker responded for a different or unidentified Codespace. Check this account's Worker selection.",
+                    response = body, retryAllowed = false
+                )
+            }
+            if (response.isSuccessful && body?.ok != true) {
+                return WorkerRouteOutcome.Failed("Worker health check returned an invalid status.",
+                    response = body, retryAllowed = false)
+            }
+            if (!response.isSuccessful && !(response.code() == 404 && body == null)) {
+                val retryAllowed = !permanentWakeFailure(body) &&
+                    (isRateLimited(response, body) || wakeHttpFailureRetryAllowed(response.code()))
+                return WorkerRouteOutcome.Failed(
+                    message = body?.next_action ?: body?.reason ?: body?.error ?: "Worker health check failed with HTTP ${response.code()}.",
+                    controlPlaneUnavailable = response.code() in 500..599,
+                    httpCode = response.code(), response = body, retryAllowed = retryAllowed,
+                    retryAfterMs = if (retryAllowed) retryCooldown.remainingMs() else null
+                )
+            }
+            orderedBases = listOf(preflight.workerBaseUrl) + orderedBases.filterNot { it == preflight.workerBaseUrl }
+        }
 
         while (attempts < maxAttempts && nowMs() - startedAt < maxWaitMs) {
             attempts++
@@ -280,8 +343,14 @@ class WorkerRouteCoordinator(
                 )
             )
 
+            val remaining = (maxWaitMs - (nowMs() - startedAt)).coerceAtLeast(1L)
+            val callBudget = if (preflightBeforeWake && endpoint == WorkerRouteEndpoint.WAKE) {
+                minOf(20_000L, (remaining / 2L).coerceAtLeast(1L))
+            } else if (preflightBeforeWake && uncertainWake) {
+                minOf(8_000L, (remaining / 2L).coerceAtLeast(1L))
+            } else remaining
             val call = try {
-                withTimeoutOrNull((maxWaitMs - (nowMs() - startedAt)).coerceAtLeast(1L)) {
+                withTimeoutOrNull(callBudget) {
                     callWithFailover(orderedBases, endpoint, secret, codespaceId, retryCooldown) { retryAfterMs ->
                         onProgress(WorkerRouteProgress(
                             phase = if (endpoint == WorkerRouteEndpoint.WAKE) WorkerRoutePhase.WAKING else WorkerRoutePhase.SETTLING,
@@ -290,12 +359,28 @@ class WorkerRouteCoordinator(
                             retryAfterMs = retryAfterMs
                         ))
                     }
-                } ?: return WorkerRouteOutcome.TimedOut("Worker recovery deadline exceeded.", retryCooldown.remainingMs())
+                } ?: if (endpoint == WorkerRouteEndpoint.WAKE && preflightBeforeWake &&
+                    callBudget < remaining && (retryCooldown.remainingMs() ?: 0L) == 0L) {
+                    uncertainWake = true
+                    endpoint = WorkerRouteEndpoint.HEALTH
+                    sleep(minOf(3_000L, (maxWaitMs - (nowMs() - startedAt)).coerceAtLeast(0L)))
+                    continue
+                } else if (uncertainWake && preflightBeforeWake && callBudget < remaining &&
+                    (retryCooldown.remainingMs() ?: 0L) == 0L) {
+                    return WorkerRouteOutcome.Failed("Worker health check timed out after an uncertain wake.",
+                        controlPlaneUnavailable = true, wakeMayBeInFlight = true)
+                } else return WorkerRouteOutcome.TimedOut("Worker recovery deadline exceeded.", retryCooldown.remainingMs())
+            } catch (error: UncertainWakeException) {
+                uncertainWake = true
+                endpoint = WorkerRouteEndpoint.HEALTH
+                sleep(minOf(3_000L, (maxWaitMs - (nowMs() - startedAt)).coerceAtLeast(0L)))
+                continue
             } catch (error: IOException) {
                 return WorkerRouteOutcome.Failed(
                     message = error.localizedMessage ?: "All configured Worker endpoints are unreachable.",
                     controlPlaneUnavailable = true,
-                    retryAfterMs = retryCooldown.remainingMs()
+                    retryAfterMs = retryCooldown.remainingMs(),
+                    wakeMayBeInFlight = uncertainWake
                 )
             }
             orderedBases = listOf(call.workerBaseUrl) + orderedBases.filterNot { it == call.workerBaseUrl }
@@ -323,6 +408,15 @@ class WorkerRouteCoordinator(
                 if (body?.route_ready == true) {
                     return WorkerRouteOutcome.Ready(call.workerBaseUrl, body)
                 }
+                if (uncertainWake && body?.state?.lowercase() in setOf("shutdown", "stopped") &&
+                    body?.pending_operation == false) {
+                    stoppedChecks++
+                    if (stoppedChecks >= 2) return WorkerRouteOutcome.Failed(
+                        "Worker wake response was lost and the Codespace is still stopped.",
+                        response = body, retryAfterMs = maxOf(3_000L, retryCooldown.remainingMs() ?: 0L),
+                        wakeMayBeInFlight = true
+                    )
+                } else if (uncertainWake) stoppedChecks = 0
                 if (shouldPoll(response.code(), body)) {
                     val waitSeconds = pollDelaySeconds(body)
                     onProgress(
@@ -370,7 +464,8 @@ class WorkerRouteCoordinator(
                 httpCode = response.code(),
                 response = body,
                 retryAllowed = retryAllowed,
-                retryAfterMs = if (retryAllowed) retryCooldown.remainingMs() else null
+                retryAfterMs = if (retryAllowed) retryCooldown.remainingMs() else null,
+                wakeMayBeInFlight = uncertainWake
             )
         }
 
@@ -405,12 +500,14 @@ class WorkerRouteCoordinator(
         secret: String,
         codespaceId: String?,
         retryCooldown: WakeRetryCooldown,
+        checkRoute: Boolean = true,
         onRetryAfter: (Long) -> Unit
     ): WorkerCall {
         var lastIoError: IOException? = null
         var lastRetryableCall: WorkerCall? = null
         baseUrls.forEachIndexed { index, baseUrl ->
-            val url = WorkerUrlNormalizer.normalize(baseUrl, endpoint)
+            val url = WorkerUrlNormalizer.normalize(baseUrl, endpoint) +
+                if (!checkRoute && endpoint == WorkerRouteEndpoint.HEALTH) "?route=false" else ""
             val response = try {
                 if (endpoint == WorkerRouteEndpoint.WAKE) {
                     apiService.wake(url, "Bearer $secret", CodespaceRequest(codespaceId))
@@ -418,6 +515,10 @@ class WorkerRouteCoordinator(
                     apiService.health(url, "Bearer $secret", CodespaceRequest(codespaceId))
                 }
             } catch (error: IOException) {
+                currentCoroutineContext().ensureActive()
+                if (endpoint == WorkerRouteEndpoint.WAKE && error !is ConnectException && error !is UnknownHostException) {
+                    throw UncertainWakeException(error)
+                }
                 lastIoError = error
                 return@forEachIndexed
             }
@@ -434,6 +535,11 @@ class WorkerRouteCoordinator(
                     // wake/service deadline may cancel that next request.
                     retryCooldown.remainingMs()?.let(onRetryAfter)
                 }
+            }
+            if (endpoint == WorkerRouteEndpoint.WAKE && response.code() in 500..599 &&
+                call.errorBody?.reason in setOf("github_start_request_unreachable", "github_start_request_failed")
+            ) {
+                throw UncertainWakeException(IOException("GitHub start outcome is unknown."))
             }
             val canTryFallback = index + 1 < baseUrls.size &&
                 response.code() in 500..599

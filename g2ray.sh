@@ -6007,12 +6007,23 @@ refresh_config_exports() {
 
 _refresh_config_exports_if_changed_impl() {
     active_vless_uuid >/dev/null 2>&1 || { clear_config_exports "missing_uuid"; return 1; }
-    local new_hash old_hash
+    local new_hash old_hash quota_snapshot quota_cycle
     new_hash=$(export_input_hash)
     old_hash=$(cat "$EXPORT_INPUT_HASH_FILE" 2>/dev/null || true)
     if [[ -n "$new_hash" && "$new_hash" == "$old_hash" ]] && config_export_artifacts_present; then
-        log_event INFO "config_exports unchanged hash=${new_hash}"
-        return 0
+        # Repair an unavailable or previous-month snapshot once the tracker has
+        # current data, without rebuilding the QR for every elapsed minute.
+        if quota_cycle=$(current_quota_cycle) &&
+            jq -e --arg cycle "$quota_cycle" \
+                '.quota_estimate == null or ((.quota_estimate | type) == "object" and .quota_estimate.cycle != $cycle)' \
+                "$CODESPACE_BUNDLE_FILE" >/dev/null 2>&1 &&
+            quota_snapshot=$(quota_snapshot_json) &&
+            jq -e 'type == "object"' >/dev/null 2>&1 <<< "$quota_snapshot"; then
+            log_event INFO "config_exports refresh reason=quota_snapshot_available"
+        else
+            log_event INFO "config_exports unchanged hash=${new_hash}"
+            return 0
+        fi
     fi
     _refresh_config_exports_impl || return 1
 }

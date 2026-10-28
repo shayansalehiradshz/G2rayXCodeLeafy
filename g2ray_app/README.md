@@ -256,7 +256,7 @@ config tests run on any development machine. Installable debug and release
 builds require the official Android AAR and matching
 `app/libs/libXray.properties`:
 
-1. Install Go 1.26.5, Python, Android command-line tools, and Android NDK
+1. Install Go 1.26.10, Python, Android command-line tools, and Android NDK
    28.2.13676358. The build script pins `gomobile` and `gobind` to the same
    tested `x/mobile` revision, prevents upstream `@latest` replacement, and
    attests both tools again after the build. It also removes local source paths

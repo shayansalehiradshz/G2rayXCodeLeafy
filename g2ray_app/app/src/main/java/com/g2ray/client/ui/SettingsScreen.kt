@@ -940,7 +940,6 @@ fun ProfilesScreen(
                     val delayState = delayStates[profile.id]
                     val displayedDelay = ProfileHealth.displayDelay(profile, delayState, networkKey = measurementNetworkKey)
                     val effectiveDelayMs = displayedDelay.delayMs
-                    val effectiveP95Ms = displayedDelay.p95Ms
                     val effectiveSuccessfulSamples = displayedDelay.successfulSamples
                     val effectiveSampleCount = displayedDelay.sampleCount
                     val effectiveError = displayedDelay.error
@@ -997,7 +996,7 @@ fun ProfilesScreen(
                                     delayState?.testing == true -> "Real delay: testing..."
                                     effectiveDelayMs != null -> buildString {
                                         append("Real delay: median ${effectiveDelayMs} ms")
-                                        effectiveP95Ms?.let { append(", p95 ${it} ms") }
+                                        ProfileHealth.tailLabel(displayedDelay)?.let { append(", $it") }
                                         if (effectiveSampleCount > 0) {
                                             append(" (${effectiveSuccessfulSamples}/${effectiveSampleCount} samples)")
                                         }

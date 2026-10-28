@@ -2,6 +2,7 @@ package com.g2ray.client.network
 
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.ResponseBody.Companion.toResponseBody
@@ -12,6 +13,292 @@ import retrofit2.Response
 import java.io.IOException
 
 class WorkerRouteCoordinatorTest {
+    @Test
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    fun stalledWorkerWakeIsCancelledThenReconciledThroughHealth() = runTest {
+        var cancelled = false
+        val api = FakeWorkerApiService(
+            wakeHandler = { try { kotlinx.coroutines.awaitCancellation() } finally { cancelled = true } },
+            healthHandler = { url ->
+                Response.success(WorkerWakeResponse(ok = true, codespace = "demo",
+                    route_ready = !url.endsWith("?route=false")))
+            }
+        )
+        val result = WorkerRouteCoordinator(api, nowMs = { testScheduler.currentTime }).ensureRouteReady(
+            listOf("worker.example"), "secret", maxWaitMs = 30_000L,
+            expectedCodespaceName = "demo", preflightBeforeWake = true)
+        assertTrue(result is WorkerRouteOutcome.Ready)
+        assertTrue(cancelled)
+        assertEquals(18_000L, testScheduler.currentTime)
+        assertEquals(listOf("https://worker.example/api/health?route=false", "https://worker.example/wake",
+            "https://worker.example/api/health"), api.calls)
+    }
+
+    @Test
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    fun cancelledWakeIoFailureDoesNotTriggerHealthOrAnotherWake() = runTest {
+        var returned = false
+        val api = FakeWorkerApiService(
+            wakeHandler = { kotlinx.coroutines.currentCoroutineContext().cancel(); throw IOException("cancelled") },
+            healthHandler = { error("Cancelled wake must not poll") }
+        )
+        val job = launch {
+            WorkerRouteCoordinator(api, nowMs = { testScheduler.currentTime }).ensureRouteReady(
+                listOf("worker.example", "backup.example"), "secret")
+            returned = true
+        }
+        job.join()
+        assertTrue(job.isCancelled)
+        assertEquals(false, returned)
+        assertEquals(listOf("https://worker.example/wake"), api.calls)
+    }
+    @Test
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    fun lostWorkerWakeResponseChecksHealthWithoutRepeatingWake() = runTest {
+        var healthChecks = 0
+        val api = FakeWorkerApiService(
+            wakeHandler = { throw IOException("response lost") },
+            healthHandler = {
+                healthChecks++
+                if (healthChecks == 1) Response.success(WorkerWakeResponse(ok = true, codespace = "demo", state = "Starting", pending_operation = true, route_ready = false, poll_after_seconds = 2))
+                else Response.success(WorkerWakeResponse(ok = true, codespace = "demo", state = "Available", pending_operation = false, route_ready = true))
+            }
+        )
+        val result = WorkerRouteCoordinator(api, nowMs = { testScheduler.currentTime }).ensureRouteReady(
+            listOf("worker.example", "backup.example"), "secret", expectedCodespaceName = "demo")
+        assertTrue(result is WorkerRouteOutcome.Ready)
+        assertEquals(listOf("https://worker.example/wake", "https://worker.example/api/health", "https://worker.example/api/health"), api.calls)
+        assertEquals(5_000L, testScheduler.currentTime)
+    }
+
+    @Test
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    fun lostWorkerWakeWithStoppedHostReturnsRetryableWithoutAnotherPost() = runTest {
+        val api = FakeWorkerApiService(
+            wakeHandler = { throw IOException("response lost") },
+            healthHandler = { Response.success(WorkerWakeResponse(ok = true, codespace = "demo", state = "Shutdown", pending_operation = false, route_ready = false, poll_after_seconds = 2)) }
+        )
+        val result = WorkerRouteCoordinator(api, nowMs = { testScheduler.currentTime }).ensureRouteReady(
+            listOf("worker.example"), "secret", expectedCodespaceName = "demo") as WorkerRouteOutcome.Failed
+        assertTrue(result.retryAllowed)
+        assertTrue(result.wakeMayBeInFlight)
+        assertEquals(3_000L, result.retryAfterMs)
+        assertEquals(listOf("https://worker.example/wake", "https://worker.example/api/health", "https://worker.example/api/health"), api.calls)
+    }
+
+    @Test
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    fun lostWorkerWakePreservesLongerPriorRetryDelay() = runTest {
+        val api = FakeWorkerApiService(
+            wakeHandler = { url ->
+                if (url.contains("primary.example")) workerError(503, """{"error":"busy"}""",
+                    mapOf("Retry-After" to "180")) else throw IOException("response lost")
+            },
+            healthHandler = { Response.success(WorkerWakeResponse(ok = true, codespace = "demo", state = "Shutdown",
+                pending_operation = false, route_ready = false, poll_after_seconds = 2)) }
+        )
+        val result = WorkerRouteCoordinator(api, nowMs = { testScheduler.currentTime }).ensureRouteReady(
+            listOf("primary.example", "backup.example"), "secret", expectedCodespaceName = "demo") as WorkerRouteOutcome.Failed
+        assertEquals(175_000L, result.retryAfterMs)
+        assertTrue(result.wakeMayBeInFlight)
+        assertEquals(2, api.calls.count { it.endsWith("/wake") })
+    }
+
+    @Test
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    fun unreachableHealthAfterLostWakeCarriesUncertaintyToGitHub() = runTest {
+        var reconciles = false
+        val api = FakeWorkerApiService(
+            wakeHandler = { throw IOException("response lost") },
+            healthHandler = { url ->
+                if (url.endsWith("?route=false")) Response.success(WorkerWakeResponse(ok = true, codespace = "demo"))
+                else throw java.net.ConnectException("health unreachable")
+            }
+        )
+        val coordinator = CodespaceWakeCoordinator(
+            workerWake = { request, progress -> WorkerRouteCoordinator(api, nowMs = { testScheduler.currentTime })
+                .ensureRouteReady(request.workerBaseUrls, request.secret, maxWaitMs = request.maxWaitMs,
+                    expectedCodespaceName = request.expectedCodespaceName,
+                    preflightBeforeWake = request.preflightBeforeWake, onProgress = progress) },
+            githubWake = { request, _ ->
+                reconciles = request.reconcileUncertainWorkerWake
+                GitHubCodespaceOutcome.Ready(GitHubCodespaceResponse(state = "Available"))
+            }, nowMs = { testScheduler.currentTime }
+        )
+        val result = coordinator.ensureReady(CodespaceWakeRequest(
+            com.g2ray.client.model.CodespaceWakeMode.AUTO, "demo", workerBaseUrls = listOf("worker.example"),
+            workerSecret = "secret", githubToken = "token"
+        ))
+        assertTrue(result is CodespaceWakeOutcome.Ready)
+        assertTrue(reconciles)
+        assertEquals(listOf("https://worker.example/api/health?route=false", "https://worker.example/wake", "https://worker.example/api/health"), api.calls)
+    }
+
+    @Test
+    fun uncertainWorkerWakeDoesNotBypassRetryDelayThroughGitHub() = runTest {
+        var directCalls = 0
+        val coordinator = CodespaceWakeCoordinator(
+            workerWake = { _, _ -> WorkerRouteOutcome.Failed("Worker unavailable", controlPlaneUnavailable = true,
+                retryAfterMs = 180_000L, wakeMayBeInFlight = true) },
+            githubWake = { _, _ -> directCalls++; error("Retry delay must be honored") },
+            nowMs = { 0L }
+        )
+        val result = coordinator.ensureReady(CodespaceWakeRequest(
+            com.g2ray.client.model.CodespaceWakeMode.AUTO, "demo", workerBaseUrls = listOf("worker.example"),
+            workerSecret = "secret", githubToken = "token"
+        )) as CodespaceWakeOutcome.Failed
+        assertEquals(0, directCalls)
+        assertEquals(180_000L, result.retryAfterMs)
+    }
+    @Test
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    fun autoPreflightTimeoutFallsBackWithoutSendingWorkerWake() = runTest {
+        var healthCancelled = false
+        var directCalls = 0
+        val api = FakeWorkerApiService(
+            wakeHandler = { error("Preflight timeout must not send a Worker wake") },
+            healthHandler = {
+                try { kotlinx.coroutines.awaitCancellation() } finally { healthCancelled = true }
+            }
+        )
+        val coordinator = CodespaceWakeCoordinator(
+            workerWake = { request, progress -> WorkerRouteCoordinator(api, nowMs = { testScheduler.currentTime })
+                .ensureRouteReady(request.workerBaseUrls, request.secret, maxWaitMs = request.maxWaitMs,
+                    preflightBeforeWake = request.preflightBeforeWake, onProgress = progress) },
+            githubWake = { _, _ ->
+                directCalls++
+                GitHubCodespaceOutcome.Ready(GitHubCodespaceResponse(state = "Available"))
+            },
+            nowMs = { testScheduler.currentTime }
+        )
+        val result = coordinator.ensureReady(CodespaceWakeRequest(
+            com.g2ray.client.model.CodespaceWakeMode.AUTO, "demo", workerBaseUrls = listOf("worker.example"),
+            workerSecret = "secret", githubToken = "token"
+        ), maxWaitMs = 30_000L)
+        assertTrue(result is CodespaceWakeOutcome.Ready)
+        assertEquals(1, directCalls)
+        assertEquals(8_000L, testScheduler.currentTime)
+        assertTrue(healthCancelled)
+        assertEquals(listOf("https://worker.example/api/health?route=false"), api.calls)
+    }
+
+    @Test
+    fun healthyPreflightUsesWorkerWakeAndPreservesIdentity() = runTest {
+        val api = FakeWorkerApiService(
+            wakeHandler = { Response.success(WorkerWakeResponse(ok = true, codespace = "demo", route_ready = true)) },
+            healthHandler = { Response.success(WorkerWakeResponse(ok = true, codespace = "demo", state = "Shutdown")) }
+        )
+        val result = WorkerRouteCoordinator(api, nowMs = { 0L }).ensureRouteReady(
+            listOf("worker.example"), "secret", expectedCodespaceName = "demo", preflightBeforeWake = true
+        )
+        assertTrue(result is WorkerRouteOutcome.Ready)
+        assertEquals(listOf("https://worker.example/api/health?route=false", "https://worker.example/wake"), api.calls)
+    }
+
+    @Test
+    fun preflightRejectsWrongCodespaceAndDoesNotWake() = runTest {
+        val api = FakeWorkerApiService(
+            wakeHandler = { error("Wrong identity must not be started") },
+            healthHandler = { Response.success(WorkerWakeResponse(ok = true, codespace = "other")) }
+        )
+        val result = WorkerRouteCoordinator(api, nowMs = { 0L }).ensureRouteReady(
+            listOf("worker.example"), "secret", expectedCodespaceName = "demo", preflightBeforeWake = true
+        ) as WorkerRouteOutcome.Failed
+        assertEquals(false, result.retryAllowed)
+        assertEquals(1, api.calls.size)
+    }
+
+    @Test
+    fun preflightRateLimitDoesNotWakeOrFallBack() = runTest {
+        val api = FakeWorkerApiService(
+            wakeHandler = { error("Rate limited Worker must not wake") },
+            healthHandler = { workerError(429, """{"reason":"github_rate_limited","retry_after_seconds":180}""",
+                mapOf("Retry-After" to "180")) }
+        )
+        val result = WorkerRouteCoordinator(api, nowMs = { 0L }).ensureRouteReady(
+            listOf("worker.example"), "secret", preflightBeforeWake = true
+        ) as WorkerRouteOutcome.Failed
+        assertEquals(false, result.controlPlaneUnavailable)
+        assertEquals(180_000L, result.retryAfterMs)
+        assertEquals(1, api.calls.size)
+    }
+
+    @Test
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    fun preflightTimeoutPreservesEarlierAliasRetryDelay() = runTest {
+        val api = FakeWorkerApiService(
+            wakeHandler = { error("Cooldown must prevent wake") },
+            healthHandler = { url ->
+                if (url.contains("primary.example")) workerError(503, """{"error":"busy"}""",
+                    mapOf("Retry-After" to "180")) else kotlinx.coroutines.awaitCancellation()
+            }
+        )
+        val result = WorkerRouteCoordinator(api, nowMs = { testScheduler.currentTime }).ensureRouteReady(
+            listOf("primary.example", "backup.example"), "secret", maxWaitMs = 30_000,
+            preflightBeforeWake = true
+        ) as WorkerRouteOutcome.TimedOut
+        assertEquals(172_000L, result.retryAfterMs)
+        assertEquals(2, api.calls.size)
+    }
+
+    @Test
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    fun cancellingPreflightDoesNotStartEitherBackend() = runTest {
+        var cancelled = false
+        var directCalls = 0
+        val api = FakeWorkerApiService(
+            wakeHandler = { error("Cancelled preflight must not wake") },
+            healthHandler = { try { kotlinx.coroutines.awaitCancellation() } finally { cancelled = true } }
+        )
+        val coordinator = CodespaceWakeCoordinator(
+            workerWake = { request, progress -> WorkerRouteCoordinator(api, nowMs = { testScheduler.currentTime })
+                .ensureRouteReady(request.workerBaseUrls, request.secret, maxWaitMs = request.maxWaitMs,
+                    preflightBeforeWake = request.preflightBeforeWake, onProgress = progress) },
+            githubWake = { _, _ -> directCalls++; error("Cancelled preflight must not use GitHub") },
+            nowMs = { testScheduler.currentTime }
+        )
+        val job = launch {
+            coordinator.ensureReady(CodespaceWakeRequest(
+                com.g2ray.client.model.CodespaceWakeMode.AUTO, "demo", workerBaseUrls = listOf("worker.example"),
+                workerSecret = "secret", githubToken = "token"
+            ))
+        }
+        testScheduler.runCurrent()
+        job.cancelAndJoin()
+        assertTrue(cancelled)
+        assertEquals(0, directCalls)
+        assertEquals(listOf("https://worker.example/api/health?route=false"), api.calls)
+    }
+
+    @Test
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    fun acceptedWorkerWakeSettlesWithoutDirectFallback() = runTest {
+        var directCalls = 0
+        val api = FakeWorkerApiService(
+            wakeHandler = { Response.success(202, WorkerWakeResponse(ok = true, codespace = "demo",
+                start_accepted = true, route_ready = false, poll_after_seconds = 2)) },
+            healthHandler = { url ->
+                if (url.endsWith("?route=false")) Response.success(WorkerWakeResponse(ok = true, codespace = "demo"))
+                else kotlinx.coroutines.awaitCancellation()
+            }
+        )
+        val coordinator = CodespaceWakeCoordinator(
+            workerWake = { request, progress -> WorkerRouteCoordinator(api, nowMs = { testScheduler.currentTime })
+                .ensureRouteReady(request.workerBaseUrls, request.secret, maxWaitMs = request.maxWaitMs,
+                    expectedCodespaceName = request.expectedCodespaceName,
+                    preflightBeforeWake = request.preflightBeforeWake, onProgress = progress) },
+            githubWake = { _, _ -> directCalls++; error("Accepted wake must not use GitHub") },
+            nowMs = { testScheduler.currentTime }
+        )
+        val result = coordinator.ensureReady(CodespaceWakeRequest(
+            com.g2ray.client.model.CodespaceWakeMode.AUTO, "demo", workerBaseUrls = listOf("worker.example"),
+            workerSecret = "secret", githubToken = "token"
+        ), maxWaitMs = 5_000L)
+        assertTrue(result is CodespaceWakeOutcome.TimedOut)
+        assertEquals(0, directCalls)
+        assertEquals(listOf("https://worker.example/api/health?route=false", "https://worker.example/wake",
+            "https://worker.example/api/health"), api.calls)
+    }
     @Test
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     fun successfulWakeSuppressionDoesNotBecomeAGlobalRecoveryCooldown() = runTest {
@@ -268,7 +555,7 @@ class WorkerRouteCoordinatorTest {
                     workerError(503, """{"error":"temporary"}""", mapOf("Retry-After" to "180"))
                 } else {
                     elapsedMs = elapsed
-                    throw IOException("backup connection timed out")
+                    throw java.net.ConnectException("backup connection failed")
                 }
             })
             val result = WorkerRouteCoordinator(api, nowMs = { elapsedMs }).ensureRouteReady(
@@ -292,7 +579,7 @@ class WorkerRouteCoordinatorTest {
                 if (url.contains("primary.example")) {
                     workerError(503, """{"error":"temporary"}""", mapOf("Retry-After" to "180"))
                 } else {
-                    if (networkFailure) throw IOException("blocked backup")
+                    if (networkFailure) throw java.net.ConnectException("blocked backup")
                     workerError(503, """{"error":"temporary"}""",
                         backupHint?.let { mapOf("Retry-After" to it) }.orEmpty())
                 }
@@ -531,7 +818,7 @@ class WorkerRouteCoordinatorTest {
     @Test
     fun unreachablePrimaryUsesBackupWorker() = runTest {
         val api = FakeWorkerApiService(wakeHandler = { url ->
-            if (url.contains("primary.example")) throw IOException("blocked")
+            if (url.contains("primary.example")) throw java.net.ConnectException("blocked")
             Response.success(WorkerWakeResponse(ok = true, route_ready = true))
         })
         val coordinator = WorkerRouteCoordinator(api, nowMs = { 0L }, sleep = {})

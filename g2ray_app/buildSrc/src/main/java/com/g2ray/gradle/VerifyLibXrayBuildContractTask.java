@@ -21,6 +21,10 @@ public abstract class VerifyLibXrayBuildContractTask extends DefaultTask {
     @PathSensitive(PathSensitivity.RELATIVE)
     public abstract RegularFileProperty getControllerPatch();
 
+    @InputFile
+    @PathSensitive(PathSensitivity.RELATIVE)
+    public abstract RegularFileProperty getObserverPatch();
+
     @TaskAction
     public void verifyContract() throws Exception {
         String script = Files.readString(
@@ -51,6 +55,12 @@ public abstract class VerifyLibXrayBuildContractTask extends DefaultTask {
             "The production libXray build does not disable the nondeterministic external linker build ID.");
         require(script.contains("libxray.android.controller.patch.sha256="),
             "The libXray artifact metadata does not attest the Android controller patch.");
+        require(script.contains("git -C $xrayCoreDir apply --check $XrayObserverPatch") &&
+                script.contains("git -C $xrayCoreDir apply $XrayObserverPatch"),
+            "The production libXray build does not validate and apply the Xray observer patch.");
+        require(script.contains("libxray.xray.ref=") &&
+                script.contains("libxray.xray.observer.patch.sha256="),
+            "The libXray artifact metadata does not attest the Xray observer patch.");
         String controllerPatch = Files.readString(
             getControllerPatch().getAsFile().get().toPath(),
             StandardCharsets.UTF_8
@@ -60,6 +70,12 @@ public abstract class VerifyLibXrayBuildContractTask extends DefaultTask {
         require(controllerPatch.contains("func RegisterDialerController(controller func(fd uintptr) bool)") &&
                 controllerPatch.contains("func RegisterListenerController(controller func(fd uintptr) bool)"),
             "The Android controller patch must preserve the boolean socket-controller contract.");
+        String observerPatch = Files.readString(
+            getObserverPatch().getAsFile().get().toPath(),
+            StandardCharsets.UTF_8
+        );
+        require(!observerPatch.isBlank() && observerPatch.contains("GetObservation"),
+            "The Xray observer patch is empty or does not cover GetObservation.");
     }
 
     private static void require(boolean condition, String message) {

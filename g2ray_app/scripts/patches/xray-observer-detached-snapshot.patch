@@ -1,0 +1,49 @@
+diff --git a/app/observatory/observer.go b/app/observatory/observer.go
+index 80d81e22..5b50f1f9 100644
+--- a/app/observatory/observer.go
++++ b/app/observatory/observer.go
+@@ -7,6 +7,7 @@ import (
+ 	"net/url"
+ 	"slices"
+ 	"sort"
++	"strings"
+ 	"sync"
+ 	"time"
+ 
+@@ -39,7 +40,17 @@ type Observer struct {
+ }
+ 
+ func (o *Observer) GetObservation(ctx context.Context) (proto.Message, error) {
+-	return &ObservationResult{Status: o.status}, nil
++	// Return a detached snapshot: the background prober updates both the slice
++	// and its entries under statusLock while routers read observations.
++	o.statusLock.Lock()
++	defer o.statusLock.Unlock()
++	status := make([]*OutboundStatus, len(o.status))
++	for i, entry := range o.status {
++		if entry != nil {
++			status[i] = proto.Clone(entry).(*OutboundStatus)
++		}
++	}
++	return &ObservationResult{Status: status}, nil
+ }
+ 
+ func (o *Observer) Type() interface{} {
+@@ -178,9 +189,17 @@ func (o *Observer) probe(outbound string) ProbeResult {
+ 		if err != nil {
+ 			return errors.New("outbound failed to relay connection").Base(err)
+ 		}
++		status := response.Status
++		statusOK := response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices
++		if strings.HasSuffix(req.URL.Path, "/generate_204") {
++			statusOK = response.StatusCode == http.StatusNoContent
++		}
+ 		if response.Body != nil {
+ 			response.Body.Close()
+ 		}
++		if !statusOK {
++			return errors.New("outbound returned unexpected HTTP status ", status)
++		}
+ 		endTime := time.Now()
+ 		GETTime = endTime.Sub(startTime)
+ 		return nil
