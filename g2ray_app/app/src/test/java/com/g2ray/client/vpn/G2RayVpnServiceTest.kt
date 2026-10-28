@@ -1362,6 +1362,46 @@ class G2RayVpnServiceTest {
     }
 
     @Test
+    fun liveRoutePoolExploresUnmeasuredPublicIpsWithoutTrustingKnownFailures() {
+        val now = 10_000L
+        val selected = liveProfile("20.0.0.1")
+        val measured = liveProfile("20.0.0.2")
+        val unmeasured = liveProfile("20.0.0.3")
+        val failed = liveProfile("20.0.0.4")
+        val hostname = liveProfile("edge.example")
+        val measuredStored = storedProfile("measured", measured.address, 80, measured.rawUri).copy(
+            lastDelayTestedAt = now - 100L,
+            lastDelaySuccessfulSamples = 2,
+            lastDelaySampleCount = 2,
+            lastDelayNetworkKey = "test-network"
+        )
+        val unmeasuredStored = storedProfile("unmeasured", unmeasured.address, 0, unmeasured.rawUri)
+        val failedStored = storedProfile("failed", failed.address, 20, failed.rawUri).copy(
+            delayFailureCount = 1
+        )
+        val hostnameStored = storedProfile("hostname", hostname.address, 10, hostname.rawUri)
+
+        val selectedRoutes = G2RayVpnService.selectLiveRouteProfiles(
+            selected = selected,
+            candidates = listOf(
+                unmeasuredStored to unmeasured,
+                failedStored to failed,
+                measuredStored to measured,
+                hostnameStored to hostname
+            ),
+            sessionHealth = emptyMap(),
+            nowMs = now,
+            networkKey = "test-network",
+            maxProfiles = 3
+        )
+
+        assertEquals(
+            listOf(selected.address, measured.address, unmeasured.address),
+            selectedRoutes.map { it.address }
+        )
+    }
+
+    @Test
     fun otherNetworkHistoryCannotQualifyOrOutrankAMeasuredCurrentNetworkRoute() {
         val now = 10_000L
         val oldFast = storedProfile("old-fast", "203.0.113.1", 10).copy(lastDelayTestedAt = now, lastDelayNetworkKey = "old-network")

@@ -533,6 +533,41 @@ class G2RayVpnService : VpnService() {
             }
         }
 
+        internal fun selectLiveRouteProfiles(
+            selected: G2RayProfile,
+            candidates: List<Pair<StoredG2RayProfile, G2RayProfile>>,
+            sessionHealth: Map<String, SessionProfileHealth>,
+            nowMs: Long,
+            networkKey: String?,
+            maxProfiles: Int = MAX_LIVE_ROUTE_PROFILES
+        ): List<G2RayProfile> {
+            val verifiedCandidates = candidates.mapNotNull { (stored, parsed) ->
+                val observed = sessionHealth[stored.rawUri]
+                val verified = observed?.lastAttemptSucceeded == true ||
+                    persistedRouteMeasurementFresh(stored, nowMs, networkKey = networkKey)
+                parsed.takeIf { verified }
+            }
+            val verifiedUris = verifiedCandidates.mapTo(hashSetOf()) { it.rawUri }
+            // The observer measures from the phone, which is the only vantage
+            // point that can rank edge IPs for this client. Fill unused bounded
+            // slots with fresh, unfailed public-IP profiles so a route that has
+            // never been Ping-All tested can still win without delaying startup.
+            val exploratoryCandidates = candidates.asSequence()
+                .filter { (stored, parsed) ->
+                    parsed.rawUri !in verifiedUris &&
+                        VlessUriParser.isUsablePublicIpv4(parsed.address) &&
+                        sessionHealth[stored.rawUri]?.lastAttemptSucceeded != false &&
+                        stored.delayFailureCount == 0
+                }
+                .map { it.second }
+                .toList()
+            return selectSeamlessRouteProfiles(
+                selected,
+                verifiedCandidates + exploratoryCandidates,
+                maxProfiles
+            )
+        }
+
         internal fun resolveRuntimeProfiles(
             profiles: List<G2RayProfile>,
             maxProfiles: Int = MAX_LIVE_ROUTE_PROFILES,
@@ -2260,30 +2295,13 @@ class G2RayVpnService : VpnService() {
         val parsedCandidates = storedCandidates.mapNotNull { stored ->
             VlessUriParser.parse(stored.rawUri).getOrNull()?.let { parsed -> stored to parsed }
         }
-        val verifiedCandidates = parsedCandidates.mapNotNull { (stored, parsed) ->
-            val observed = sessionHealth[stored.rawUri]
-            val verified = observed?.lastAttemptSucceeded == true ||
-                persistedRouteMeasurementFresh(stored, nowMs, networkKey = networkKey)
-            if (!verified) return@mapNotNull null
-            parsed
-        }
-        val verifiedUris = verifiedCandidates.mapTo(hashSetOf()) { it.rawUri }
-        // The observer measures from the phone, which is the only vantage
-        // point that can rank edge IPs for this client. Fill unused bounded
-        // slots with fresh, unfailed public-IP profiles so a route that has
-        // never been Ping-All tested can still win without delaying startup.
-        val exploratoryCandidates = parsedCandidates.asSequence()
-            .filter { (stored, parsed) ->
-                parsed.rawUri !in verifiedUris &&
-                    VlessUriParser.isUsablePublicIpv4(parsed.address) &&
-                    sessionHealth[stored.rawUri]?.lastAttemptSucceeded != false &&
-                    stored.delayFailureCount == 0
-            }
-            .map { it.second }
-            .toList()
-        return selectSeamlessRouteProfiles(
+        return selectLiveRouteProfiles(
             selected,
-            verifiedCandidates + exploratoryCandidates
+            parsedCandidates,
+            sessionHealth,
+            nowMs,
+            networkKey,
+            maxProfiles = MAX_LIVE_ROUTE_PROFILES
         )
     }
 
