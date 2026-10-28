@@ -116,17 +116,18 @@ portable rather than simpler.
 
 ## VPN Engine
 
-- **Auto** is the default. It uses the bundled HEV TUN forwarding engine when
-  available, verifies the Xray route, and falls back once to Xray's native TUN
-  engine if HEV cannot carry that profile.
+- **Auto** is the default. It tries Xray's native TUN path first to avoid the
+  extra HEV userspace forwarding hop, verifies the full route, and falls back
+  once to HEV if the native packet path cannot become healthy.
 - **HEV** keeps the choice explicit for testing. It uses loopback SOCKS between
   HEV and Xray and exposes true VPN TUN upload/download counters.
-- **Native** uses Xray's Android TUN inbound directly. It is the compatibility
-  fallback; the app does not invent device-wide throughput figures for it.
+- **Native** uses Xray's Android TUN inbound directly. It is the default Auto
+  data path; the app does not invent device-wide throughput figures for it.
 
 Physical-device tests found retained-connection idle stalls in Native and a
-HEV screen-off case. Fresh connections still worked. Auto/HEV remains the normal
-path, not a guarantee of stall-free idle resume. See the
+HEV screen-off case. Fresh connections still worked. Both engines now use
+bounded wake/reverification, and Native also has a coarse physical-byte stall
+hint; neither is a guarantee of stall-free idle resume. See the
 [verification record](DEVICE_VERIFICATION_2026-10-12.md).
 
 Both engines use a 1500-byte Android VPN MTU. The physical network and the

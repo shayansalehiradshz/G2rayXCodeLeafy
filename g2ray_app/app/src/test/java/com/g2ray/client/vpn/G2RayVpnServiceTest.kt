@@ -923,6 +923,20 @@ class G2RayVpnServiceTest {
                 TrafficBytes(rxBytes = 101L, txBytes = 200L, rxTcpPayloadBytes = 51L)
             )
         )
+        assertTrue(
+            G2RayVpnService.measuredResponseTrafficAdvanced(
+                ActiveVpnEngine.XrayNative,
+                TrafficBytes(rxBytes = 10_000L, txBytes = 200L),
+                TrafficBytes(rxBytes = 18_192L, txBytes = 200L)
+            )
+        )
+        assertFalse(
+            G2RayVpnService.measuredResponseTrafficAdvanced(
+                ActiveVpnEngine.XrayNative,
+                TrafficBytes(rxBytes = 10_000L, txBytes = 200L),
+                TrafficBytes(rxBytes = 18_191L, txBytes = 70_000L)
+            )
+        )
         assertFalse(
             G2RayVpnService.measuredResponseTrafficAdvanced(
                 ActiveVpnEngine.Hev,
@@ -1046,12 +1060,12 @@ class G2RayVpnServiceTest {
                 timeSinceLastReverifyMs = 29_999L
             )
         )
-        assertFalse(
+        assertTrue(
             G2RayVpnService.shouldReverifyAfterIdleTraffic(
                 engine = ActiveVpnEngine.XrayNative,
                 idleDurationMs = 60_000L,
-                rxBps = 0L,
-                txBps = 1L,
+                rxBps = 1L,
+                txBps = 0L,
                 timeSinceLastReverifyMs = 30_000L
             )
         )
@@ -1118,6 +1132,15 @@ class G2RayVpnServiceTest {
                 engine = ActiveVpnEngine.XrayNative,
                 txBytesSinceLastRx = 32L * 1024L,
                 txPacketsSinceLastRx = 20L,
+                timeSinceLastRxMs = 10_000L,
+                timeSinceLastReverifyMs = 10_000L
+            )
+        )
+        assertTrue(
+            G2RayVpnService.shouldProbeSuspectedActiveStall(
+                engine = ActiveVpnEngine.XrayNative,
+                txBytesSinceLastRx = 64L * 1024L,
+                txPacketsSinceLastRx = 0L,
                 timeSinceLastRxMs = 10_000L,
                 timeSinceLastReverifyMs = 10_000L
             )

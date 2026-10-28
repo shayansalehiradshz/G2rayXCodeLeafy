@@ -248,6 +248,7 @@ class G2RayVpnService : VpnService() {
     private var activeEngine: ActiveVpnEngine? = null
     private var hevTunnelRunning = false
     private val sessionProfileHealth = mutableMapOf<String, SessionProfileHealth>()
+    private val nativeTrafficSource = AndroidUidTrafficByteSource()
 
     companion object {
         const val NOTIFICATION_ID = 101
@@ -275,6 +276,8 @@ class G2RayVpnService : VpnService() {
         private const val ACTIVE_STALL_MIN_TX_BYTES = 32L * 1024L
         private const val ACTIVE_STALL_INTERACTIVE_MIN_TX_BYTES = 2L * 1024L
         private const val ACTIVE_STALL_INTERACTIVE_MIN_TX_PACKETS = 4L
+        private const val NATIVE_TRAFFIC_PROGRESS_GRACE_BYTES = 8L * 1024L
+        private const val NATIVE_STALL_MIN_TX_BYTES = 64L * 1024L
         private const val MAX_LIVE_ROUTE_PROFILES = 3
         private const val OPTIONAL_ENDPOINT_DNS_GRACE_MS = 500L
         // A ready backup may win the first lookup race, but the user-selected
@@ -753,12 +756,17 @@ class G2RayVpnService : VpnService() {
             previousTraffic: TrafficBytes?,
             currentTraffic: TrafficBytes?
         ): Boolean {
-            return engine == ActiveVpnEngine.Hev &&
-                previousTraffic != null &&
-                currentTraffic != null &&
-                previousTraffic.rxTcpPayloadBytes != null &&
-                currentTraffic.rxTcpPayloadBytes != null &&
-                currentTraffic.rxTcpPayloadBytes > previousTraffic.rxTcpPayloadBytes
+            if (previousTraffic == null || currentTraffic == null) return false
+            return when (engine) {
+                ActiveVpnEngine.Hev -> previousTraffic.rxTcpPayloadBytes != null &&
+                    currentTraffic.rxTcpPayloadBytes != null &&
+                    currentTraffic.rxTcpPayloadBytes > previousTraffic.rxTcpPayloadBytes
+                ActiveVpnEngine.XrayNative -> {
+                    val receivedDelta = currentTraffic.rxBytes - previousTraffic.rxBytes
+                    receivedDelta >= NATIVE_TRAFFIC_PROGRESS_GRACE_BYTES
+                }
+                null -> false
+            }
         }
 
         internal fun shouldSuppressRouteRecoveryAfterFailedReverification(
@@ -781,7 +789,7 @@ class G2RayVpnService : VpnService() {
             txBps: Long,
             timeSinceLastReverifyMs: Long
         ): Boolean {
-            return engine == ActiveVpnEngine.Hev &&
+            return (engine == ActiveVpnEngine.Hev || engine == ActiveVpnEngine.XrayNative) &&
                 idleDurationMs >= IDLE_ACTIVITY_REVERIFY_THRESHOLD_MS &&
                 (rxBps > 0L || txBps > 0L) &&
                 timeSinceLastReverifyMs >= PASSIVE_ROUTE_REVERIFY_COOLDOWN_MS
@@ -798,8 +806,11 @@ class G2RayVpnService : VpnService() {
             val interactiveRequestStalled =
                 txBytesSinceLastRx >= ACTIVE_STALL_INTERACTIVE_MIN_TX_BYTES &&
                     txPacketsSinceLastRx >= ACTIVE_STALL_INTERACTIVE_MIN_TX_PACKETS
-            return engine == ActiveVpnEngine.Hev &&
-                (bulkRequestStalled || interactiveRequestStalled) &&
+            val nativeRequestStalled =
+                engine == ActiveVpnEngine.XrayNative &&
+                    txBytesSinceLastRx >= NATIVE_STALL_MIN_TX_BYTES
+            return (engine == ActiveVpnEngine.Hev && (bulkRequestStalled || interactiveRequestStalled) ||
+                nativeRequestStalled) &&
                 timeSinceLastRxMs >= ACTIVE_STALL_NO_RX_THRESHOLD_MS &&
                 timeSinceLastReverifyMs >= ACTIVE_STALL_ROUTE_REVERIFY_COOLDOWN_MS
         }
@@ -1627,9 +1638,11 @@ class G2RayVpnService : VpnService() {
     }
 
     private fun startTrafficUpdates() {
-        if (activeEngine != ActiveVpnEngine.Hev || !hevTunnelRunning) {
+        if (activeEngine == ActiveVpnEngine.XrayNative) {
+            startNativeTrafficUpdates()
             return
         }
+        if (activeEngine != ActiveVpnEngine.Hev || !hevTunnelRunning) return
         if (trafficJob?.isActive == true) {
             return
         }
@@ -1726,6 +1739,78 @@ class G2RayVpnService : VpnService() {
                     }
                     publishSpeed(speed)
                 }
+            }
+        }
+    }
+
+    /**
+     * Native Xray has no exact TUN counter in the bundled API. This monitor
+     * uses coarse per-UID physical counters only to trigger a fresh quorum
+     * probe after a likely idle resume or transmit-only stall. The probe, not
+     * these counters, decides whether the route is healthy or needs recovery.
+     */
+    private fun startNativeTrafficUpdates() {
+        if (trafficJob?.isActive == true) return
+        trafficJob = scope.launch {
+            var previous = nativeTrafficSource.snapshot()
+            var lastActivityAtMs = SystemClock.elapsedRealtime()
+            var lastRxProgressAtMs = lastActivityAtMs
+            var txBytesSinceLastRx = 0L
+            while (isActive && core.state.value == TunnelCoreState.Connected) {
+                delay(1_000L)
+                val nowMs = SystemClock.elapsedRealtime()
+                val current = nativeTrafficSource.snapshot()
+                if (previous == null || current == null) {
+                    previous = current
+                    lastActivityAtMs = nowMs
+                    lastRxProgressAtMs = nowMs
+                    continue
+                }
+                val rxDelta = (current.rxBytes - previous.rxBytes).coerceAtLeast(0L)
+                val txDelta = (current.txBytes - previous.txBytes).coerceAtLeast(0L)
+                val hasActivity = rxDelta > 0L || txDelta > 0L
+                if (rxDelta > 0L) {
+                    lastRxProgressAtMs = nowMs
+                    txBytesSinceLastRx = 0L
+                } else {
+                    txBytesSinceLastRx = if (Long.MAX_VALUE - txBytesSinceLastRx < txDelta) {
+                        Long.MAX_VALUE
+                    } else {
+                        txBytesSinceLastRx + txDelta
+                    }
+                }
+                if (
+                    hasActivity &&
+                    shouldReverifyAfterIdleTraffic(
+                        engine = ActiveVpnEngine.XrayNative,
+                        idleDurationMs = (nowMs - lastActivityAtMs).coerceAtLeast(0L),
+                        rxBps = rxDelta,
+                        txBps = txDelta,
+                        timeSinceLastReverifyMs = timeSinceLastPromptReverify(
+                            RouteReverifyReason.IdleTraffic,
+                            nowMs
+                        )
+                    )
+                ) {
+                    requestPromptRouteReverification(RouteReverifyReason.IdleTraffic, nowMs)
+                }
+                if (hasActivity) lastActivityAtMs = nowMs
+                if (
+                    !waitingForUnderlyingNetwork &&
+                    shouldProbeSuspectedActiveStall(
+                        engine = ActiveVpnEngine.XrayNative,
+                        txBytesSinceLastRx = txBytesSinceLastRx,
+                        txPacketsSinceLastRx = 0L,
+                        timeSinceLastRxMs = (nowMs - lastRxProgressAtMs).coerceAtLeast(0L),
+                        timeSinceLastReverifyMs = timeSinceLastPromptReverify(
+                            RouteReverifyReason.ActiveStall,
+                            nowMs
+                        )
+                    )
+                ) {
+                    requestPromptRouteReverification(RouteReverifyReason.ActiveStall, nowMs)
+                }
+                previous = current
             }
         }
     }
@@ -1837,9 +1922,8 @@ class G2RayVpnService : VpnService() {
 
     private fun currentMeasuredTrafficSnapshot(): TrafficBytes? {
         val state = VpnStateRepository.state.value
-        if (activeEngine != ActiveVpnEngine.Hev || state.tunnelTrafficSource != TunnelTrafficSource.HevTun) {
-            return null
-        }
+        if (activeEngine == ActiveVpnEngine.XrayNative) return nativeTrafficSource.snapshot()
+        if (activeEngine != ActiveVpnEngine.Hev || state.tunnelTrafficSource != TunnelTrafficSource.HevTun) return null
         // Keep both sides of a comparison in HEV's absolute counter domain.
         // UI totals are baseline-relative, so mixing them after one transient
         // native read failure could look like traffic advanced when it did not.

@@ -14,6 +14,21 @@ import org.junit.Test
 
 class TrafficSpeedTest {
     @Test
+    fun nativeUidTrafficSourceReturnsPhysicalCountersAndRejectsUnsupportedValues() {
+        var rx = 10_000L
+        var tx = 5_000L
+        val source = AndroidUidTrafficByteSource(
+            uid = 1234,
+            readRxBytes = { rx },
+            readTxBytes = { tx }
+        )
+
+        assertEquals(TrafficBytes(10_000L, 5_000L), source.snapshot())
+        rx = -1L
+        assertEquals(null, source.snapshot())
+    }
+
+    @Test
     fun sample_firstSampleReportsTotalsAndZeroSpeed() {
         val source = FakeTrafficByteSource(rx = 1000, tx = 500)
         var now = 1000L
