@@ -121,6 +121,16 @@ class TrafficSpeedTest {
     }
 
     @Test
+    fun formatNotification_labelsNativeRateAsApproximate() {
+        val speed = TrafficSpeed(rxBps = 1536, txBps = 2L * 1024L * 1024L)
+
+        assertEquals(
+            "Approx. tunnel rate DL 1.5 KB/s  UL 2.0 MB/s",
+            SpeedFormatter.formatNotification(speed, approximate = true)
+        )
+    }
+
+    @Test
     fun sample_snapshotSourceReadsRxAndTxAtomicallyOncePerSample() {
         val source = FakeSnapshotTrafficByteSource(rx = 1000, tx = 500)
         var now = 1000L
