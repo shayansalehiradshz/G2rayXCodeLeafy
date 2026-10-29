@@ -550,12 +550,13 @@ class G2RayVpnService : VpnService() {
             val verifiedUris = verifiedCandidates.mapTo(hashSetOf()) { it.rawUri }
             // The observer measures from the phone, which is the only vantage
             // point that can rank edge IPs for this client. Fill unused bounded
-            // slots with fresh, unfailed public-IP profiles so a route that has
-            // never been Ping-All tested can still win without delaying startup.
+            // slots with fresh, unfailed IP or hostname profiles so a route
+            // that has never been Ping-All tested can still win without
+            // delaying startup or losing the canonical domain fallback.
             val exploratoryCandidates = candidates.asSequence()
                 .filter { (stored, parsed) ->
                     parsed.rawUri !in verifiedUris &&
-                        VlessUriParser.isUsablePublicIpv4(parsed.address) &&
+                        isExplorableLiveEndpoint(parsed.address) &&
                         sessionHealth[stored.rawUri]?.lastAttemptSucceeded != false &&
                         stored.delayFailureCount == 0
                 }
@@ -566,6 +567,14 @@ class G2RayVpnService : VpnService() {
                 verifiedCandidates + exploratoryCandidates,
                 maxProfiles
             )
+        }
+
+        internal fun isExplorableLiveEndpoint(address: String): Boolean {
+            return VlessUriParser.isUsablePublicIpv4(address) ||
+                (!VlessUriParser.isIpv4Literal(address) &&
+                    !address.contains(':') &&
+                    address.isNotBlank() &&
+                    address.length <= 253)
         }
 
         internal fun resolveRuntimeProfiles(

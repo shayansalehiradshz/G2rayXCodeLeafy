@@ -1399,6 +1399,29 @@ class G2RayVpnServiceTest {
             listOf(selected.address, measured.address, unmeasured.address),
             selectedRoutes.map { it.address }
         )
+        assertFalse(selectedRoutes.any { it.address == failed.address })
+    }
+
+    @Test
+    fun liveRoutePoolKeepsAnUnmeasuredDomainFallbackForBlockedIpPaths() {
+        val selected = liveProfile("20.0.0.1")
+        val hostname = liveProfile("edge.example")
+        val failed = liveProfile("20.0.0.4")
+        val hostnameStored = storedProfile("hostname", hostname.address, 10, hostname.rawUri)
+        val failedStored = storedProfile("failed", failed.address, 20, failed.rawUri).copy(
+            delayFailureCount = 1
+        )
+
+        val selectedRoutes = G2RayVpnService.selectLiveRouteProfiles(
+            selected = selected,
+            candidates = listOf(failedStored to failed, hostnameStored to hostname),
+            sessionHealth = emptyMap(),
+            nowMs = 10_000L,
+            networkKey = "test-network",
+            maxProfiles = 3
+        )
+
+        assertEquals(listOf(selected.address, hostname.address), selectedRoutes.map { it.address })
     }
 
     @Test
