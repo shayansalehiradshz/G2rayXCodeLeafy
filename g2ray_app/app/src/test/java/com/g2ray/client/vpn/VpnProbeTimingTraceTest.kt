@@ -11,6 +11,10 @@ import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.InetAddress
 import java.net.Proxy
+import java.net.ServerSocket
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.concurrent.thread
 
 class VpnProbeTimingTraceTest {
     private val call = OkHttpClient().newCall(Request.Builder().url("https://www.gstatic.com/generate_204").build())
@@ -151,5 +155,84 @@ class VpnProbeTimingTraceTest {
         listener.callFailed(call, IOException("Network unavailable"))
 
         assertTrue(trace.summaries().single().contains("outcome=failed_IOException elapsed_ms=unknown"))
+    }
+
+    @Test
+    fun capsRequestsAsWellAsEventsAndRedactsUntrustedLabels() {
+        val trace = VpnProbeTimingTrace { 0L }
+        repeat(1_000) {
+            trace.listenerFor("https://user:secret@example.com/private?token=secret").callStart(call)
+        }
+        val results = trace.summaries()
+        assertEquals(64, results.size)
+        assertTrue(results.all { it.contains("endpoint=redacted") && it.contains("requests_dropped=936") })
+        assertFalse(results.joinToString().contains("secret"))
+    }
+
+    @Test
+    fun responseBodyCompletionIsSeparateFromHeadersAndHttpValidity() {
+        var now = 100L
+        val trace = VpnProbeTimingTrace { now }
+        val listener = trace.listenerFor("synthetic")
+        listener.callStart(call)
+        now = 120L
+        listener.requestHeadersEnd(call, call.request())
+        now = 150L
+        listener.responseHeadersStart(call)
+        listener.responseHeadersEnd(call, okhttp3.Response.Builder().request(call.request())
+            .protocol(Protocol.HTTP_2).code(503).message("private error").build())
+        now = 500L
+        listener.responseBodyEnd(call, 123L)
+        listener.callEnd(call)
+        val result = trace.summaries().single()
+        assertTrue(result.contains("http=503 response_bytes=123"))
+        assertTrue(result.contains("request_start_ms=100 request_end_ms=500"))
+        assertTrue(result.contains("response_headers:50,response_headers_end:50,response_body_end:400"))
+        assertFalse(result.contains("private error"))
+    }
+
+    @Test
+    fun realPooledConnectionIsDistinguishedFromFreshConnectWithoutClaimingXrayRoute() {
+        ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { server ->
+            server.soTimeout = 5_000
+            val failure = AtomicReference<Throwable>()
+            val responder = thread(isDaemon = true) {
+                runCatching {
+                    server.accept().use { socket ->
+                        socket.soTimeout = 5_000
+                        val input = socket.getInputStream().bufferedReader()
+                        repeat(2) {
+                            while (!input.readLine().isNullOrEmpty()) Unit
+                            socket.getOutputStream().apply {
+                                write("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: keep-alive\r\n\r\nx".toByteArray())
+                                flush()
+                            }
+                        }
+                    }
+                }.onFailure(failure::set)
+            }
+            val trace = VpnProbeTimingTrace { System.nanoTime() / 1_000_000L }
+            val client = OkHttpClient.Builder().callTimeout(3, TimeUnit.SECONDS)
+                .eventListenerFactory { trace.listenerFor("fixture") }.build()
+            try {
+                repeat(2) {
+                    client.newCall(Request.Builder().url("http://127.0.0.1:${server.localPort}/private-token").build()).execute()
+                        .use { response -> assertTrue(response.body!!.string().isNotBlank()) }
+                }
+                val results = trace.summaries()
+                assertEquals(2, results.size)
+                assertTrue(results[0].contains("acquired_without_connect=false"))
+                assertTrue(results[1].contains("acquired_without_connect=true"))
+                fun connectionId(result: String) = result.substringAfter("connection_id=").substringBefore(' ')
+                assertEquals(connectionId(results[0]), connectionId(results[1]))
+                assertFalse(results.joinToString().contains("private-token"))
+            } finally {
+                client.connectionPool.evictAll()
+                client.dispatcher.executorService.shutdown()
+                responder.join(5_000)
+                assertFalse("Local fixture did not terminate", responder.isAlive)
+                failure.get()?.let { throw AssertionError("Local fixture failed", it) }
+            }
+        }
     }
 }

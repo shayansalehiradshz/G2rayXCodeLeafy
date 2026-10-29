@@ -66,8 +66,6 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import okhttp3.ConnectionPool
-import okhttp3.Call
-import okhttp3.Connection
 import okhttp3.EventListener
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -505,12 +503,22 @@ class LiveVpnDeviceTest {
             Transport.entries.firstOrNull { it.name.equals(value, ignoreCase = true) }
                 ?: error("Test transport must be xhttp or ws")
         }
-        val profile = if (transport == null || transport == selected!!.transport) selected else {
+        val savedProfile = if (transport == null || transport == selected!!.transport) selected else {
             repository.profiles.value.firstOrNull {
                 it.accountId == selected!!.accountId && it.address == selected.address && it.transport == transport
             }
         }
-        assertNotNull("No matching saved transport profile exists on the selected edge", profile)
+        assertNotNull("No matching saved transport profile exists on the selected edge", savedProfile)
+        val coreDefaultExtra = when (args.getString("xhttpTuning")) {
+            null, "saved" -> false
+            "core-default" -> true
+            else -> error("xhttpTuning must be saved or core-default")
+        }
+        require(!coreDefaultExtra || !uiStart) { "UI startup must use the unchanged saved profile" }
+        val parsedProfile = VlessUriParser.parse(savedProfile!!.rawUri).getOrThrow()
+        val profile = if (coreDefaultExtra) SyntheticProfileVariants.withoutXhttpExtra(parsedProfile) else parsedProfile
+        report("event=profile_variant xhttp_tuning=${if (coreDefaultExtra) "core-default" else "saved"} " +
+            "extra_present=${profile.xhttpExtraJson != null} saved_profile_unchanged=true")
         assertTrue("UI startup uses the selected profile, not a transport override",
             !uiStart || transport == null || transport == selected!!.transport)
         val settings = VpnEnginePreferences(context.secureStore).readSettings()
@@ -540,12 +548,10 @@ class LiveVpnDeviceTest {
             .readTimeout(20, TimeUnit.SECONDS)
             .writeTimeout(20, TimeUnit.SECONDS)
             .callTimeout(30, TimeUnit.SECONDS)
-            .eventListener(object : EventListener() {
-                override fun connectionAcquired(call: Call, connection: Connection) {
-                    report("event=connection_acquired endpoint=${call.request().url.host} " +
-                        "protocol=${connection.protocol()} connection=${System.identityHashCode(connection)}")
-                }
-            })
+            .eventListenerFactory { call ->
+                call.request().tag(VpnProbeTimingTrace::class.java)
+                    ?.listenerFor(call.request().url.host) ?: EventListener.NONE
+            }
             .build()
 
         var scenario = ActivityScenario.launch(MainActivity::class.java)
@@ -570,7 +576,7 @@ class LiveVpnDeviceTest {
                 } else {
                     ContextCompat.startForegroundService(activity, Intent(activity, G2RayVpnService::class.java).apply {
                         action = G2RayVpnService.ACTION_START
-                        putExtra(G2RayVpnService.EXTRA_RAW_PROFILE_URI, profile!!.rawUri)
+                        putExtra(G2RayVpnService.EXTRA_RAW_PROFILE_URI, profile.rawUri)
                         putExtra(G2RayVpnService.EXTRA_ACCOUNT_ID, selection.accountId)
                         putExtra(G2RayVpnService.EXTRA_VPN_ENGINE_MODE, mode.storageValue)
                     })
@@ -589,7 +595,7 @@ class LiveVpnDeviceTest {
                 val requestedEngine = if (mode == VpnEngineMode.XrayNative) ActiveVpnEngine.XrayNative else ActiveVpnEngine.Hev
                 assertEquals("The requested engine was not exercised", requestedEngine, actualEngine)
             }
-            report("engine=${mode.storageValue} transport=${profile!!.transport} ui_start=$uiStart " +
+            report("engine=${mode.storageValue} transport=${profile.transport} ui_start=$uiStart " +
                 "actual_engine=$actualEngine verified_start_ms=${SystemClock.elapsedRealtime() - startedAt}")
 
             val connectivity = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -973,8 +979,10 @@ class LiveVpnDeviceTest {
         var responsive = 0
         for ((url, status) in endpoints) {
             val started = SystemClock.elapsedRealtime()
+            val trace = VpnProbeTimingTrace(SystemClock::elapsedRealtime)
             try {
-                client.newCall(Request.Builder().url(url).header("Cache-Control", "no-store").build())
+                client.newCall(Request.Builder().url(url).header("Cache-Control", "no-store")
+                    .tag(VpnProbeTimingTrace::class.java, trace).build())
                     .execute().use { response ->
                         val body = response.body?.string().orEmpty()
                         val valid = response.code == status && (status == 204 || body.contains("Example Domain"))
@@ -990,8 +998,12 @@ class LiveVpnDeviceTest {
                             "request_start_ms=$started request_end_ms=$finished")
                     }
             } catch (error: Exception) {
+                val finished = SystemClock.elapsedRealtime()
                 report("phase=$phase endpoint=${url.substringAfter("https://").substringBefore('/')} " +
-                    "error=${error.javaClass.simpleName} elapsed_ms=${SystemClock.elapsedRealtime() - started}")
+                    "error=${error.javaClass.simpleName} elapsed_ms=${finished - started} " +
+                    "request_start_ms=$started request_end_ms=$finished")
+            } finally {
+                trace.summaries().forEach { report("event=http_timing phase=$phase $it") }
             }
         }
         return responsive
@@ -1016,45 +1028,72 @@ class LiveVpnDeviceTest {
             .followRedirects(false).followSslRedirects(false).build()
         val nonce = SystemClock.elapsedRealtimeNanos()
         val started = SystemClock.elapsedRealtime()
-        transferClient.newCall(Request.Builder()
-            .url("https://speed.cloudflare.com/__down?bytes=$downloadBytes&nonce=$nonce")
-            .header("Accept-Encoding", "identity")
-            .header("Cache-Control", "no-store")
-            .build()).execute().use { response ->
-                assertEquals("Download endpoint rejected the transfer", 200, response.code)
-                val body = response.body ?: throw IOException("Download response has no body")
-                body.byteStream().use { readTransferBody(it, downloadBytes) }
+        recordBulkRequest(SyntheticTransferRecorder.Kind.Download) { trace ->
+            transferClient.newCall(Request.Builder()
+                .url("https://speed.cloudflare.com/__down?bytes=$downloadBytes&nonce=$nonce")
+                .tag(VpnProbeTimingTrace::class.java, trace)
+                .header("Accept-Encoding", "identity")
+                .header("Cache-Control", "no-store")
+                .build()).execute().use { response ->
+                    assertEquals("Download endpoint rejected the transfer", 200, response.code)
+                    val body = response.body ?: throw IOException("Download response has no body")
+                    body.byteStream().use { readTransferBody(it, downloadBytes) }
             }
+        }
         val downloadFinished = SystemClock.elapsedRealtime()
         onCompletedRequest(started, downloadFinished)
         report("download_bytes=$downloadBytes elapsed_ms=${downloadFinished - started} " +
             "request_start_ms=$started request_end_ms=$downloadFinished")
         val payload = ByteArray(uploadBytes) { (it and 0xff).toByte() }
         val uploadStarted = SystemClock.elapsedRealtime()
-        transferClient.newCall(Request.Builder()
-            .url("https://speed.cloudflare.com/__up?nonce=$nonce")
-            .post(payload.toRequestBody("application/octet-stream".toMediaType()))
-            .build()).execute().use { response ->
-                assertTrue("Upload endpoint rejected the transfer: HTTP ${response.code}", response.isSuccessful)
+        recordBulkRequest(SyntheticTransferRecorder.Kind.Upload) { trace ->
+            transferClient.newCall(Request.Builder()
+                .url("https://speed.cloudflare.com/__up?nonce=$nonce")
+                .tag(VpnProbeTimingTrace::class.java, trace)
+                .post(payload.toRequestBody("application/octet-stream".toMediaType()))
+                .build()).execute().use { response ->
+                    assertTrue("Upload endpoint rejected the transfer: HTTP ${response.code}", response.isSuccessful)
             }
+        }
         val uploadFinished = SystemClock.elapsedRealtime()
         onCompletedRequest(uploadStarted, uploadFinished)
         report("upload_bytes=$uploadBytes elapsed_ms=${uploadFinished - uploadStarted} " +
             "request_start_ms=$uploadStarted request_end_ms=$uploadFinished")
     }
 
+    private fun <T> recordBulkRequest(
+        kind: SyntheticTransferRecorder.Kind,
+        transfer: (VpnProbeTimingTrace) -> T
+    ): T {
+        val trace = VpnProbeTimingTrace(SystemClock::elapsedRealtime)
+        try {
+            return SyntheticTransferRecorder(SystemClock::elapsedRealtime, ::report)
+                .record(kind) { transfer(trace) }
+        } finally {
+            // No diagnostic I/O in HTTP callbacks, and no reporter failure may
+            // replace the original transfer/cancellation exception.
+            runCatching {
+                trace.summaries().forEach { report("event=http_timing phase=bulk_${kind.name.lowercase()} $it") }
+            }
+        }
+    }
+
     private fun readTransferBody(input: InputStream, expectedBytes: Int): Int {
         require(expectedBytes > 0)
         var total = 0
         val buffer = ByteArray(8 * 1024)
-        while (true) {
-            val count = input.read(buffer, 0, minOf(buffer.size, expectedBytes - total + 1))
-            if (count == -1) break
-            total += count
-            if (total > expectedBytes) throw IOException("Download response exceeded the byte budget")
+        try {
+            while (true) {
+                val count = input.read(buffer, 0, minOf(buffer.size, expectedBytes - total + 1))
+                if (count == -1) break
+                total += count
+                if (total > expectedBytes) throw IOException("Download response exceeded the byte budget")
+            }
+            if (total != expectedBytes) throw IOException("Download response was truncated: $total/$expectedBytes bytes")
+            return total
+        } finally {
+            runCatching { report("event=download_body received_bytes=$total expected_bytes=$expectedBytes") }
         }
-        if (total != expectedBytes) throw IOException("Download response was truncated: $total/$expectedBytes bytes")
-        return total
     }
 
     private suspend fun playBoundedYoutubeSample(context: Context) {
