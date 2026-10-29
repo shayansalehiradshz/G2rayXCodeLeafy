@@ -40,6 +40,8 @@ import com.g2ray.client.model.TunnelTrafficSource
 import com.g2ray.client.model.TunnelState
 import com.g2ray.client.model.CodespaceWakeMode
 import com.g2ray.client.model.VpnEngineMode
+import com.g2ray.client.model.Transport
+import com.g2ray.client.parser.VlessUriParser
 import com.g2ray.client.vpn.SpeedFormatter
 import com.g2ray.client.vpn.XrayCoreManager
 
@@ -56,6 +58,13 @@ internal fun copyConfigLinkToClipboard(context: Context, rawUri: String): Boolea
         ?: return false
     clipboard.setPrimaryClip(ClipData.newPlainText("VLESS config", rawUri))
     return true
+}
+
+internal fun xhttpSettingsLabel(rawUri: String): String? {
+    val profile = VlessUriParser.parse(rawUri).getOrNull() ?: return null
+    if (profile.transport != Transport.XHTTP) return null
+    val settings = if (profile.xhttpExtraJson == null) "core defaults" else "custom extra"
+    return "XHTTP: ${profile.mode ?: "auto"} / $settings"
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -438,6 +447,11 @@ fun HomeScreen(
                                 style = MaterialTheme.typography.labelMedium,
                                 color = MaterialTheme.colorScheme.secondary
                             )
+                            remember(activeProfile?.rawUri) {
+                                activeProfile?.rawUri?.let(::xhttpSettingsLabel)
+                            }?.let { label ->
+                                Text(label, style = MaterialTheme.typography.bodySmall)
+                            }
                         }
 
                         Box(
@@ -545,6 +559,10 @@ fun HomeScreen(
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
+                                remember(profile.rawUri) { xhttpSettingsLabel(profile.rawUri) }?.let { label ->
+                                    Text(label, style = MaterialTheme.typography.bodySmall,
+                                        maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                }
                                 profile.lastDownloadBps?.takeIf { it > 0L }?.let { downloadBps ->
                                     val sampleText = if (ProfileHealth.isThroughputFresh(profile, networkKey = measurementNetworkKey)) {
                                         val uploadText = profile.lastUploadBps

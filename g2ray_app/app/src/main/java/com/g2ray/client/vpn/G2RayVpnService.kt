@@ -280,6 +280,7 @@ class G2RayVpnService : VpnService() {
         private const val NATIVE_STALL_MIN_TX_BYTES = 64L * 1024L
         private const val MAX_LIVE_ROUTE_PROFILES = 3
         private const val OPTIONAL_ENDPOINT_DNS_GRACE_MS = 500L
+        private const val READY_PRIMARY_OPTIONAL_DNS_GRACE_MS = 50L
         // A ready backup may win the first lookup race, but the user-selected
         // endpoint gets a little longer to arrive before startup commits to a
         // different route. This bounds cold-start delay without waiting for
@@ -543,22 +544,23 @@ class G2RayVpnService : VpnService() {
         ): List<G2RayProfile> {
             val verifiedCandidates = candidates.mapNotNull { (stored, parsed) ->
                 val observed = sessionHealth[stored.rawUri]
-                val verified = observed?.lastAttemptSucceeded == true ||
-                    persistedRouteMeasurementFresh(stored, nowMs, networkKey = networkKey)
+                val verified = observed?.lastAttemptSucceeded != false &&
+                    (observed?.lastAttemptSucceeded == true ||
+                        persistedRouteMeasurementFresh(stored, nowMs, networkKey = networkKey))
                 parsed.takeIf { verified }
             }
             val verifiedUris = verifiedCandidates.mapTo(hashSetOf()) { it.rawUri }
             // The observer measures from the phone, which is the only vantage
             // point that can rank edge IPs for this client. Fill unused bounded
-            // slots with fresh, unfailed IP or hostname profiles so a route
-            // that has never been Ping-All tested can still win without
-            // delaying startup or losing the canonical domain fallback.
+            // slots with eligible unmeasured IP or hostname profiles. Failures
+            // from another network or expired history must not blacklist them.
             val exploratoryCandidates = candidates.asSequence()
                 .filter { (stored, parsed) ->
                     parsed.rawUri !in verifiedUris &&
                         isExplorableLiveEndpoint(parsed.address) &&
                         sessionHealth[stored.rawUri]?.lastAttemptSucceeded != false &&
-                        stored.delayFailureCount == 0
+                        !(persistedRouteHistoryFresh(stored, nowMs, networkKey) &&
+                            (stored.delayFailureCount > 0 || stored.lastDelayError != null))
                 }
                 .map { it.second }
                 .toList()
@@ -626,6 +628,7 @@ class G2RayVpnService : VpnService() {
             fallbackWaitMs: Long = FALLBACK_ENDPOINT_DNS_WAIT_MS,
             resolve: suspend (String) -> List<String>
         ): List<G2RayProfile> = withContext(Dispatchers.IO) { supervisorScope {
+            val startedAtNs = System.nanoTime()
             require(profiles.isNotEmpty()) { "A selected VPN profile is required" }
             require(maxProfiles > 0) { "At least one runtime profile is required" }
             require(optionalGraceMs > 0 && primaryGraceMs > 0 && fallbackWaitMs > 0)
@@ -670,10 +673,13 @@ class G2RayVpnService : VpnService() {
                     withTimeoutOrNull(primaryGraceMs) {
                         tasks.getValue(eligible.first().address).await()
                     }
-                    // Keep the existing short grace for compatible optional
-                    // backups, which improves seamless failover without
-                    // turning startup into a serial DNS scan.
-                    withTimeoutOrNull(optionalGraceMs) { tasks.values.awaitAll() }
+                    val primaryTask = tasks.getValue(eligible.first().address)
+                    val primaryReady = primaryTask.isCompleted &&
+                        primaryTask.await().getOrNull()?.any(String::isNotBlank) == true
+                    val optionalBudget = if (primaryReady) {
+                        minOf(optionalGraceMs, READY_PRIMARY_OPTIONAL_DNS_GRACE_MS)
+                    } else optionalGraceMs
+                    withTimeoutOrNull(optionalBudget) { tasks.values.awaitAll() }
                 }
             } finally {
                 completed.close()
@@ -686,9 +692,16 @@ class G2RayVpnService : VpnService() {
                     task.await()
                 }
             }
-            resolveRuntimeProfiles(eligible, maxProfiles) { address ->
+            val resolved = resolveRuntimeProfiles(eligible, maxProfiles) { address ->
                 results.getValue(address).getOrThrow()
             }
+            if (BuildConfig.DEBUG) {
+                val primaryAddresses = results.getValue(eligible.first().address).getOrNull().orEmpty()
+                Log.i("G2RayVpnService", "startup_dns requested=${eligible.size} included=${resolved.size} " +
+                    "selected_endpoint_included=${resolved.any { it.address in primaryAddresses }} " +
+                    "elapsed_ms=${(System.nanoTime() - startedAtNs) / 1_000_000L}")
+            }
+            resolved
         } }
 
         internal fun persistedRouteScore(profile: StoredG2RayProfile, networkKey: String? = null, nowMs: Long = System.currentTimeMillis()): Long {
@@ -814,6 +827,18 @@ class G2RayVpnService : VpnService() {
         }
 
         internal fun shouldSuppressRouteRecoveryAfterFailedReverification(
+            route: RunningRouteResult,
+            engine: ActiveVpnEngine?,
+            previousTraffic: TrafficBytes?,
+            currentTraffic: TrafficBytes?
+        ): Boolean {
+            // Only HEV's upstream TCP payload counter can corroborate a path.
+            // Native UID bytes also include protected Worker/GitHub traffic.
+            return engine == ActiveVpnEngine.Hev &&
+                shouldAllowRouteActivityGrace(route, engine, previousTraffic, currentTraffic)
+        }
+
+        internal fun shouldAllowRouteActivityGrace(
             route: RunningRouteResult,
             engine: ActiveVpnEngine?,
             previousTraffic: TrafficBytes?,
@@ -1935,7 +1960,7 @@ class G2RayVpnService : VpnService() {
                             break
                         }
                         val currentMeasuredTraffic = currentMeasuredTrafficSnapshot()
-                        val trafficIsAdvancing = shouldSuppressRouteRecoveryAfterFailedReverification(
+                        val trafficIsAdvancing = shouldAllowRouteActivityGrace(
                             route, activeEngine, previousMeasuredTraffic, currentMeasuredTraffic
                         )
                         previousMeasuredTraffic = currentMeasuredTraffic

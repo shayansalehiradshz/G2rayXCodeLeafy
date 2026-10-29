@@ -92,6 +92,8 @@ class OkHttpVpnDataPathProbe(
                 .writeTimeout(3, TimeUnit.SECONDS)
                 .callTimeout(4, TimeUnit.SECONDS)
                 .retryOnConnectionFailure(false)
+                .followRedirects(false)
+                .followSslRedirects(false)
                 .apply {
                     if (BuildConfig.DEBUG) eventListenerFactory { call ->
                         call.request().tag(VpnProbeTimingTrace::class.java)

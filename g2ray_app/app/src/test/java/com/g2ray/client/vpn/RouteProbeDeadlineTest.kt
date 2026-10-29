@@ -47,7 +47,7 @@ class RouteProbeDeadlineTest {
                 val client = clientFor(server).readTimeout(10, TimeUnit.SECONDS).build()
                 val check = async(start = CoroutineStart.UNDISPATCHED) { probe(fullVpn, client) }
                 try {
-                    assertTrue(withContext(Dispatchers.IO) { server.twoHeaders.await(3, TimeUnit.SECONDS) })
+                    assertTrue(withContext(Dispatchers.IO) { server.stalledBodySent.await(3, TimeUnit.SECONDS) })
                     assertTrue("Headers alone must not complete the health check", check.isActive)
                     check.cancelAndJoin()
                     assertTrue(check.isCancelled)
@@ -62,7 +62,16 @@ class RouteProbeDeadlineTest {
         .callTimeout(4, TimeUnit.SECONDS)
         .retryOnConnectionFailure(false)
         .addInterceptor { chain ->
-            chain.proceed(chain.request().newBuilder().url("http://127.0.0.1:${server.port}/health").build())
+            val original = chain.request()
+            val path = when (original.url.host) {
+                "www.apple.com" -> "/success"
+                "www.gstatic.com" -> "/unavailable"
+                else -> "/generate_204"
+            }
+            // Redirect only the fixture's socket to loopback; preserve the
+            // logical request identity, like a DNS/socket-level test adapter.
+            chain.proceed(original.newBuilder().url("http://127.0.0.1:${server.port}$path").build())
+                .newBuilder().request(original).build()
         }
 
     private suspend fun probe(fullVpn: Boolean, client: OkHttpClient): RunningRouteResult {
@@ -91,7 +100,7 @@ class RouteProbeDeadlineTest {
         private val workers = Executors.newFixedThreadPool(4)
         private val released = CountDownLatch(1)
         val headersSent = AtomicInteger()
-        val twoHeaders = CountDownLatch(2)
+        val stalledBodySent = CountDownLatch(1)
         val port: Int get() = listener.localPort
 
         private val acceptTask = workers.submit {
@@ -102,15 +111,24 @@ class RouteProbeDeadlineTest {
                         try {
                             it.soTimeout = 1_000
                             val request = it.getInputStream().bufferedReader(Charsets.US_ASCII)
+                            val requestLine = request.readLine()
                             while (!request.readLine().isNullOrEmpty()) Unit
+                            val stalled = requestLine?.contains(" /success ") == true
+                            val response = when {
+                                stalled -> "HTTP/1.1 200 OK\r\nContent-Length: 512\r\nConnection: close\r\n\r\npartial"
+                                requestLine?.contains(" /unavailable ") == true ->
+                                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                else -> "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"
+                            }
                             it.getOutputStream().apply {
-                                write(("HTTP/1.1 200 OK\r\nContent-Length: 512\r\n" +
-                                    "Connection: close\r\n\r\npartial").toByteArray(Charsets.US_ASCII))
+                                write(response.toByteArray(Charsets.US_ASCII))
                                 flush()
                             }
                             headersSent.incrementAndGet()
-                            twoHeaders.countDown()
-                            released.await(8, TimeUnit.SECONDS)
+                            if (stalled) {
+                                stalledBodySent.countDown()
+                                released.await(8, TimeUnit.SECONDS)
+                            }
                         } catch (_: IOException) {
                             // Cancellation closes the client's owned connection.
                         }

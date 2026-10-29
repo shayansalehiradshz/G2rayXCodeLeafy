@@ -180,13 +180,14 @@ class RouteProbeBodyTest {
 
     private suspend fun probe(
         fullVpn: Boolean,
-        code: Int = 200,
+        code: Int? = null,
         defaultNetworkIsVpn: () -> Boolean? = { true },
         body: () -> ResponseBody
     ): RunningRouteResult {
         val client = OkHttpClient.Builder().addInterceptor { chain ->
             Response.Builder().request(chain.request()).protocol(Protocol.HTTP_2)
-                .code(code).message("Fixture").body(body()).build()
+                .code(code ?: if (chain.request().url.encodedPath.endsWith("/generate_204")) 204 else 200)
+                .message("Fixture").body(body()).build()
         }.build()
         if (fullVpn) {
             val probe = OkHttpVpnDataPathProbe(defaultNetworkIsVpn)

@@ -143,6 +143,8 @@ class SocksRunningRouteProbe : RunningRouteProbe {
                 // once, then let the quorum/recovery loop decide. OkHttp's
                 // transparent retry can otherwise hide a mobile-NAT reset.
                 .retryOnConnectionFailure(false)
+                .followRedirects(false)
+                .followSslRedirects(false)
                 .connectTimeout(3, TimeUnit.SECONDS)
                 .readTimeout(3, TimeUnit.SECONDS)
                 .callTimeout(4, TimeUnit.SECONDS)

@@ -21,12 +21,15 @@ concurrency:
 jobs:
   native-payload-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
       - name: Verify upstream payload counters and engine restart cleanup
         run: bash ./g2ray_app/scripts/test-hev-payload.sh
+      - name: Verify native build workspace ownership
+        shell: pwsh
+        run: ./g2ray_app/scripts/test-native-build-workspace.ps1
       - name: Set up the pinned native Go toolchain
         uses: actions/setup-go@v5
         with:
@@ -37,16 +40,27 @@ jobs:
         run: |
           set -euo pipefail
           ref=$(tr -d '\r' < g2ray_app/app/libs/libXray.properties | sed -nE 's/^libxray.ref=([0-9a-f]{40})$/\1/p')
+          core_ref=$(tr -d '\r' < g2ray_app/app/libs/libXray.properties | sed -nE 's/^libxray.xray.ref=([0-9a-f]{40})$/\1/p')
           [[ "$ref" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$core_ref" =~ ^[0-9a-f]{40}$ ]]
           tmp=$(mktemp -d)
           trap 'rm -rf -- "$tmp"' EXIT
-          git -C "$tmp" init
-          git -C "$tmp" fetch --depth=1 https://github.com/XTLS/libXray.git "$ref"
-          git -C "$tmp" -c core.autocrlf=false checkout --detach FETCH_HEAD
-          git -C "$tmp" apply "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/libxray-measure-status.patch"
-          cp g2ray_app/scripts/fixtures/libxray_measure_status_test.go "$tmp/nodep/g2ray_measure_status_test.go"
-          cd "$tmp"
-          go test -race ./nodep -run TestG2RayMeasure -count=1 -v
+          mkdir "$tmp/libxray-src" "$tmp/Xray-core"
+          git -C "$tmp/libxray-src" init
+          git -C "$tmp/libxray-src" fetch --depth=1 https://github.com/XTLS/libXray.git "$ref"
+          git -C "$tmp/libxray-src" -c core.autocrlf=false checkout --detach FETCH_HEAD
+          git -C "$tmp/Xray-core" init
+          git -C "$tmp/Xray-core" fetch --depth=1 https://github.com/XTLS/Xray-core.git "$core_ref"
+          git -C "$tmp/Xray-core" -c core.autocrlf=false checkout --detach FETCH_HEAD
+          git -C "$tmp/libxray-src" apply "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/libxray-measure-status.patch"
+          git -C "$tmp/libxray-src" apply "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/libxray-android-controller.patch"
+          git -C "$tmp/Xray-core" apply "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/xray-observer-detached-snapshot.patch"
+          cp g2ray_app/scripts/fixtures/libxray_measure_status_test.go "$tmp/libxray-src/nodep/g2ray_measure_status_test.go"
+          cp g2ray_app/scripts/fixtures/libxray_batch_policy_test.go "$tmp/libxray-src/xray/g2ray_batch_policy_test.go"
+          cd "$tmp/libxray-src"
+          go mod edit -replace=github.com/xtls/xray-core=../Xray-core
+          [[ "$(go list -m -f '{{.Replace.Dir}}' github.com/xtls/xray-core)" == "$tmp/Xray-core" ]]
+          go test -race ./nodep ./xray -run TestG2Ray -count=1 -timeout=90s -v
 
   source-checks:
     runs-on: ubuntu-latest

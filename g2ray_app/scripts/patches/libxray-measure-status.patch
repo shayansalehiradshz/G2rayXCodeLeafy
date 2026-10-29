@@ -1,4 +1,5 @@
 diff --git a/nodep/measure.go b/nodep/measure.go
+index 112fde7..8208f0c 100644
 --- a/nodep/measure.go
 +++ b/nodep/measure.go
 @@ -1,9 +1,11 @@
@@ -13,7 +14,7 @@ diff --git a/nodep/measure.go b/nodep/measure.go
  	"time"
  )
  
-@@ -41,6 +43,9 @@ func CoreHTTPClient(timeout time.Duration, proxy string) (*http.Client, error) {
+@@ -44,6 +46,9 @@ func CoreHTTPClient(timeout time.Duration, proxy string) (*http.Client, error) {
  	c := &http.Client{
  		Transport: tr,
  		Timeout:   timeout,
@@ -23,7 +24,20 @@ diff --git a/nodep/measure.go b/nodep/measure.go
  	}
  
  	return c, nil
-@@ -59,6 +64,16 @@ func PingHTTPRequest(c *http.Client, url string, timeout int) (int64, error) {
+@@ -55,7 +60,11 @@ func PingHTTPRequest(c *http.Client, url string, timeout int) (int64, error) {
+ 	if err != nil {
+ 		return PingDelayError, err
+ 	}
+-	response, err := c.Do(req)
++	probeClient := *c
++	probeClient.CheckRedirect = func(*http.Request, []*http.Request) error {
++		return http.ErrUseLastResponse
++	}
++	response, err := probeClient.Do(req)
+ 	delay := time.Since(start).Milliseconds()
+ 	if err != nil {
+ 		precision := delay - int64(timeout)*1000
+@@ -64,6 +73,16 @@ func PingHTTPRequest(c *http.Client, url string, timeout int) (int64, error) {
  		}
  		return PingDelayError, err
  	}

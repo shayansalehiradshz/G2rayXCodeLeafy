@@ -1,6 +1,6 @@
 param(
     [string]$OutputDir = "$PSScriptRoot\..\app\libs",
-    [string]$WorkDir = "$PSScriptRoot\..\build\libxray-src",
+    [string]$WorkDir = "$PSScriptRoot\..\build\native-bundle\libxray-src",
     [string]$NdkVersion = "28.2.13676358",
     [string]$LibXrayRef = "80263da83e96b2972455b0a94b13ee1a10e51391",
     [string]$GoVersion = "go1.26.10",
@@ -9,10 +9,12 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "native-build-workspace.ps1")
 $AndroidControllerPatch = Join-Path $PSScriptRoot "patches\libxray-android-controller.patch"
 $XrayObserverPatch = Join-Path $PSScriptRoot "patches\xray-observer-detached-snapshot.patch"
 $LibXrayMeasurePatch = Join-Path $PSScriptRoot "patches\libxray-measure-status.patch"
 $LibXrayMeasureTests = Join-Path $PSScriptRoot "fixtures\libxray_measure_status_test.go"
+$LibXrayBatchTests = Join-Path $PSScriptRoot "fixtures\libxray_batch_policy_test.go"
 
 function Assert-PinnedMobileTool {
     param(
@@ -62,6 +64,9 @@ if (-not (Test-Path -LiteralPath $LibXrayMeasurePatch -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $LibXrayMeasureTests -PathType Leaf)) {
     throw "The required libXray measurement fixtures are missing at '$LibXrayMeasureTests'."
 }
+if (-not (Test-Path -LiteralPath $LibXrayBatchTests -PathType Leaf)) {
+    throw "The required libXray batch measurement fixtures are missing."
+}
 if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
     throw "Go $GoVersion is required but the go command was not found."
 }
@@ -70,16 +75,27 @@ if ($LASTEXITCODE -ne 0 -or $actualGoVersion -ne $GoVersion) {
     throw "libXray must be built with $GoVersion; found '$actualGoVersion'."
 }
 
+$WorkDir = [IO.Path]::GetFullPath($WorkDir)
+$xrayCoreDir = Join-Path (Split-Path $WorkDir -Parent) "Xray-core"
+if ($WorkDir -eq $xrayCoreDir) { throw "The libXray and Xray-core build directories must be different." }
+$libXrayOrigin = "https://github.com/XTLS/libXray.git"
+$xrayOrigin = "https://github.com/XTLS/Xray-core.git"
+# Validate both before touching either checkout, including their sibling path.
+Assert-NativeSourceCheckout $WorkDir $libXrayOrigin
+Assert-NativeSourceCheckout $xrayCoreDir $xrayOrigin
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 New-Item -ItemType Directory -Force -Path (Split-Path $WorkDir -Parent) | Out-Null
-$xrayCoreDir = Join-Path (Split-Path $WorkDir -Parent) "Xray-core"
 
-if (-not (Test-Path $WorkDir)) {
-    git clone https://github.com/XTLS/libXray.git $WorkDir
+if (-not (Test-Path (Join-Path $WorkDir ".git"))) {
+    git clone $libXrayOrigin $WorkDir
+    if ($LASTEXITCODE -ne 0) { throw "Could not clone the pinned libXray source." }
+    Register-NativeSourceCheckout $WorkDir $libXrayOrigin
 } else {
     git -C $WorkDir fetch --tags --force origin
+    if ($LASTEXITCODE -ne 0) { throw "Could not refresh the pinned libXray source." }
 }
 
+Assert-NativeSourceCheckout $WorkDir $libXrayOrigin
 git -C $WorkDir -c core.autocrlf=false -c core.eol=lf checkout --force $LibXrayRef
 if ($LASTEXITCODE -ne 0) {
     throw "Could not check out pinned libXray ref $LibXrayRef."
@@ -99,11 +115,15 @@ if ($LibXrayRef -eq "main") {
 }
 Write-Host "Building libXray ref $LibXrayRef ($resolvedRef)"
 
-if (-not (Test-Path $xrayCoreDir)) {
-    git clone https://github.com/XTLS/Xray-core.git $xrayCoreDir
+if (-not (Test-Path (Join-Path $xrayCoreDir ".git"))) {
+    git clone $xrayOrigin $xrayCoreDir
+    if ($LASTEXITCODE -ne 0) { throw "Could not clone the pinned Xray-core source." }
+    Register-NativeSourceCheckout $xrayCoreDir $xrayOrigin
 } else {
     git -C $xrayCoreDir fetch --tags --force origin
+    if ($LASTEXITCODE -ne 0) { throw "Could not refresh the pinned Xray-core source." }
 }
+Assert-NativeSourceCheckout $xrayCoreDir $xrayOrigin
 git -C $xrayCoreDir -c core.autocrlf=false -c core.eol=lf checkout --force $XrayCoreRef
 if ($LASTEXITCODE -ne 0) {
     throw "Could not check out pinned Xray-core ref $XrayCoreRef."
@@ -139,9 +159,16 @@ if ($LASTEXITCODE -ne 0) {
 $libXrayMeasurePatchHash = (Get-FileHash $LibXrayMeasurePatch -Algorithm SHA256).Hash
 Write-Host "Applied libXray measurement-status patch $libXrayMeasurePatchHash at $resolvedRef"
 Copy-Item -LiteralPath $LibXrayMeasureTests -Destination (Join-Path $WorkDir "nodep\g2ray_measure_status_test.go")
+Copy-Item -LiteralPath $LibXrayBatchTests -Destination (Join-Path $WorkDir "xray\g2ray_batch_policy_test.go")
 Push-Location $WorkDir
 try {
-    go test ./nodep -run TestG2RayMeasure -count=1
+    go mod edit '-replace=github.com/xtls/xray-core=../Xray-core'
+    if ($LASTEXITCODE -ne 0) { throw "Could not select the patched local Xray-core for native fixtures." }
+    $testCoreDir = (go list -m -f '{{if .Replace}}{{.Replace.Dir}}{{end}}' github.com/xtls/xray-core).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $testCoreDir -or [IO.Path]::GetFullPath($testCoreDir) -ne $xrayCoreDir) {
+        throw "Native fixtures must use this build's patched Xray-core, not a module-cache copy."
+    }
+    go test ./nodep ./xray -run TestG2Ray -count=1
     if ($LASTEXITCODE -ne 0) {
         throw "The patched native measurement failed its HTTP status, redirect, timeout or cancellation fixtures."
     }

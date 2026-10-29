@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -88,5 +89,37 @@ func TestG2RayMeasureTimeoutIsNotSuccess(t *testing.T) {
 	defer client.CloseIdleConnections()
 	if _, err := PingHTTPRequest(client, server.URL, 1); err == nil {
 		t.Fatal("timeout was accepted as a successful route")
+	}
+}
+
+func TestG2RaySharedProbeRejectsRedirectsFromBatchStyleClients(t *testing.T) {
+	var targetRequests, originalPolicyCalls atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetRequests.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer redirect.Close()
+	client := &http.Client{Timeout: time.Second, CheckRedirect: func(*http.Request, []*http.Request) error {
+		originalPolicyCalls.Add(1)
+		return nil
+	}}
+	defer client.CloseIdleConnections()
+	if _, err := PingHTTPRequest(client, redirect.URL+"/generate_204", 1); err == nil {
+		t.Fatal("a custom/batch HTTP client accepted a redirected 204")
+	}
+	if targetRequests.Load() != 0 || originalPolicyCalls.Load() != 0 {
+		t.Fatal("the probe followed a redirect")
+	}
+	response, err := client.Get(redirect.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if targetRequests.Load() != 1 || originalPolicyCalls.Load() != 1 {
+		t.Fatal("the probe mutated its caller's redirect policy")
 	}
 }
