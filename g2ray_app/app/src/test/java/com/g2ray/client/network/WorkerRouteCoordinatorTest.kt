@@ -88,7 +88,7 @@ class WorkerRouteCoordinatorTest {
 
     @Test
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
-    fun lostWorkerWakePreservesLongerPriorRetryDelay() = runTest {
+    fun ambiguousWorkerFailurePreservesRetryDelayWithoutRepeatingWake() = runTest {
         val api = FakeWorkerApiService(
             wakeHandler = { url ->
                 if (url.contains("primary.example")) workerError(503, """{"error":"busy"}""",
@@ -101,7 +101,7 @@ class WorkerRouteCoordinatorTest {
             listOf("primary.example", "backup.example"), "secret", expectedCodespaceName = "demo") as WorkerRouteOutcome.Failed
         assertEquals(175_000L, result.retryAfterMs)
         assertTrue(result.wakeMayBeInFlight)
-        assertEquals(2, api.calls.count { it.endsWith("/wake") })
+        assertEquals(1, api.calls.count { it.endsWith("/wake") })
     }
 
     @Test
@@ -365,7 +365,7 @@ class WorkerRouteCoordinatorTest {
         })
         val job = launch {
             WorkerRouteCoordinator(api, nowMs = { testScheduler.currentTime }).ensureRouteReady(
-                listOf("primary.example", "backup.example"), "secret"
+                listOf("primary.example", "backup.example"), "secret", preflightBeforeWake = true
             )
             returned = true
         }
@@ -417,7 +417,7 @@ class WorkerRouteCoordinatorTest {
 
     @Test
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
-    fun workerDeadlinePreservesTheReportedCooldownAndCancelsTheHungAlias() = runTest {
+    fun healthDeadlinePreservesTheReportedCooldownAndCancelsTheHungAlias() = runTest {
         var cancelled = false
         val api = FakeWorkerApiService(wakeHandler = { url ->
             if (url.contains("primary.example")) {
@@ -431,19 +431,23 @@ class WorkerRouteCoordinatorTest {
             }
         })
         val result = WorkerRouteCoordinator(api, nowMs = { testScheduler.currentTime }).ensureRouteReady(
-            listOf("primary.example", "backup.example"), "secret", maxWaitMs = 500L
+            listOf("primary.example", "backup.example"), "secret", maxWaitMs = 1_500L, preflightBeforeWake = true
         ) as WorkerRouteOutcome.TimedOut
         assertEquals(599_500L, result.retryAfterMs)
         assertEquals(500L, testScheduler.currentTime)
         assertTrue(cancelled)
         assertEquals(2, api.calls.size)
+        assertTrue(api.calls.none { it.endsWith("/wake") })
     }
 
     @Test
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     fun sharedWakeDeadlineKeepsTheWorkerCooldownEvenBeforeAnOutcomeReturns() = runTest {
         var cancelled = false
-        val api = FakeWorkerApiService(wakeHandler = { url ->
+        val api = FakeWorkerApiService(wakeHandler = {
+            Response.success(202, WorkerWakeResponse(ok = true, start_accepted = true,
+                route_ready = false, poll_after_seconds = 2))
+        }, healthHandler = { url ->
             if (url.contains("primary.example")) {
                 workerError(503, """{"error":"temporary"}""", mapOf("Retry-After" to "600"))
             } else {
@@ -466,11 +470,13 @@ class WorkerRouteCoordinatorTest {
         val result = coordinator.ensureReady(CodespaceWakeRequest(
             com.g2ray.client.model.CodespaceWakeMode.WORKER, "demo",
             workerBaseUrls = listOf("primary.example", "backup.example"), workerSecret = "secret"
-        ), maxWaitMs = 500L) as CodespaceWakeOutcome.TimedOut
+        ), maxWaitMs = 2_500L) as CodespaceWakeOutcome.TimedOut
         assertEquals(599_500L, result.retryAfterMs)
+        assertEquals(2_500L, testScheduler.currentTime)
         assertEquals(WakeControlBackend.WORKER, result.backend)
         assertTrue(cancelled)
-        assertEquals(2, api.calls.size)
+        assertEquals(3, api.calls.size)
+        assertEquals(1, api.calls.count { it.endsWith("/wake") })
     }
 
     @Test
@@ -559,7 +565,8 @@ class WorkerRouteCoordinatorTest {
                 }
             })
             val result = WorkerRouteCoordinator(api, nowMs = { elapsedMs }).ensureRouteReady(
-                listOf("primary.example", "backup.example", "last.example"), "secret", maxWaitMs = 300_000L
+                listOf("primary.example", "backup.example", "last.example"), "secret", maxWaitMs = 300_000L,
+                preflightBeforeWake = true
             ) as WorkerRouteOutcome.Failed
             assertTrue(result.retryAllowed)
             assertEquals(expectedRemaining, result.retryAfterMs)
@@ -585,7 +592,7 @@ class WorkerRouteCoordinatorTest {
                 }
             })
             val result = WorkerRouteCoordinator(api, nowMs = { 0L }).ensureRouteReady(
-                listOf("primary.example", "backup.example"), "secret"
+                listOf("primary.example", "backup.example"), "secret", preflightBeforeWake = true
             ) as WorkerRouteOutcome.Failed
             assertTrue(result.retryAllowed)
             assertEquals(expectedMs, result.retryAfterMs)
@@ -603,7 +610,7 @@ class WorkerRouteCoordinatorTest {
             }
         })
         val result = WorkerRouteCoordinator(api, nowMs = { 0L }).ensureRouteReady(
-            listOf("primary.example", "backup.example"), "secret"
+            listOf("primary.example", "backup.example"), "secret", preflightBeforeWake = true
         ) as WorkerRouteOutcome.Failed
         assertEquals(false, result.retryAllowed)
         assertEquals(null, result.retryAfterMs)
@@ -622,7 +629,7 @@ class WorkerRouteCoordinatorTest {
             }
         })
         val result = WorkerRouteCoordinator(api, nowMs = { elapsedMs }).ensureRouteReady(
-            listOf("primary.example", "backup.example"), "secret"
+            listOf("primary.example", "backup.example"), "secret", preflightBeforeWake = true
         ) as WorkerRouteOutcome.Failed
         assertEquals(120_000L, result.retryAfterMs)
         assertEquals(2, api.calls.size)
@@ -691,7 +698,7 @@ class WorkerRouteCoordinatorTest {
         )) {
             val api = FakeWorkerApiService(wakeHandler = { Response.success(body) })
             val result = WorkerRouteCoordinator(api, nowMs = { 0L })
-                .ensureRouteReady(listOf("worker.example"), "secret") as WorkerRouteOutcome.Failed
+                .ensureRouteReady(listOf("worker.example", "backup.example"), "secret") as WorkerRouteOutcome.Failed
             assertEquals(false, result.retryAllowed)
             assertEquals(1, api.calls.size)
         }
@@ -941,12 +948,18 @@ class WorkerRouteCoordinatorTest {
     }
 
     @Test
-    fun primaryServerFailureUsesBackupWorker() = runTest {
-        val api = FakeWorkerApiService(wakeHandler = { url ->
-            if (url.contains("primary.example")) {
+    fun primaryWakeServerFailureReconcilesThroughBackupHealth() = runTest {
+        val api = FakeWorkerApiService(
+            wakeHandler = { url ->
+                check(url.contains("primary.example")) { "An uncertain wake must not be repeated" }
                 workerError(503, """{"ok":false,"error":"temporary"}""", mapOf("Retry-After" to "180"))
-            } else Response.success(WorkerWakeResponse(ok = true, route_ready = true))
-        })
+            },
+            healthHandler = { url ->
+                if (url.contains("primary.example")) {
+                    workerError(503, """{"ok":false,"error":"temporary"}""", emptyMap())
+                } else Response.success(WorkerWakeResponse(ok = true, route_ready = true))
+            }
+        )
         val coordinator = WorkerRouteCoordinator(api, nowMs = { 0L }, sleep = {})
 
         val result = coordinator.ensureRouteReady(
@@ -956,7 +969,7 @@ class WorkerRouteCoordinatorTest {
 
         assertTrue(result is WorkerRouteOutcome.Ready)
         assertEquals(
-            listOf("https://primary.example/wake", "https://backup.example/wake"),
+            listOf("https://primary.example/wake", "https://primary.example/api/health", "https://backup.example/api/health"),
             api.calls
         )
     }
@@ -977,6 +990,30 @@ class WorkerRouteCoordinatorTest {
         assertTrue(result is WorkerRouteOutcome.TimedOut || result is WorkerRouteOutcome.Failed)
         assertEquals(1, api.calls.count { it.endsWith("/wake") })
         assertTrue(api.calls.none { it.contains("backup.example") && it.endsWith("/wake") })
+    }
+
+    @Test
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    fun genericWorkerServerErrorsNeverRepeatWakeThroughAnotherAlias() = runTest {
+        for (code in listOf(500, 502, 503, 504, 599)) {
+            var healthChecks = 0
+            val api = FakeWorkerApiService(
+                wakeHandler = { url ->
+                    check(url.contains("primary.example")) { "HTTP $code triggered another wake POST" }
+                    workerError(code, """{"error":"temporary server failure"}""", emptyMap())
+                },
+                healthHandler = {
+                    healthChecks++
+                    Response.success(WorkerWakeResponse(ok = true, codespace = "demo", state = "Available",
+                        route_ready = healthChecks >= 2, poll_after_seconds = 2))
+                }
+            )
+            val result = WorkerRouteCoordinator(api, nowMs = { testScheduler.currentTime }).ensureRouteReady(
+                listOf("primary.example", "backup.example"), "secret", expectedCodespaceName = "demo")
+            assertTrue("HTTP $code did not reconcile through health", result is WorkerRouteOutcome.Ready)
+            assertEquals("HTTP $code repeated the wake POST", 1, api.calls.count { it.endsWith("/wake") })
+            assertEquals(2, healthChecks)
+        }
     }
 
     @Test

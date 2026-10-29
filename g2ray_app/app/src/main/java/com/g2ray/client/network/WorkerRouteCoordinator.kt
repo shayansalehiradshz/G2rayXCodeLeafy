@@ -536,8 +536,8 @@ class WorkerRouteCoordinator(
                     retryCooldown.remainingMs()?.let(onRetryAfter)
                 }
             }
-            if (endpoint == WorkerRouteEndpoint.WAKE &&
-                (response.code() == 502 ||
+            if (endpoint == WorkerRouteEndpoint.WAKE && !permanentWakeFailure(call.errorBody) &&
+                (response.code() in 500..599 ||
                     call.errorBody?.reason in setOf("github_start_request_unreachable", "github_start_request_failed"))
             ) {
                 // A gateway-style wake failure may still hide an accepted
@@ -548,7 +548,7 @@ class WorkerRouteCoordinator(
                 ))
             }
             val canTryFallback = index + 1 < baseUrls.size &&
-                response.code() in 500..599
+                response.code() in 500..599 && !permanentWakeFailure(call.errorBody)
             if (canTryFallback) {
                 lastRetryableCall = call
                 return@forEachIndexed

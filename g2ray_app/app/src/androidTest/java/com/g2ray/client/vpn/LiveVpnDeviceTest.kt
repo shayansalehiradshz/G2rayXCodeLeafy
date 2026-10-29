@@ -584,10 +584,13 @@ class LiveVpnDeviceTest {
                 }
             }
             assertEquals("Tunnel failed to verify: ${connected.message}", TunnelState.Connected, connected.tunnelState)
-            val expectedEngine = if (mode == VpnEngineMode.XrayNative) ActiveVpnEngine.XrayNative else ActiveVpnEngine.Hev
-            assertEquals("The requested engine was not exercised", expectedEngine, connected.activeVpnEngine)
+            val actualEngine = requireNotNull(connected.activeVpnEngine) { "Verified VPN has no active engine" }
+            if (mode != VpnEngineMode.Auto) {
+                val requestedEngine = if (mode == VpnEngineMode.XrayNative) ActiveVpnEngine.XrayNative else ActiveVpnEngine.Hev
+                assertEquals("The requested engine was not exercised", requestedEngine, actualEngine)
+            }
             report("engine=${mode.storageValue} transport=${profile!!.transport} ui_start=$uiStart " +
-                "verified_start_ms=${SystemClock.elapsedRealtime() - startedAt}")
+                "actual_engine=$actualEngine verified_start_ms=${SystemClock.elapsedRealtime() - startedAt}")
 
             val connectivity = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
             assertTrue(
@@ -601,7 +604,7 @@ class LiveVpnDeviceTest {
             } else {
                 transferSample(client, downloadBytes, uploadBytes)
             }
-            if (expectedEngine == ActiveVpnEngine.Hev) {
+            if (actualEngine == ActiveVpnEngine.Hev) {
                 val minimumRxBytes = if (smallProbesOnly) 1L else downloadBytes.toLong()
                 val counters = withTimeout(15_000L) {
                     VpnStateRepository.state.first {
@@ -611,7 +614,15 @@ class LiveVpnDeviceTest {
                 assertTrue("Real TUN upload counters did not advance", counters.totalTxBytes > 0L)
                 report("hev_tun_rx_bytes=${counters.totalRxBytes} hev_tun_tx_bytes=${counters.totalTxBytes}")
             } else {
-                assertEquals(TunnelTrafficSource.Unavailable, VpnStateRepository.state.value.tunnelTrafficSource)
+                val nativeSource = VpnStateRepository.state.value.tunnelTrafficSource
+                assertTrue("Native mode must not display HEV counters",
+                    nativeSource in setOf(TunnelTrafficSource.NativeUid, TunnelTrafficSource.Unavailable))
+                if (nativeSource == TunnelTrafficSource.NativeUid) {
+                    val counters = withTimeout(15_000L) {
+                        VpnStateRepository.state.first { it.totalRxBytes > 0L && it.totalTxBytes > 0L }
+                    }
+                    report("native_uid_rx_bytes=${counters.totalRxBytes} native_uid_tx_bytes=${counters.totalTxBytes} approximate=true")
+                } else report("native_uid_counters_unavailable=true")
             }
 
             if (startupOnly) {
