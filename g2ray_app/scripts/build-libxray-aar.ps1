@@ -12,6 +12,7 @@ $ErrorActionPreference = "Stop"
 $AndroidControllerPatch = Join-Path $PSScriptRoot "patches\libxray-android-controller.patch"
 $XrayObserverPatch = Join-Path $PSScriptRoot "patches\xray-observer-detached-snapshot.patch"
 $LibXrayMeasurePatch = Join-Path $PSScriptRoot "patches\libxray-measure-status.patch"
+$LibXrayMeasureTests = Join-Path $PSScriptRoot "fixtures\libxray_measure_status_test.go"
 
 function Assert-PinnedMobileTool {
     param(
@@ -58,6 +59,9 @@ if (-not (Test-Path -LiteralPath $XrayObserverPatch -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $LibXrayMeasurePatch -PathType Leaf)) {
     throw "The required libXray measurement patch is missing at '$LibXrayMeasurePatch'."
 }
+if (-not (Test-Path -LiteralPath $LibXrayMeasureTests -PathType Leaf)) {
+    throw "The required libXray measurement fixtures are missing at '$LibXrayMeasureTests'."
+}
 if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
     throw "Go $GoVersion is required but the go command was not found."
 }
@@ -76,9 +80,14 @@ if (-not (Test-Path $WorkDir)) {
     git -C $WorkDir fetch --tags --force origin
 }
 
-git -C $WorkDir checkout --force $LibXrayRef
+git -C $WorkDir -c core.autocrlf=false -c core.eol=lf checkout --force $LibXrayRef
 if ($LASTEXITCODE -ne 0) {
     throw "Could not check out pinned libXray ref $LibXrayRef."
+}
+# Also refresh an unchanged checkout that a previous Windows build wrote as CRLF.
+git -C $WorkDir -c core.autocrlf=false -c core.eol=lf checkout-index --force --all
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not normalize the disposable libXray source checkout."
 }
 git -C $WorkDir clean -ffdx
 if ($LASTEXITCODE -ne 0) {
@@ -95,9 +104,13 @@ if (-not (Test-Path $xrayCoreDir)) {
 } else {
     git -C $xrayCoreDir fetch --tags --force origin
 }
-git -C $xrayCoreDir checkout --force $XrayCoreRef
+git -C $xrayCoreDir -c core.autocrlf=false -c core.eol=lf checkout --force $XrayCoreRef
 if ($LASTEXITCODE -ne 0) {
     throw "Could not check out pinned Xray-core ref $XrayCoreRef."
+}
+git -C $xrayCoreDir -c core.autocrlf=false -c core.eol=lf checkout-index --force --all
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not normalize the disposable Xray-core source checkout."
 }
 git -C $xrayCoreDir clean -ffdx
 if ($LASTEXITCODE -ne 0) {
@@ -125,6 +138,16 @@ if ($LASTEXITCODE -ne 0) {
 }
 $libXrayMeasurePatchHash = (Get-FileHash $LibXrayMeasurePatch -Algorithm SHA256).Hash
 Write-Host "Applied libXray measurement-status patch $libXrayMeasurePatchHash at $resolvedRef"
+Copy-Item -LiteralPath $LibXrayMeasureTests -Destination (Join-Path $WorkDir "nodep\g2ray_measure_status_test.go")
+Push-Location $WorkDir
+try {
+    go test ./nodep -run TestG2RayMeasure -count=1
+    if ($LASTEXITCODE -ne 0) {
+        throw "The patched native measurement failed its HTTP status, redirect, timeout or cancellation fixtures."
+    }
+} finally {
+    Pop-Location
+}
 
 git -C $WorkDir apply --check $AndroidControllerPatch
 if ($LASTEXITCODE -ne 0) {

@@ -83,6 +83,7 @@ jobs:
           go test -race ./tests/xray_retained_http_check.go ./tests/xray_retained_http_check_test.go
           python3 tests/xray_authenticated_transport_check_test.py
           python3 tests/xray_isolated_server_pair_check_test.py
+          python3 tests/native_checkout_eol_test.py
 
   xray-core-tests:
     runs-on: ubuntu-latest
