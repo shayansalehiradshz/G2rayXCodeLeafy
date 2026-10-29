@@ -584,7 +584,7 @@ show_xhttp_mode_manager() {
         echo -e "  ${RED}2)${NC} stream-up  ${YELLOW}Failed every request through the Codespaces edge in tests${NC}"
         echo -e "  ${RED}3)${NC} stream-one ${YELLOW}Failed every request through the Codespaces edge in tests${NC}"
         echo -e "  ${RED}4)${NC} auto       ${DIM}Xray resolves this to packet-up for these TLS links${NC}"
-        echo -e "  ${RED}5)${NC} Toggle upload tuning ${DIM}(turn off only for a client that rejects the extra parameter)${NC}"
+        echo -e "  ${RED}5)${NC} Toggle upload tuning ${DIM}(optional upload A/B; off is the browsing default)${NC}"
         echo -e "  ${RED}0)${NC} Return\n"
         echo -ne "  ${GREEN}Select:${NC} "
         read -r choice

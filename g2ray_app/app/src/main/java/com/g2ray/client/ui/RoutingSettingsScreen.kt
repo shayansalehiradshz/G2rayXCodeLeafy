@@ -13,6 +13,8 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.g2ray.client.model.TunnelState
@@ -85,7 +87,9 @@ internal fun RoutingSettingsScreen(vm: G2RayViewModel, onBack: () -> Unit) {
                     excluded = ArrayList(if (checked) excluded - app.packageName else excluded + app.packageName)
                 }, verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) { Text(app.label); Text(app.packageName, style = MaterialTheme.typography.bodySmall) }
-                    Checkbox(checked, enabled = editable, onCheckedChange = { selected ->
+                    Checkbox(checked, enabled = editable, modifier = Modifier.semantics {
+                        contentDescription = "Bypass ${app.label} (${app.packageName})"
+                    }, onCheckedChange = { selected ->
                         excluded = ArrayList(if (selected) excluded + app.packageName else excluded - app.packageName)
                     })
                 }

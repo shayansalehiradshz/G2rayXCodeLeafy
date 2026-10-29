@@ -115,6 +115,7 @@ jobs:
           chmod +x "$tmp/core/xray"
           python3 tests/xray_upload_queue_validation.py "$tmp/core/xray"
           python3 tests/xray_client_failure_validation.py "$tmp/core/xray"
+          bash tests/g2ray_option_matrix.sh "$tmp/core/xray"
           go build -o "$tmp/retained-http-probe" tests/xray_retained_http_check.go
           python3 tests/xray_isolated_server_pair_check.py "$tmp/core/xray" \
             "$tmp/retained-http-probe" --loopback-baseline --idle-seconds 0

@@ -1,5 +1,7 @@
 package com.g2ray.client.vpn
 
+import android.content.Context
+import android.content.ContextWrapper
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -9,6 +11,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.Implementation
 import org.robolectric.annotation.Implements
@@ -42,11 +45,35 @@ class VpnInterfaceContainmentTest {
         }
     }
 
-    private fun interfaceConfig(ipv4Only: Boolean): Snapshot {
+    @Test
+    fun explicitAppExclusionsNeverExcludeTheVpnItselfOrEnableGlobalBypass() {
+        val ownPackage = RuntimeEnvironment.getApplication().packageName
+        val valid = "com.example.excluded"
+        val missing = "com.example.uninstalled"
+        for (ipv4 in listOf(false, true)) {
+            for (exclusions in listOf(emptySet(), setOf(valid), setOf(ownPackage, valid), setOf(missing, valid))) {
+                interfaceConfig(ipv4, RoutingPolicy(excludedPackages = exclusions)).use { snapshot ->
+                    assertEquals(exclusions - ownPackage - missing, snapshot.disallowedApps.toSet())
+                    assertTrue(snapshot.allowedApps.isEmpty())
+                    assertFalse(snapshot.bypass)
+                    assertTrue(snapshot.allowedFamilies.isEmpty())
+                    assertEquals(if (ipv4) setOf("0.0.0.0/0") else setOf("0.0.0.0/0", "::/0"), snapshot.routes.toSet())
+                }
+            }
+        }
+    }
+
+    private fun interfaceConfig(ipv4Only: Boolean, routing: RoutingPolicy = RoutingPolicy()): Snapshot {
         val service = G2RayVpnService()
+        ContextWrapper::class.java.getDeclaredMethod("attachBaseContext", Context::class.java)
+            .apply { isAccessible = true }.invoke(service, RuntimeEnvironment.getApplication())
         G2RayVpnService::class.java.getDeclaredField("ipv4Only").apply {
             isAccessible = true
             setBoolean(service, ipv4Only)
+        }
+        G2RayVpnService::class.java.getDeclaredField("routingPolicy").apply {
+            isAccessible = true
+            set(service, routing)
         }
         val snapshot = Snapshot()
         captured = snapshot
@@ -91,7 +118,10 @@ class VpnInterfaceContainmentTest {
         @Implementation fun allowBypass(): VpnService.Builder = real.also { checkNotNull(captured).bypass = true }
         @Implementation fun allowFamily(family: Int): VpnService.Builder = real.also { checkNotNull(captured).allowedFamilies += family }
         @Implementation fun addAllowedApplication(app: String): VpnService.Builder = real.also { checkNotNull(captured).allowedApps += app }
-        @Implementation fun addDisallowedApplication(app: String): VpnService.Builder = real.also { checkNotNull(captured).disallowedApps += app }
+        @Implementation fun addDisallowedApplication(app: String): VpnService.Builder {
+            if (app == "com.example.uninstalled") throw android.content.pm.PackageManager.NameNotFoundException(app)
+            return real.also { checkNotNull(captured).disallowedApps += app }
+        }
         @Implementation fun establish(): ParcelFileDescriptor = checkNotNull(captured).pipe[0]
     }
 

@@ -125,6 +125,19 @@ jobs:
           for config in "${fixtures[@]}"; do
             "$tmp/core/xray" run -test -config "$config"
           done
+          option_fixtures=(app/build/vpn-config-fixtures/options/*.json)
+          if [[ ${#option_fixtures[@]} -ne 1408 ]]; then
+            printf 'Expected 1408 option-matrix configs, found %s.\n' "${#option_fixtures[@]}" >&2
+            exit 1
+          fi
+          for config in "${option_fixtures[@]}"; do
+            "$tmp/core/xray" run -test -config "$config" > "$tmp/option-check.log" 2>&1 || {
+              printf 'Option config rejected: %s\n' "$config" >&2
+              cat "$tmp/option-check.log" >&2
+              exit 1
+            }
+          done
+          printf 'Validated all %s option-matrix configurations.\n' "${#option_fixtures[@]}"
       - name: Test release-schema mapping verifier
         run: bash ./gradlew -p buildSrc test --no-daemon --console=plain
       - name: Preserve Android test and lint evidence

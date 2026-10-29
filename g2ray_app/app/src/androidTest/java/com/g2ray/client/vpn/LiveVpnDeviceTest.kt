@@ -1134,7 +1134,7 @@ class LiveVpnDeviceTest {
                 // Stop only the explicitly launched video app, so it cannot
                 // continue prefetching after the test or its budget guard ends.
                 ParcelFileDescriptor.AutoCloseInputStream(automation.executeShellCommand(
-                    "am force-stop com.google.android.youtube"
+                    "am force-stop --user current com.google.android.youtube"
                 )).use { output -> while (output.read() != -1) { /* Drain shell completion. */ } }
             } finally {
                 automation.dropShellPermissionIdentity()
