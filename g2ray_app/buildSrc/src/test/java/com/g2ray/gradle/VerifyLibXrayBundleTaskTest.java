@@ -21,7 +21,7 @@ import static org.junit.Assert.*;
 
 public class VerifyLibXrayBundleTaskTest {
     @Rule public TemporaryFolder temporaryFolder = new TemporaryFolder();
-    private Path aar, metadata, controller, observer, measure, xhttp, close;
+    private Path aar, metadata, controller, observer, measure, xhttp, close, webSocket, vlessCancel;
     private Properties properties;
 
     @Before public void prepare() throws Exception {
@@ -33,6 +33,8 @@ public class VerifyLibXrayBundleTaskTest {
         measure = Files.writeString(root.resolve("measure.patch"), "measure fixture\n");
         xhttp = Files.writeString(root.resolve("xhttp.patch"), "XHTTP fixture\n");
         close = Files.writeString(root.resolve("close.patch"), "close fixture\n");
+        webSocket = Files.writeString(root.resolve("websocket.patch"), "WebSocket fixture\n");
+        vlessCancel = Files.writeString(root.resolve("vless-cancel.patch"), "VLESS cancellation fixture\n");
         writeAar(true);
         properties = new Properties();
         properties.setProperty("libxray.ref", "80263da83e96b2972455b0a94b13ee1a10e51391");
@@ -45,7 +47,9 @@ public class VerifyLibXrayBundleTaskTest {
                 "libxray.xray.observer.patch.sha256", observer,
                 "libxray.measure.patch.sha256", measure,
                 "libxray.xray.xhttp.patch.sha256", xhttp,
-                "libxray.xray.xhttp.close.patch.sha256", close).entrySet()) {
+                "libxray.xray.xhttp.close.patch.sha256", close,
+                "libxray.xray.websocket.patch.sha256", webSocket,
+                "libxray.xray.vless.cancel.patch.sha256", vlessCancel).entrySet()) {
             properties.setProperty(entry.getKey(), hash(entry.getValue()));
         }
         saveMetadata();
@@ -60,7 +64,7 @@ public class VerifyLibXrayBundleTaskTest {
     }
 
     private void verify(boolean required) throws Exception {
-        VerifyLibXrayBundleTask.verifyArtifacts(aar, metadata, controller, observer, measure, xhttp, close, required);
+        VerifyLibXrayBundleTask.verifyArtifacts(aar, metadata, controller, observer, measure, xhttp, close, webSocket, vlessCancel, required);
     }
 
     private void rejected(String expected) {
@@ -119,6 +123,28 @@ public class VerifyLibXrayBundleTaskTest {
 
     @Test public void rejectsChangedClosePatch() throws Exception {
         Files.writeString(close, "changed close patch"); rejected("libxray.xray.xhttp.close.patch.sha256");
+    }
+
+    @Test public void rejectsMissingWebSocketAttestation() throws Exception {
+        properties.remove("libxray.xray.websocket.patch.sha256"); saveMetadata();
+        rejected("libxray.xray.websocket.patch.sha256");
+    }
+
+    @Test public void rejectsMissingVlessCancellationAttestation() throws Exception {
+        properties.remove("libxray.xray.vless.cancel.patch.sha256"); saveMetadata();
+        rejected("libxray.xray.vless.cancel.patch.sha256");
+    }
+
+    @Test public void rejectsChangedVlessCancellationPatchAndWrongMetadataHash() throws Exception {
+        Files.writeString(vlessCancel, "changed patch"); rejected("libxray.xray.vless.cancel.patch.sha256");
+        properties.setProperty("libxray.xray.vless.cancel.patch.sha256", "wrong"); saveMetadata();
+        rejected("libxray.xray.vless.cancel.patch.sha256");
+    }
+
+    @Test public void rejectsChangedWebSocketPatchAndWrongMetadataHash() throws Exception {
+        Files.writeString(webSocket, "changed patch"); rejected("libxray.xray.websocket.patch.sha256");
+        properties.setProperty("libxray.xray.websocket.patch.sha256", "wrong"); saveMetadata();
+        rejected("libxray.xray.websocket.patch.sha256");
     }
 
     @Test public void rejectsMismatchedAarEvenWithCurrentPatchHashes() throws Exception {

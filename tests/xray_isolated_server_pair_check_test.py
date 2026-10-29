@@ -1,8 +1,11 @@
 """No-network contract tests for isolated server/client acceptance."""
 
 import json
+import sys
+import tempfile
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from xray_authenticated_transport_check import outbound
@@ -40,6 +43,20 @@ def bundle(ws_path="/ws"):
 
 
 class IsolatedServerPairTest(unittest.TestCase):
+    def test_cli_passes_distinct_pinned_client_to_pair_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            server, client, helper = (root / name for name in ("server", "client", "helper"))
+            for executable in (server, client, helper):
+                executable.touch()
+            argv = ["pair-check", str(server), str(helper), "--client-xray", str(client),
+                    "--loopback-baseline", "--idle-seconds", "0"]
+            with patch.object(sys, "argv", argv), patch("xray_isolated_server_pair_check.validate") as validate_pair:
+                from xray_isolated_server_pair_check import main
+                main()
+            self.assertEqual(server.resolve(), validate_pair.call_args.args[0])
+            self.assertEqual(client.resolve(), validate_pair.call_args.kwargs["client_core"])
+
     def test_ws_early_data_is_opt_in_bounded_and_changes_only_the_copied_ws_path(self):
         source = bundle(ws_path="/ws?ed=1&token=a%2Bb&blank=")
         ports = {"xhttp": 12345, "ws": 12346}

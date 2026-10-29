@@ -37,6 +37,14 @@ public abstract class VerifyLibXrayBuildContractTask extends DefaultTask {
     @PathSensitive(PathSensitivity.RELATIVE)
     public abstract RegularFileProperty getXhttpClosePatch();
 
+    @InputFile
+    @PathSensitive(PathSensitivity.RELATIVE)
+    public abstract RegularFileProperty getWebSocketPatch();
+
+    @InputFile
+    @PathSensitive(PathSensitivity.RELATIVE)
+    public abstract RegularFileProperty getVlessCancelPatch();
+
     @TaskAction
     public void verifyContract() throws Exception {
         String script = Files.readString(
@@ -102,6 +110,38 @@ public abstract class VerifyLibXrayBuildContractTask extends DefaultTask {
         verifyXhttpContract(script,
             Files.readString(getXhttpPatch().getAsFile().get().toPath(), StandardCharsets.UTF_8),
             Files.readString(getXhttpClosePatch().getAsFile().get().toPath(), StandardCharsets.UTF_8));
+        verifyWebSocketContract(script,
+            Files.readString(getWebSocketPatch().getAsFile().get().toPath(), StandardCharsets.UTF_8));
+        verifyVlessCancelContract(script,
+            Files.readString(getVlessCancelPatch().getAsFile().get().toPath(), StandardCharsets.UTF_8));
+    }
+
+    static void verifyVlessCancelContract(String script, String patch) {
+        require(script.contains("git -C $xrayCoreDir apply --check $XrayVlessCancelPatch") &&
+                script.contains("git -C $xrayCoreDir apply $XrayVlessCancelPatch"),
+            "The native build must validate and apply the VLESS cancellation patch.");
+        require(script.contains("libxray.xray.vless.cancel.patch.sha256="),
+            "The native build must attest the VLESS cancellation patch.");
+        require(script.contains("go test ./common/retry ./proxy/vless/outbound") &&
+                script.contains("if ($LASTEXITCODE -ne 0) { throw \"The patched VLESS"),
+            "The native build must fail when the actual outbound or retry fixtures fail.");
+        require(patch.contains("ExponentialBackoffContext(ctx, 5, 200)") &&
+                patch.contains("case <-r.ctx.Done():") && patch.contains("r.ctx.Err()"),
+            "The patch must fence outbound attempts and interrupt retry backoff on cancellation.");
+    }
+
+    static void verifyWebSocketContract(String script, String patch) {
+        require(script.contains("git -C $xrayCoreDir apply --check $XrayWebSocketPatch") &&
+                script.contains("git -C $xrayCoreDir apply $XrayWebSocketPatch"),
+            "The native build must validate and apply the WebSocket patch.");
+        require(script.contains("libxray.xray.websocket.patch.sha256="),
+            "The native build must attest the WebSocket patch.");
+        require(script.contains("go test ./transport/internet/websocket -run '^TestG2RayWS'") &&
+                script.contains("if ($LASTEXITCODE -ne 0) { throw \"The patched WebSocket"),
+            "The native build must fail when the WebSocket fixtures fail.");
+        require(patch.contains("NetDialContext:") && patch.contains("WebsocketHandshakeContext(dialCtx)") &&
+                patch.contains("if nBytes > 0") && patch.contains("_ = pconn.Close()"),
+            "The WebSocket patch is missing the deadline, byte-integrity or socket-cleanup fix.");
     }
 
     static void verifyXhttpContract(String script, String patch, String closePatch) {

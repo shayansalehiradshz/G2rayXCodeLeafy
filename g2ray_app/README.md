@@ -281,11 +281,15 @@ the real-device production matrix:
 
 3. Confirm `app/libs/libXray.aar` and `app/libs/libXray.properties` exist. The
    build script records the exact commit, Go version, mobile-tool revisions,
-   controller-, observer-, measurement-, XHTTP-concurrency-, and XHTTP-close-error
+   controller-, observer-, measurement-, XHTTP-concurrency-, XHTTP-close-error,
+   WebSocket-integrity-, and VLESS-cancellation
    patch hashes, plus the AAR SHA-256. The XHTTP backport fixes upload buffer
    ownership and concurrent response-body ownership without changing the core
    version or transport tuning. The builder runs focused byte-integrity and
    lifecycle fixtures; CI repeats them under Go's race detector.
+   The WebSocket patch preserves final-frame bytes, honors the existing handshake
+   deadline and closes failed TLS sockets. The VLESS patch interrupts canceled
+   retries without changing the live retry schedule for uncanceled requests.
    Functional-debug and release builds
    reject a missing, stale, mismatched, or Java-API-incompatible core, and
    release builds also verify every bundled HEV ABI against its pinned metadata.

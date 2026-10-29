@@ -17,6 +17,22 @@ public class VerifyLibXrayBuildContractTaskTest {
         """;
     private final String patch = "+\t\tn := int(buff.Len())\natomic.Bool\nreader.Swap(nil)";
     private final String close = "+\t\treturn err2";
+    private final String webSocketScript = """
+        git -C $xrayCoreDir apply --check $XrayWebSocketPatch
+        git -C $xrayCoreDir apply $XrayWebSocketPatch
+        libxray.xray.websocket.patch.sha256=hash
+        go test ./transport/internet/websocket -run '^TestG2RayWS'
+        if ($LASTEXITCODE -ne 0) { throw "The patched WebSocket
+        """;
+    private final String webSocketPatch = "NetDialContext: WebsocketHandshakeContext(dialCtx) if nBytes > 0 _ = pconn.Close()";
+    private final String vlessScript = """
+        git -C $xrayCoreDir apply --check $XrayVlessCancelPatch
+        git -C $xrayCoreDir apply $XrayVlessCancelPatch
+        libxray.xray.vless.cancel.patch.sha256=hash
+        go test ./common/retry ./proxy/vless/outbound
+        if ($LASTEXITCODE -ne 0) { throw "The patched VLESS
+        """;
+    private final String vlessPatch = "ExponentialBackoffContext(ctx, 5, 200) case <-r.ctx.Done(): r.ctx.Err()";
 
     @Test public void acceptsCompleteXhttpContract() {
         VerifyLibXrayBuildContractTask.verifyXhttpContract(script, patch, close);
@@ -36,5 +52,42 @@ public class VerifyLibXrayBuildContractTaskTest {
         }
         assertThrows(GradleException.class, () ->
             VerifyLibXrayBuildContractTask.verifyXhttpContract(script, patch, ""));
+    }
+
+    @Test public void acceptsCompleteWebSocketContract() {
+        VerifyLibXrayBuildContractTask.verifyWebSocketContract(webSocketScript, webSocketPatch);
+    }
+
+    @Test public void rejectsMissingWebSocketBuildOrAttestationStep() {
+        for (String line : webSocketScript.strip().split("\n")) {
+            assertThrows(line, GradleException.class, () ->
+                VerifyLibXrayBuildContractTask.verifyWebSocketContract(webSocketScript.replace(line, ""), webSocketPatch));
+        }
+    }
+
+    @Test public void rejectsIncompleteWebSocketPatch() {
+        for (String missing : new String[]{"NetDialContext:", "WebsocketHandshakeContext(dialCtx)",
+                "if nBytes > 0", "_ = pconn.Close()"}) {
+            assertThrows(missing, GradleException.class, () ->
+                VerifyLibXrayBuildContractTask.verifyWebSocketContract(webSocketScript, webSocketPatch.replace(missing, "")));
+        }
+    }
+
+    @Test public void acceptsCompleteVlessCancellationContract() {
+        VerifyLibXrayBuildContractTask.verifyVlessCancelContract(vlessScript, vlessPatch);
+    }
+
+    @Test public void rejectsMissingVlessCancellationBuildOrAttestationStep() {
+        for (String line : vlessScript.strip().split("\n")) {
+            assertThrows(line, GradleException.class, () ->
+                VerifyLibXrayBuildContractTask.verifyVlessCancelContract(vlessScript.replace(line, ""), vlessPatch));
+        }
+    }
+
+    @Test public void rejectsIncompleteVlessCancellationPatch() {
+        for (String missing : new String[]{"ExponentialBackoffContext(ctx, 5, 200)", "case <-r.ctx.Done():", "r.ctx.Err()"}) {
+            assertThrows(missing, GradleException.class, () ->
+                VerifyLibXrayBuildContractTask.verifyVlessCancelContract(vlessScript, vlessPatch.replace(missing, "")));
+        }
     }
 }

@@ -20,6 +20,8 @@ val libXrayObserverPatch = rootProject.file("scripts/patches/xray-observer-detac
 val libXrayMeasurePatch = rootProject.file("scripts/patches/libxray-measure-status.patch")
 val libXrayXhttpPatch = rootProject.file("scripts/patches/xray-xhttp-upstream-races-5ca.patch")
 val libXrayXhttpClosePatch = rootProject.file("scripts/patches/xray-xhttp-close-error-5ca.patch")
+val libXrayWebSocketPatch = rootProject.file("scripts/patches/xray-websocket-integrity-5ca.patch")
+val libXrayVlessCancelPatch = rootProject.file("scripts/patches/xray-vless-cancel-5ca.patch")
 val hevMetadataFile = file("libs/hev.properties")
 val hevJniLibsDirectory = file("src/main/jniLibs")
 val releaseRequested = gradle.startParameter.taskNames.any { it.contains("Release", ignoreCase = true) }
@@ -90,7 +92,9 @@ fun verifyLibXrayBundle(required: Boolean) {
         "The bundled libXray AAR was not built with the current measurement-status patch"
     }
     mapOf("libxray.xray.xhttp.patch.sha256" to libXrayXhttpPatch,
-        "libxray.xray.xhttp.close.patch.sha256" to libXrayXhttpClosePatch).forEach { (key, patch) ->
+        "libxray.xray.xhttp.close.patch.sha256" to libXrayXhttpClosePatch,
+        "libxray.xray.websocket.patch.sha256" to libXrayWebSocketPatch,
+        "libxray.xray.vless.cancel.patch.sha256" to libXrayVlessCancelPatch).forEach { (key, patch) ->
         check(sha256(patch) == metadata.getProperty(key)?.trim()?.uppercase()) {
             "The bundled libXray AAR does not attest the current $key; rebuild the native bundle"
         }
@@ -215,6 +219,8 @@ val verifyLibXrayBuildContract = tasks.register<VerifyLibXrayBuildContractTask>(
     measurePatch.set(libXrayMeasurePatch)
     xhttpPatch.set(libXrayXhttpPatch)
     xhttpClosePatch.set(libXrayXhttpClosePatch)
+    webSocketPatch.set(libXrayWebSocketPatch)
+    vlessCancelPatch.set(libXrayVlessCancelPatch)
 }
 
 val verifyBundledCore = tasks.register<VerifyLibXrayBundleTask>("verifyBundledCore") {
@@ -227,6 +233,8 @@ val verifyBundledCore = tasks.register<VerifyLibXrayBundleTask>("verifyBundledCo
     measurePatch.set(libXrayMeasurePatch)
     xhttpPatch.set(libXrayXhttpPatch)
     xhttpClosePatch.set(libXrayXhttpClosePatch)
+    webSocketPatch.set(libXrayWebSocketPatch)
+    vlessCancelPatch.set(libXrayVlessCancelPatch)
     required.set(true)
 }
 

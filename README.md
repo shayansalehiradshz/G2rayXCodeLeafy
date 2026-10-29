@@ -83,6 +83,16 @@ The [retained-flow investigation](PERFORMANCE_INVESTIGATION_2026-10-13.md) recor
 
 ## Getting Started
 
+The server image builds Xray 26.10.21 from the exact source revision recorded in
+`.devcontainer/build-xray.sh`, with a narrow WebSocket final-byte correction.
+Go 1.27.3 and the source patch are pinned, reader regressions run during the
+image build, and `/usr/local/share/g2ray/xray-build.properties` records provenance.
+The checksum-verified official release remains at
+`/usr/local/lib/g2ray/xray-official` for controlled rollback. This compilation
+happens when building the image, not during Codespace wake or normal VPN startup.
+Changing `XRAY_VERSION` now also requires reviewing and updating that maintained
+source pin and patch; the image refuses a mismatched release/source combination.
+
 1. **Fork the Repository**  
    → Click **Fork** at the top-right of this page
 

@@ -4,10 +4,22 @@ on:
   push:
     paths:
       - "g2ray_app/**"
+      - "g2ray.sh"
+      - ".devcontainer/Dockerfile"
+      - "tests/g2ray_config_validation.sh"
+      - "tests/xray_isolated_server_pair_check.py"
+      - "tests/xray_authenticated_transport_check.py"
+      - "tests/xray_retained_http_check.go"
       - ".github/workflows/android-tests.yml"
   pull_request:
     paths:
       - "g2ray_app/**"
+      - "g2ray.sh"
+      - ".devcontainer/Dockerfile"
+      - "tests/g2ray_config_validation.sh"
+      - "tests/xray_isolated_server_pair_check.py"
+      - "tests/xray_authenticated_transport_check.py"
+      - "tests/xray_retained_http_check.go"
       - ".github/workflows/android-tests.yml"
   workflow_dispatch:
 
@@ -59,8 +71,37 @@ jobs:
           git -C "$tmp/Xray-core" apply "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/xray-xhttp-upstream-races-5ca.patch"
           git -C "$tmp/Xray-core" apply --check "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/xray-xhttp-close-error-5ca.patch"
           git -C "$tmp/Xray-core" apply "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/xray-xhttp-close-error-5ca.patch"
+          git -C "$tmp/Xray-core" apply --check "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/xray-websocket-integrity-5ca.patch"
+          git -C "$tmp/Xray-core" apply "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/xray-websocket-integrity-5ca.patch"
+          git -C "$tmp/Xray-core" apply --check "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/xray-vless-cancel-5ca.patch"
+          git -C "$tmp/Xray-core" apply "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/xray-vless-cancel-5ca.patch"
           cp g2ray_app/scripts/fixtures/g2ray_xhttp_regression_test.go "$tmp/Xray-core/transport/internet/splithttp/g2ray_xhttp_regression_test.go"
+          cp g2ray_app/scripts/fixtures/g2ray_ws_regression_test.go "$tmp/Xray-core/transport/internet/websocket/g2ray_ws_regression_test.go"
+          cp g2ray_app/scripts/fixtures/g2ray_retry_regression_test.go "$tmp/Xray-core/common/retry/g2ray_retry_regression_test.go"
+          cp g2ray_app/scripts/fixtures/g2ray_vless_cancel_test.go "$tmp/Xray-core/proxy/vless/outbound/g2ray_vless_cancel_test.go"
+          (cd "$tmp/Xray-core" && go test -race ./common/retry ./proxy/vless/outbound -count=1 -timeout=90s)
           (cd "$tmp/Xray-core" && go test -race ./transport/internet/splithttp -run '^TestG2RayXHTTP' -count=3 -timeout=180s)
+          (cd "$tmp/Xray-core" && go test -race ./transport/internet/websocket -run '^TestG2RayWS(RealFrame|ReadPreserves|HandshakeDeadline|Blackholed|EarlierParent|FailedTLS)' -count=1 -timeout=90s)
+          # Xray's separate TLS-server certificate reload has a known race;
+          # keep the real local WSS success control, without claiming it is race-clean.
+          (cd "$tmp/Xray-core" && go test ./transport/internet/websocket -run '^TestG2RayWSFinalFrameOnTLSClose$' -count=3 -timeout=30s)
+          # Use the same patched, pinned client source as the AAR and the
+          # separately pinned server release. Everything below is loopback-only.
+          (cd "$tmp/Xray-core" && go build -trimpath -buildvcs=false -o "$tmp/client-xray" ./main)
+          version=$(sed -nE 's/^ARG XRAY_VERSION=(v[0-9]+\.[0-9]+\.[0-9]+)$/\1/p' .devcontainer/Dockerfile)
+          [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          curl --fail --location --retry 2 --max-time 180 --silent --show-error \
+            "https://github.com/XTLS/Xray-core/releases/download/${version}/Xray-linux-64.zip" -o "$tmp/server.zip"
+          curl --fail --location --retry 2 --max-time 60 --silent --show-error \
+            "https://github.com/XTLS/Xray-core/releases/download/${version}/Xray-linux-64.zip.dgst" -o "$tmp/server.zip.dgst"
+          hash=$(awk -F'= ' '/^SHA2-256=/{print $2}' "$tmp/server.zip.dgst")
+          [[ "$hash" =~ ^[0-9a-fA-F]{64}$ ]]
+          printf '%s  %s\n' "$hash" "$tmp/server.zip" | sha256sum -c -
+          unzip -q "$tmp/server.zip" -d "$tmp/server"
+          chmod +x "$tmp/server/xray"
+          go build -o "$tmp/retained-http-probe" tests/xray_retained_http_check.go
+          python3 tests/xray_isolated_server_pair_check.py "$tmp/server/xray" "$tmp/retained-http-probe" \
+            --client-xray "$tmp/client-xray" --profile balanced --loopback-baseline --idle-seconds 0
           cp g2ray_app/scripts/fixtures/libxray_measure_status_test.go "$tmp/libxray-src/nodep/g2ray_measure_status_test.go"
           cp g2ray_app/scripts/fixtures/libxray_batch_policy_test.go "$tmp/libxray-src/xray/g2ray_batch_policy_test.go"
           cd "$tmp/libxray-src"

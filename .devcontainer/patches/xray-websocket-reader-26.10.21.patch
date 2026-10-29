@@ -1,0 +1,16 @@
+diff --git a/transport/internet/websocket/connection.go b/transport/internet/websocket/connection.go
+index 26082fc..2b3b971 100644
+--- a/transport/internet/websocket/connection.go
++++ b/transport/internet/websocket/connection.go
+@@ -52,6 +52,11 @@ func (c *connection) Read(b []byte) (int, error) {
+ 		nBytes, err := reader.Read(b)
+ 		if errors.Cause(err) == io.EOF {
+ 			c.reader = nil
++			// A reader can return its final bytes and EOF together. Deliver
++			// those bytes before advancing to the next WebSocket message.
++			if nBytes > 0 {
++				return nBytes, nil
++			}
+ 			continue
+ 		}
+ 		return nBytes, err

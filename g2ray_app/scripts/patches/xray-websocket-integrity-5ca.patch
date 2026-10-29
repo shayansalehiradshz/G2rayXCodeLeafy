@@ -1,0 +1,59 @@
+diff --git a/transport/internet/websocket/connection.go b/transport/internet/websocket/connection.go
+index 26082fc..2b3b971 100644
+--- a/transport/internet/websocket/connection.go
++++ b/transport/internet/websocket/connection.go
+@@ -52,6 +52,11 @@ func (c *connection) Read(b []byte) (int, error) {
+ 		nBytes, err := reader.Read(b)
+ 		if errors.Cause(err) == io.EOF {
+ 			c.reader = nil
++			// A reader can return its final bytes and EOF together. Deliver
++			// those bytes before advancing to the next WebSocket message.
++			if nBytes > 0 {
++				return nBytes, nil
++			}
+ 			continue
+ 		}
+ 		return nBytes, err
+diff --git a/transport/internet/websocket/dialer.go b/transport/internet/websocket/dialer.go
+index 8e295da..37c06d3 100644
+--- a/transport/internet/websocket/dialer.go
++++ b/transport/internet/websocket/dialer.go
+@@ -47,8 +47,8 @@ func dialWebSocket(ctx context.Context, dest net.Destination, streamSettings *in
+ 	wsSettings := streamSettings.ProtocolSettings.(*Config)
+ 
+ 	dialer := &websocket.Dialer{
+-		NetDial: func(network, addr string) (net.Conn, error) {
+-			conn, err := internet.DialSystem(ctx, dest, streamSettings.SocketSettings)
++		NetDialContext: func(dialCtx context.Context, network, addr string) (net.Conn, error) {
++			conn, err := internet.DialSystem(dialCtx, dest, streamSettings.SocketSettings)
+ 			if err != nil {
+ 				return nil, err
+ 			}
+@@ -77,9 +77,9 @@ func dialWebSocket(ctx context.Context, dest net.Destination, streamSettings *in
+ 		tlsConfig := tConfig.GetTLSConfig(tls.WithDestination(dest), tls.WithNextProto("http/1.1"))
+ 		dialer.TLSClientConfig = tlsConfig
+ 		if fingerprint := tls.GetFingerprint(tConfig.Fingerprint); fingerprint != nil {
+-			dialer.NetDialTLSContext = func(_ context.Context, _, addr string) (net.Conn, error) {
++			dialer.NetDialTLSContext = func(dialCtx context.Context, _, addr string) (net.Conn, error) {
+ 				// Like the NetDial in the dialer
+-				pconn, err := internet.DialSystem(ctx, dest, streamSettings.SocketSettings)
++				pconn, err := internet.DialSystem(dialCtx, dest, streamSettings.SocketSettings)
+ 				if err != nil {
+ 					errors.LogErrorInner(ctx, err, "failed to dial to "+addr)
+ 					return nil, err
+@@ -96,12 +96,14 @@ func dialWebSocket(ctx context.Context, dest net.Destination, streamSettings *in
+ 
+ 				// TLS and apply the handshake
+ 				cn := tls.UClient(pconn, tlsConfig, fingerprint).(*tls.UConn)
+-				if err := cn.WebsocketHandshakeContext(ctx); err != nil {
++				if err := cn.WebsocketHandshakeContext(dialCtx); err != nil {
++					_ = pconn.Close()
+ 					errors.LogErrorInner(ctx, err, "failed to dial to "+addr)
+ 					return nil, err
+ 				}
+ 				if !tlsConfig.InsecureSkipVerify {
+ 					if err := cn.VerifyHostname(tlsConfig.ServerName); err != nil {
++						_ = pconn.Close()
+ 						errors.LogErrorInner(ctx, err, "failed to dial to "+addr)
+ 						return nil, err
+ 					}

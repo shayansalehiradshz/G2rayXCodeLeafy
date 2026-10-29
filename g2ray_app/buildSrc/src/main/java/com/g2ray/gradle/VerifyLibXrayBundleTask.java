@@ -66,6 +66,14 @@ public abstract class VerifyLibXrayBundleTask extends DefaultTask {
     @PathSensitive(PathSensitivity.RELATIVE)
     public abstract RegularFileProperty getXhttpClosePatch();
 
+    @InputFile
+    @PathSensitive(PathSensitivity.RELATIVE)
+    public abstract RegularFileProperty getWebSocketPatch();
+
+    @InputFile
+    @PathSensitive(PathSensitivity.RELATIVE)
+    public abstract RegularFileProperty getVlessCancelPatch();
+
     @Input
     public abstract Property<Boolean> getRequired();
 
@@ -86,11 +94,14 @@ public abstract class VerifyLibXrayBundleTask extends DefaultTask {
             getObserverPatch().getAsFile().get().toPath(),
             getMeasurePatch().getAsFile().get().toPath(),
             getXhttpPatch().getAsFile().get().toPath(),
-            getXhttpClosePatch().getAsFile().get().toPath(), getRequired().get());
+            getXhttpClosePatch().getAsFile().get().toPath(),
+            getWebSocketPatch().getAsFile().get().toPath(),
+            getVlessCancelPatch().getAsFile().get().toPath(), getRequired().get());
     }
 
     static void verifyArtifacts(Path aar, Path metadata, Path controllerPatch, Path observerPatch,
-                                Path measurePatch, Path xhttpPatch, Path xhttpClosePatch,
+                                Path measurePatch, Path xhttpPatch, Path xhttpClosePatch, Path webSocketPatch,
+                                Path vlessCancelPatch,
                                 boolean required) throws Exception {
         boolean aarExists = Files.isRegularFile(aar);
         boolean metadataExists = Files.isRegularFile(metadata);
@@ -158,6 +169,8 @@ public abstract class VerifyLibXrayBundleTask extends DefaultTask {
         }
         requirePatchHash(properties, "libxray.xray.xhttp.patch.sha256", xhttpPatch);
         requirePatchHash(properties, "libxray.xray.xhttp.close.patch.sha256", xhttpClosePatch);
+        requirePatchHash(properties, "libxray.xray.websocket.patch.sha256", webSocketPatch);
+        requirePatchHash(properties, "libxray.xray.vless.cancel.patch.sha256", vlessCancelPatch);
 
         verifyNativeLibraries(aar);
         verifyJavaApi(aar);

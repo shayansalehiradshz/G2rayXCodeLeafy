@@ -47,6 +47,7 @@ jobs:
         run: |
           bash -n ./g2ray.sh
           bash -n ./scripts/post-start.sh
+          bash -n ./.devcontainer/build-xray.sh
           bash -n ./tests/g2ray_static_tests.sh
           bash -n ./tests/g2ray_behavior_tests.sh
           python3 ./tests/xray_upload_queue_validation.py --help >/dev/null
@@ -124,6 +125,23 @@ jobs:
             "$tmp/retained-http-probe" --loopback-baseline --idle-seconds 70 \
             --transport ws --ws-early-data-bytes 2560
 
+  maintained-server-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Build and verify the maintained server image
+        run: |
+          docker build --tag g2ray-ws-verified --file .devcontainer/Dockerfile .devcontainer
+          docker run --rm g2ray-ws-verified /usr/local/bin/xray version
+          docker run --rm g2ray-ws-verified sh -eu -c '
+            cd /usr/local/bin
+            expected=$(sed -n "s/^xray.sha256=//p" /usr/local/share/g2ray/xray-build.properties)
+            test -n "$expected"
+            printf "%s  xray\n" "$expected" | sha256sum -c -
+            test -x /usr/local/lib/g2ray/xray-official'
+
   extended-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -145,7 +163,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y shellcheck
-          shellcheck -S error ./g2ray.sh ./scripts/post-start.sh ./tests/*.sh
+          shellcheck -S error ./g2ray.sh ./scripts/post-start.sh ./.devcontainer/build-xray.sh ./tests/*.sh
 
       - name: Wrangler dry-run bundle check
         working-directory: worker/codespace-waker

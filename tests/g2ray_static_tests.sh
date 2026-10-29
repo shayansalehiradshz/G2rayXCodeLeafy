@@ -360,6 +360,16 @@ test_xray_version_can_be_pinned() {
         || fail 'Dockerfile does not download Xray digest metadata'
     grep_fixed 'sha256sum -c -' "$DOCKERFILE" \
         || fail 'Dockerfile does not verify Xray zip checksum before installing'
+    grep_fixed 'FROM golang:1.27.3-bookworm AS xray-build' "$DOCKERFILE" \
+        || fail 'maintained server builder does not pin Go 1.27.3'
+    grep_fixed 'COPY --from=xray-build /out/xray /usr/local/bin/xray' "$DOCKERFILE" \
+        || fail 'container rebuild does not retain the tested WebSocket reader correction'
+    grep_fixed '/usr/local/lib/g2ray/xray-official' "$DOCKERFILE" \
+        || fail 'maintained server image does not preserve the verified official binary for rollback'
+    grep_fixed 'pin=1b1647cd9ddf0abc34b981d4611fc03bcac1ca74' "$ROOT_DIR/.devcontainer/build-xray.sh" \
+        || fail 'maintained server source is not pinned to the reviewed release commit'
+    grep_fixed 'go test -race ./transport/internet/websocket' "$ROOT_DIR/.devcontainer/build-xray.sh" \
+        || fail 'maintained server build does not run reader regression tests before compiling'
     pass 'Dockerfile supports pinned Xray version'
 }
 

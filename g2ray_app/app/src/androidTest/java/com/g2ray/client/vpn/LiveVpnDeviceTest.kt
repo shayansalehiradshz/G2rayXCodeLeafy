@@ -86,6 +86,23 @@ class LiveVpnDeviceTest {
     private val traceIdentity = VpnProbeTraceIdentity()
 
     @Test
+    fun savedWebSocketEarlyDataUsageIsReportedWithoutSecrets() {
+        assumeTrue("Saved-profile inspection requires liveVpn=true",
+            InstrumentationRegistry.getArguments().getString("liveVpn") == "true")
+        val repository = ApplicationProvider.getApplicationContext<G2RayApplication>().accountRepository
+        assertTrue("Saved data failed to load", repository.loadError.value == null)
+        val selection = repository.activeSelection.value
+        val profiles = repository.profiles.value.mapNotNull { VlessUriParser.parse(it.rawUri).getOrNull() }
+        val ws = profiles.filter { it.transport == Transport.WS }
+        val earlyDataCount = ws.count {
+            (Uri.parse("https://config.invalid${it.path}").getQueryParameter("ed")?.toIntOrNull() ?: 0) > 0
+        }
+        report("event=saved_transport_summary ws_profiles=${ws.size} ws_early_data_profiles=$earlyDataCount " +
+            "configuration_unchanged=true")
+        assertEquals(selection, repository.activeSelection.value)
+    }
+
+    @Test
     fun debugDataPathClientAttachesPerRequestTimingWithoutNetworkAccess() = runBlocking {
         assertTrue("This regression requires the actual debug client", com.g2ray.client.BuildConfig.DEBUG)
         val probe = OkHttpVpnDataPathProbe()

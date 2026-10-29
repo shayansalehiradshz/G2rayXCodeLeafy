@@ -1,3 +1,9 @@
+FROM golang:1.27.3-bookworm AS xray-build
+COPY build-xray.sh /build/build-xray.sh
+COPY patches/ /build/patches/
+COPY fixtures/ /build/fixtures/
+RUN GOTOOLCHAIN=local bash /build/build-xray.sh /out
+
 FROM debian:bookworm-slim
 
 ARG XRAY_VERSION=v26.10.21
@@ -21,9 +27,14 @@ RUN wget -qO xray.zip "https://github.com/XTLS/Xray-core/releases/download/${XRA
     && wget -qO xray.zip.dgst "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip.dgst" \
     && awk -F'= ' '/^SHA2-256=/{print $2 "  xray.zip"}' xray.zip.dgst | sha256sum -c - \
     && unzip -q xray.zip -d /tmp/xray-dir \
-    && mv /tmp/xray-dir/xray /usr/local/bin/xray \
+    && mkdir -p /usr/local/lib/g2ray \
+    && mv /tmp/xray-dir/xray /usr/local/lib/g2ray/xray-official \
     && mv /tmp/xray-dir/*.dat /usr/local/bin/ \
-    && chmod +x /usr/local/bin/xray \
+    && chmod +x /usr/local/lib/g2ray/xray-official \
     && rm -rf xray.zip xray.zip.dgst /tmp/xray-dir
+
+COPY --from=xray-build /out/xray /usr/local/bin/xray
+COPY --from=xray-build /out/xray-build.properties /usr/local/share/g2ray/xray-build.properties
+RUN test "$XRAY_VERSION" = v26.10.21 && chmod +x /usr/local/bin/xray
 
 EXPOSE 443

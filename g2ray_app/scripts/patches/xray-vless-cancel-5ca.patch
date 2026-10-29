@@ -1,0 +1,96 @@
+diff --git a/common/retry/retry.go b/common/retry/retry.go
+index 02dcbfb..8eeccaa 100644
+--- a/common/retry/retry.go
++++ b/common/retry/retry.go
+@@ -1,6 +1,7 @@
+ package retry // import "github.com/xtls/xray-core/common/retry"
+ 
+ import (
++	"context"
+ 	"time"
+ 
+ 	"github.com/xtls/xray-core/common/errors"
+@@ -17,6 +18,7 @@ type Strategy interface {
+ type retryer struct {
+ 	totalAttempt int
+ 	nextDelay    func() uint32
++	ctx          context.Context
+ }
+ 
+ // On implements Strategy.On.
+@@ -24,16 +26,41 @@ func (r *retryer) On(method func() error) error {
+ 	attempt := 0
+ 	accumulatedError := make([]error, 0, r.totalAttempt)
+ 	for attempt < r.totalAttempt {
++		if r.ctx != nil {
++			if err := r.ctx.Err(); err != nil {
++				return err
++			}
++		}
+ 		err := method()
+ 		if err == nil {
+ 			return nil
+ 		}
++		if r.ctx != nil {
++			if err := r.ctx.Err(); err != nil {
++				return err
++			}
++		}
+ 		numErrors := len(accumulatedError)
+ 		if numErrors == 0 || err.Error() != accumulatedError[numErrors-1].Error() {
+ 			accumulatedError = append(accumulatedError, err)
+ 		}
+-		delay := r.nextDelay()
+-		time.Sleep(time.Duration(delay) * time.Millisecond)
++		// Context-aware callers have no reason to sleep after the last
++		// failed attempt. Keep legacy retry behavior unchanged elsewhere.
++		if r.ctx != nil && attempt+1 >= r.totalAttempt {
++			break
++		}
++		delay := time.Duration(r.nextDelay()) * time.Millisecond
++		if r.ctx == nil {
++			time.Sleep(delay)
++		} else {
++			timer := time.NewTimer(delay)
++			select {
++			case <-r.ctx.Done():
++				timer.Stop()
++				return r.ctx.Err()
++			case <-timer.C:
++			}
++		}
+ 		attempt++
+ 	}
+ 	return errors.New(accumulatedError).Base(ErrRetryFailed)
+@@ -60,3 +87,18 @@ func ExponentialBackoff(attempts int, delay uint32) Strategy {
+ 		},
+ 	}
+ }
++
++// ExponentialBackoffContext preserves the existing attempt schedule while
++// stopping promptly if the caller's operation is cancelled.
++func ExponentialBackoffContext(ctx context.Context, attempts int, delay uint32) Strategy {
++	nextDelay := uint32(0)
++	return &retryer{
++		totalAttempt: attempts,
++		ctx:          ctx,
++		nextDelay: func() uint32 {
++			r := nextDelay
++			nextDelay += delay
++			return r
++		},
++	}
++}
+diff --git a/proxy/vless/outbound/outbound.go b/proxy/vless/outbound/outbound.go
+index ac087c6..05699fc 100644
+--- a/proxy/vless/outbound/outbound.go
++++ b/proxy/vless/outbound/outbound.go
+@@ -189,7 +189,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
+ 	}
+ 
+ 	if conn == nil {
+-		if err := retry.ExponentialBackoff(5, 200).On(func() error {
++		if err := retry.ExponentialBackoffContext(ctx, 5, 200).On(func() error {
+ 			var err error
+ 			conn, err = dialer.Dial(ctx, rec.Destination)
+ 			if err != nil {

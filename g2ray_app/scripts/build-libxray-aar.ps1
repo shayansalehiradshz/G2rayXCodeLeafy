@@ -15,6 +15,11 @@ $XrayObserverPatch = Join-Path $PSScriptRoot "patches\xray-observer-detached-sna
 $XrayXhttpPatch = Join-Path $PSScriptRoot "patches\xray-xhttp-upstream-races-5ca.patch"
 $XrayXhttpClosePatch = Join-Path $PSScriptRoot "patches\xray-xhttp-close-error-5ca.patch"
 $XrayXhttpTests = Join-Path $PSScriptRoot "fixtures\g2ray_xhttp_regression_test.go"
+$XrayWebSocketPatch = Join-Path $PSScriptRoot "patches\xray-websocket-integrity-5ca.patch"
+$XrayWebSocketTests = Join-Path $PSScriptRoot "fixtures\g2ray_ws_regression_test.go"
+$XrayVlessCancelPatch = Join-Path $PSScriptRoot "patches\xray-vless-cancel-5ca.patch"
+$XrayRetryTests = Join-Path $PSScriptRoot "fixtures\g2ray_retry_regression_test.go"
+$XrayVlessCancelTests = Join-Path $PSScriptRoot "fixtures\g2ray_vless_cancel_test.go"
 $LibXrayMeasurePatch = Join-Path $PSScriptRoot "patches\libxray-measure-status.patch"
 $LibXrayMeasureTests = Join-Path $PSScriptRoot "fixtures\libxray_measure_status_test.go"
 $LibXrayBatchTests = Join-Path $PSScriptRoot "fixtures\libxray_batch_policy_test.go"
@@ -64,6 +69,16 @@ if (-not (Test-Path -LiteralPath $XrayObserverPatch -PathType Leaf)) {
 foreach ($inputFile in @($XrayXhttpPatch, $XrayXhttpClosePatch, $XrayXhttpTests)) {
     if (-not (Test-Path -LiteralPath $inputFile -PathType Leaf)) {
         throw "A required XHTTP patch or regression fixture is missing: '$inputFile'."
+    }
+}
+foreach ($inputFile in @($XrayWebSocketPatch, $XrayWebSocketTests)) {
+    if (-not (Test-Path -LiteralPath $inputFile -PathType Leaf)) {
+        throw "A required WebSocket patch or regression fixture is missing: '$inputFile'."
+    }
+}
+foreach ($inputFile in @($XrayVlessCancelPatch, $XrayRetryTests, $XrayVlessCancelTests)) {
+    if (-not (Test-Path -LiteralPath $inputFile -PathType Leaf)) {
+        throw "A required VLESS cancellation patch or regression fixture is missing: '$inputFile'."
     }
 }
 if (-not (Test-Path -LiteralPath $LibXrayMeasurePatch -PathType Leaf)) {
@@ -166,11 +181,28 @@ git -C $xrayCoreDir apply $XrayXhttpClosePatch
 if ($LASTEXITCODE -ne 0) { throw "Could not apply the XHTTP close-error patch." }
 $xrayXhttpPatchHash = (Get-FileHash $XrayXhttpPatch -Algorithm SHA256).Hash
 $xrayXhttpClosePatchHash = (Get-FileHash $XrayXhttpClosePatch -Algorithm SHA256).Hash
+git -C $xrayCoreDir apply --check $XrayWebSocketPatch
+if ($LASTEXITCODE -ne 0) { throw "The pinned Xray source does not accept the WebSocket integrity patch." }
+git -C $xrayCoreDir apply $XrayWebSocketPatch
+if ($LASTEXITCODE -ne 0) { throw "Could not apply the WebSocket integrity patch." }
+$xrayWebSocketPatchHash = (Get-FileHash $XrayWebSocketPatch -Algorithm SHA256).Hash
+git -C $xrayCoreDir apply --check $XrayVlessCancelPatch
+if ($LASTEXITCODE -ne 0) { throw "The pinned Xray source does not accept the VLESS cancellation patch." }
+git -C $xrayCoreDir apply $XrayVlessCancelPatch
+if ($LASTEXITCODE -ne 0) { throw "Could not apply the VLESS cancellation patch." }
+$xrayVlessCancelPatchHash = (Get-FileHash $XrayVlessCancelPatch -Algorithm SHA256).Hash
 Copy-Item -LiteralPath $XrayXhttpTests -Destination (Join-Path $xrayCoreDir "transport\internet\splithttp\g2ray_xhttp_regression_test.go")
+Copy-Item -LiteralPath $XrayWebSocketTests -Destination (Join-Path $xrayCoreDir "transport\internet\websocket\g2ray_ws_regression_test.go")
+Copy-Item -LiteralPath $XrayRetryTests -Destination (Join-Path $xrayCoreDir "common\retry\g2ray_retry_regression_test.go")
+Copy-Item -LiteralPath $XrayVlessCancelTests -Destination (Join-Path $xrayCoreDir "proxy\vless\outbound\g2ray_vless_cancel_test.go")
 Push-Location $xrayCoreDir
 try {
     go test ./transport/internet/splithttp -run '^TestG2RayXHTTP' -count=1 -timeout=180s
     if ($LASTEXITCODE -ne 0) { throw "The patched XHTTP byte-integrity, concurrency or close-error fixtures failed." }
+    go test ./transport/internet/websocket -run '^TestG2RayWS' -count=1 -timeout=90s
+    if ($LASTEXITCODE -ne 0) { throw "The patched WebSocket integrity or deadline fixtures failed." }
+    go test ./common/retry ./proxy/vless/outbound -count=1 -timeout=90s
+    if ($LASTEXITCODE -ne 0) { throw "The patched VLESS cancellation or legacy retry fixtures failed." }
 } finally { Pop-Location }
 
 git -C $WorkDir apply --check $LibXrayMeasurePatch
@@ -330,6 +362,8 @@ libxray.xray.ref=$resolvedXrayCoreRef
 libxray.xray.observer.patch.sha256=$xrayObserverPatchHash
 libxray.xray.xhttp.patch.sha256=$xrayXhttpPatchHash
 libxray.xray.xhttp.close.patch.sha256=$xrayXhttpClosePatchHash
+libxray.xray.websocket.patch.sha256=$xrayWebSocketPatchHash
+libxray.xray.vless.cancel.patch.sha256=$xrayVlessCancelPatchHash
 libxray.measure.patch.sha256=$libXrayMeasurePatchHash
 "@ | Set-Content (Join-Path $OutputDir "libXray.properties") -Encoding ascii
 Write-Host "Copied libXray.aar to $OutputDir"

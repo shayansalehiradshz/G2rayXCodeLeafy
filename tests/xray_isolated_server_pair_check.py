@@ -105,7 +105,7 @@ def allow_owned_origins(template, ports):
 
 
 def validate(core, helper, panel, profile, transports, idle_seconds, loopback_baseline=False, runtime_log_dir=None,
-             ws_early_data_bytes=None):
+             ws_early_data_bytes=None, client_core=None):
     if ws_early_data_bytes is not None and "ws" not in transports:
         raise ValueError("WS early-data experiment requires the WS transport")
     with tempfile.TemporaryDirectory(prefix="g2ray-server-pair-") as directory:
@@ -151,6 +151,7 @@ def validate(core, helper, panel, profile, transports, idle_seconds, loopback_ba
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15)
         origins = "owned HTTP/2 origins" if loopback_baseline else "real Internet origins"
         print(f"PAIR SCOPE: generated profile={profile}; local TLS; {origins}; no public edge or Android", flush=True)
+        print(f"PAIR BINARIES: server={core}; client={client_core or core}", flush=True)
         if ws_early_data_bytes is not None:
             print(f"FIXTURE ONLY: WS early-data limit={ws_early_data_bytes}; production links/config unchanged", flush=True)
         log = (root / "server.log").open("wb") if runtime_log_dir is None else \
@@ -158,7 +159,7 @@ def validate(core, helper, panel, profile, transports, idle_seconds, loopback_ba
         if runtime_log_dir is not None:
             print(f"Private server runtime log: {log.name}; do not publish raw logs", flush=True)
         with log, running_core(core, server_path, ports.values(), log):
-            validate_client(core, bundle_path, retained_probe=helper, idle_seconds=idle_seconds,
+            validate_client(client_core or core, bundle_path, retained_probe=helper, idle_seconds=idle_seconds,
                             transports=transports, fixture_ca=certificate, loopback_baseline=loopback_baseline,
                             loopback_origin_ports=origin_ports, runtime_log_dir=runtime_log_dir)
 
@@ -167,6 +168,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("xray", type=Path, help="Verified pinned Linux Xray binary")
     parser.add_argument("retained_probe", type=Path, help="Compiled xray_retained_http_check.go helper")
+    parser.add_argument("--client-xray", type=Path,
+                        help="Separate verified Xray client binary; defaults to the server binary")
     parser.add_argument("--panel-fixture", type=Path, default=Path(__file__).with_name("g2ray_config_validation.sh"))
     parser.add_argument("--profile", choices=PROFILES, default="low_latency")
     parser.add_argument("--transport", choices=("all", "xhttp", "ws"), default="all")
@@ -188,7 +191,8 @@ def main():
         validate(arguments.xray.resolve(strict=True), arguments.retained_probe.resolve(strict=True),
                  arguments.panel_fixture.resolve(strict=True), arguments.profile, transports, arguments.idle_seconds,
                  arguments.loopback_baseline, arguments.runtime_log_dir.resolve() if arguments.runtime_log_dir else None,
-                 ws_early_data_bytes=arguments.ws_early_data_bytes)
+                 ws_early_data_bytes=arguments.ws_early_data_bytes,
+                 client_core=arguments.client_xray.resolve(strict=True) if arguments.client_xray else None)
     except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
         parser.exit(1, f"FAIL: {error}\n")
 
