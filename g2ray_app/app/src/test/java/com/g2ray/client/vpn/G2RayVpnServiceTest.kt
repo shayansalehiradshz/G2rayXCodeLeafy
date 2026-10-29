@@ -1404,6 +1404,10 @@ class G2RayVpnServiceTest {
 
     @Test
     fun liveRoutePoolKeepsAnUnmeasuredDomainFallbackForBlockedIpPaths() {
+        assertTrue(G2RayVpnService.isExplorableLiveEndpoint("edge.example"))
+        assertFalse(G2RayVpnService.isExplorableLiveEndpoint("2001:db8::1"))
+        assertFalse(G2RayVpnService.isExplorableLiveEndpoint("192.168.1.1"))
+
         val selected = liveProfile("20.0.0.1")
         val hostname = liveProfile("edge.example")
         val failed = liveProfile("20.0.0.4")
