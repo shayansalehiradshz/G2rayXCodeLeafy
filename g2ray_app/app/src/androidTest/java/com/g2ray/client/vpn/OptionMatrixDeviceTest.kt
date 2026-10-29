@@ -38,6 +38,36 @@ import java.util.concurrent.TimeUnit
 /** Opt-in real preference/service/TUN interaction checks; never edits accounts or profiles. */
 @RunWith(AndroidJUnit4::class)
 class OptionMatrixDeviceTest {
+    @Test fun loadedTrafficWithExplicitFailoverSettingRestoresPreferences() = runBlocking {
+        assumeTrue("Requires explicit liveOptions=true", args().getString("liveOptions") == "true")
+        assumeTrue("Requires explicit liveLoadedTransfers=true", args().getString("liveLoadedTransfers") == "true")
+        val enabled = requireNotNull(args().getString("optionFailover")) { "Pass optionFailover=true or false" }.toBooleanStrict()
+        val context = ApplicationProvider.getApplicationContext<G2RayApplication>()
+        stop(context)
+        val prefs = VpnEnginePreferences(context.secureStore)
+        val original = prefs.readSettings()
+        val selection = context.accountRepository.activeSelection.value
+        val raw = OPTION_KEYS.associateWith { context.secureStore.getString(it, null) }
+        val saved = backup(context)
+        check(!saved.exists()) { "Restore the previous interrupted option run first" }
+        saved.writeText(JSONObject(raw.mapValues { it.value ?: JSONObject.NULL }).toString())
+        try {
+            prefs.setSeamlessFailoverEnabled(enabled)
+            report("loaded_option seamless_failover=$enabled")
+            LiveVpnDeviceTest().selectedProfileKeepsResponsiveDuringConcurrentTransfers()
+        } finally {
+            withContext(NonCancellable) {
+                try { stop(context) } finally {
+                    context.secureStore.putStrings(raw)
+                    DiagnosticEvents.setEnabled(original.diagnosticsEnabled)
+                    assertEquals(original, prefs.readSettings())
+                    assertEquals(selection, context.accountRepository.activeSelection.value)
+                    check(saved.delete())
+                }
+            }
+        }
+    }
+
     @Test fun quickSettingsTileConnectsAndDisconnectsWithoutChangingSelection() = runBlocking {
         assumeTrue("Requires explicit liveOptions=true", args().getString("liveOptions") == "true")
         val context = ApplicationProvider.getApplicationContext<G2RayApplication>()
