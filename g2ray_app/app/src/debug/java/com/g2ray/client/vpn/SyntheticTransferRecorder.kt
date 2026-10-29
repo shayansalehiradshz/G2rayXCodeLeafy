@@ -3,7 +3,9 @@ package com.g2ray.client.vpn
 /** Test diagnostics only. Never used for ordinary user requests or in a release APK. */
 internal class SyntheticTransferRecorder(
     private val nowMs: () -> Long,
-    private val report: (String) -> Unit
+    private val report: (String) -> Unit,
+    private val identities: VpnProbeTraceIdentity? = null,
+    private val requestId: Long? = null
 ) {
     enum class Kind { Download, Upload }
 
@@ -12,9 +14,10 @@ internal class SyntheticTransferRecorder(
         fun emit(value: String) { runCatching { report(value) } }
         val started = time()
         val label = kind.name.lowercase()
+        val identity = identities?.let { "run_id=${it.runId} request_id=${requestId ?: "unknown"} " }.orEmpty()
         var outcome = "failed"
         var errorType = "none"
-        emit("event=bulk_begin kind=$label request_start_ms=${started ?: "unknown"}")
+        emit("event=bulk_begin kind=$label ${identity}request_start_ms=${started ?: "unknown"}")
         try {
             val result = transfer()
             outcome = "completed"
@@ -24,7 +27,7 @@ internal class SyntheticTransferRecorder(
             throw error
         } finally {
             val finished = time()
-            emit("event=bulk_end kind=$label outcome=$outcome error_type=$errorType " +
+            emit("event=bulk_end kind=$label outcome=$outcome error_type=$errorType $identity" +
                 "request_start_ms=${started ?: "unknown"} request_end_ms=${finished ?: "unknown"}")
         }
     }

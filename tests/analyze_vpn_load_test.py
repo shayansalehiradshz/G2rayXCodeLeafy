@@ -43,6 +43,77 @@ class AnalyzeVpnLoadTest(unittest.TestCase):
         self.assertEqual(1, result['http_stages']['example.com']['calls'])
         self.assertEqual(60, result['http_stages']['example.com']['response_headers_ms']['max'])
 
+    def test_lost_terminal_event_does_not_hide_a_completed_transfer(self):
+        result = analyzer.summarize([
+            'LIVE_VPN event=bulk_end kind=download outcome=completed request_start_ms=101 request_end_ms=199',
+            'LIVE_VPN download_bytes=8 request_start_ms=100 request_end_ms=200',
+            'LIVE_VPN download_bytes=8 request_start_ms=300 request_end_ms=400',
+            'LIVE_VPN event=bulk_end kind=upload outcome=failed request_start_ms=500 request_end_ms=600',
+            'LIVE_VPN phase=during_transfer_1 endpoint=example.com usable=true elapsed_ms=20 request_start_ms=330 request_end_ms=350'])
+        self.assertEqual(2, result['completed_transfers'])
+        self.assertEqual(1, result['failed_transfers'])
+        self.assertEqual(1, result['recovered_legacy_successes'])
+        self.assertEqual({'inside_completed_download': 1}, result['probe_hosts']['example.com']['complete_overlap'])
+
+    def test_unknown_terminal_clock_does_not_create_a_duplicate_success(self):
+        result = analyzer.summarize([
+            'LIVE_VPN event=bulk_end kind=download outcome=completed request_start_ms=unknown request_end_ms=unknown',
+            'LIVE_VPN download_bytes=8 request_start_ms=100 request_end_ms=200'])
+        self.assertEqual(1, result['completed_transfers'])
+        self.assertEqual(1, result['ambiguous_legacy_successes'])
+
+    def test_ambiguous_nested_legacy_intervals_are_flagged_not_duplicated(self):
+        result = analyzer.summarize([
+            'LIVE_VPN event=bulk_end kind=download outcome=completed request_start_ms=120 request_end_ms=180',
+            'LIVE_VPN download_bytes=8 request_start_ms=100 request_end_ms=200',
+            'LIVE_VPN download_bytes=8 request_start_ms=110 request_end_ms=190'])
+        self.assertEqual(1, result['completed_transfers'])
+        self.assertEqual(2, result['ambiguous_legacy_successes'])
+
+    def test_trace_outcomes_and_unknown_reuse_are_separate(self):
+        result = analyzer.summarize([
+            'LIVE_VPN event=http_timing endpoint=example.com outcome=completed http=204 acquired_without_connect=true stages=response_headers:40',
+            'LIVE_VPN event=http_timing endpoint=example.com outcome=failed_SocketTimeoutException http=200 acquired_without_connect=false stages=response_headers:70',
+            'LIVE_VPN event=http_timing endpoint=example.com outcome=pending http=unknown acquired_without_connect=unknown stages=call_start:0'])
+        stages = result['http_stages']['example.com']
+        self.assertEqual({'completed': 1, 'failed': 1, 'pending': 1}, stages['outcomes'])
+        self.assertEqual((1, 1, 1), (stages['acquired_without_connect'], stages['acquired_after_connect_attempt'], stages['acquisition_unknown']))
+        self.assertEqual(70, stages['response_headers_ms_by_outcome']['failed']['max'])
+
+    def test_identity_matches_terminal_even_when_its_clock_is_unknown(self):
+        identity = 'run_id=00000000-0000-0000-0000-000000000001 request_id=3'
+        result = analyzer.summarize([
+            f'LIVE_VPN event=bulk_end kind=upload outcome=completed {identity} request_start_ms=unknown request_end_ms=unknown',
+            f'LIVE_VPN upload_bytes=8 {identity} request_start_ms=100 request_end_ms=200'])
+        self.assertEqual(1, result['completed_transfers'])
+        self.assertEqual(0, result['ambiguous_legacy_successes'])
+        self.assertEqual(0, result['recovered_legacy_successes'])
+
+    def test_different_request_ids_are_not_joined_by_overlapping_timestamps(self):
+        run = 'run_id=00000000-0000-0000-0000-000000000001'
+        result = analyzer.summarize([
+            f'LIVE_VPN event=bulk_end kind=upload outcome=completed {run} request_id=1 request_start_ms=100 request_end_ms=200',
+            f'LIVE_VPN upload_bytes=8 {run} request_id=2 request_start_ms=100 request_end_ms=200'])
+        self.assertEqual(2, result['completed_transfers'])
+
+    def test_multiple_runs_are_rejected_instead_of_joining_their_clocks(self):
+        with self.assertRaisesRegex(ValueError, 'Multiple diagnostic runs'):
+            analyzer.summarize([
+                'LIVE_VPN event=bulk_end kind=upload outcome=completed run_id=00000000-0000-0000-0000-000000000001 request_id=0',
+                'LIVE_VPN event=bulk_end kind=upload outcome=completed run_id=00000000-0000-0000-0000-000000000002 request_id=0'])
+
+    def test_upload_control_summary_joins_only_the_same_request(self):
+        run = 'run_id=00000000-0000-0000-0000-000000000001'
+        result = analyzer.summarize([
+            f'LIVE_VPN event=transfer_progress {run} request_id=3 observed_bytes=20480',
+            f'LIVE_VPN event=http_timing endpoint=speed.cloudflare.com outcome=completed {run} request_id=3 elapsed_ms=501',
+            f'LIVE_VPN event=upload_control {run} request_id=3 path=tun outcome=completed expected_bytes=20480',
+            f'LIVE_VPN event=upload_control {run} request_id=4 path=socks outcome=failed expected_bytes=20480'])
+        self.assertEqual(1, result['upload_control_paths']['tun']['writer_exact_size'])
+        self.assertEqual(501, result['upload_control_paths']['tun']['complete_response_ms']['max'])
+        self.assertEqual(0, result['upload_control_paths']['socks']['writer_exact_size'])
+        self.assertEqual(0, result['upload_control_paths']['socks']['complete_response_ms']['n'])
+
     def test_never_prints_untrusted_input_or_unknown_hosts(self):
         result = analyzer.summarize([
             'LIVE_VPN phase=during_transfer_1 endpoint=secret.example usable=true error=private-secret path=private-token',

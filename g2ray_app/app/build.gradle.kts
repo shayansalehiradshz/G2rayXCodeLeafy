@@ -18,6 +18,8 @@ val libXrayBuildScript = rootProject.file("scripts/build-libxray-aar.ps1")
 val libXrayControllerPatch = rootProject.file("scripts/patches/libxray-android-controller.patch")
 val libXrayObserverPatch = rootProject.file("scripts/patches/xray-observer-detached-snapshot.patch")
 val libXrayMeasurePatch = rootProject.file("scripts/patches/libxray-measure-status.patch")
+val libXrayXhttpPatch = rootProject.file("scripts/patches/xray-xhttp-upstream-races-5ca.patch")
+val libXrayXhttpClosePatch = rootProject.file("scripts/patches/xray-xhttp-close-error-5ca.patch")
 val hevMetadataFile = file("libs/hev.properties")
 val hevJniLibsDirectory = file("src/main/jniLibs")
 val releaseRequested = gradle.startParameter.taskNames.any { it.contains("Release", ignoreCase = true) }
@@ -86,6 +88,12 @@ fun verifyLibXrayBundle(required: Boolean) {
     }
     check(sha256(libXrayMeasurePatch) == expectedMeasurePatchHash) {
         "The bundled libXray AAR was not built with the current measurement-status patch"
+    }
+    mapOf("libxray.xray.xhttp.patch.sha256" to libXrayXhttpPatch,
+        "libxray.xray.xhttp.close.patch.sha256" to libXrayXhttpClosePatch).forEach { (key, patch) ->
+        check(sha256(patch) == metadata.getProperty(key)?.trim()?.uppercase()) {
+            "The bundled libXray AAR does not attest the current $key; rebuild the native bundle"
+        }
     }
 }
 
@@ -205,6 +213,8 @@ val verifyLibXrayBuildContract = tasks.register<VerifyLibXrayBuildContractTask>(
     controllerPatch.set(libXrayControllerPatch)
     observerPatch.set(libXrayObserverPatch)
     measurePatch.set(libXrayMeasurePatch)
+    xhttpPatch.set(libXrayXhttpPatch)
+    xhttpClosePatch.set(libXrayXhttpClosePatch)
 }
 
 val verifyBundledCore = tasks.register<VerifyLibXrayBundleTask>("verifyBundledCore") {
@@ -215,6 +225,8 @@ val verifyBundledCore = tasks.register<VerifyLibXrayBundleTask>("verifyBundledCo
     controllerPatch.set(libXrayControllerPatch)
     observerPatch.set(libXrayObserverPatch)
     measurePatch.set(libXrayMeasurePatch)
+    xhttpPatch.set(libXrayXhttpPatch)
+    xhttpClosePatch.set(libXrayXhttpClosePatch)
     required.set(true)
 }
 

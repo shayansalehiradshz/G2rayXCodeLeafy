@@ -55,6 +55,12 @@ jobs:
           git -C "$tmp/libxray-src" apply "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/libxray-measure-status.patch"
           git -C "$tmp/libxray-src" apply "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/libxray-android-controller.patch"
           git -C "$tmp/Xray-core" apply "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/xray-observer-detached-snapshot.patch"
+          git -C "$tmp/Xray-core" apply --check "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/xray-xhttp-upstream-races-5ca.patch"
+          git -C "$tmp/Xray-core" apply "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/xray-xhttp-upstream-races-5ca.patch"
+          git -C "$tmp/Xray-core" apply --check "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/xray-xhttp-close-error-5ca.patch"
+          git -C "$tmp/Xray-core" apply "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/xray-xhttp-close-error-5ca.patch"
+          cp g2ray_app/scripts/fixtures/g2ray_xhttp_regression_test.go "$tmp/Xray-core/transport/internet/splithttp/g2ray_xhttp_regression_test.go"
+          (cd "$tmp/Xray-core" && go test -race ./transport/internet/splithttp -run '^TestG2RayXHTTP' -count=3 -timeout=180s)
           cp g2ray_app/scripts/fixtures/libxray_measure_status_test.go "$tmp/libxray-src/nodep/g2ray_measure_status_test.go"
           cp g2ray_app/scripts/fixtures/libxray_batch_policy_test.go "$tmp/libxray-src/xray/g2ray_batch_policy_test.go"
           cd "$tmp/libxray-src"
@@ -138,7 +144,7 @@ jobs:
             }
           done
           printf 'Validated all %s option-matrix configurations.\n' "${#option_fixtures[@]}"
-      - name: Test release-schema mapping verifier
+      - name: Test release-schema and native-bundle gates
         run: bash ./gradlew -p buildSrc test --no-daemon --console=plain
       - name: Preserve Android test and lint evidence
         if: always()
@@ -148,5 +154,6 @@ jobs:
           path: |
             g2ray_app/app/build/test-results/testDebugUnitTest/*.xml
             g2ray_app/app/build/reports/lint-results-debug.xml
+            g2ray_app/buildSrc/build/test-results/test/*.xml
           if-no-files-found: warn
           retention-days: 14

@@ -281,7 +281,12 @@ the real-device production matrix:
 
 3. Confirm `app/libs/libXray.aar` and `app/libs/libXray.properties` exist. The
    build script records the exact commit, Go version, mobile-tool revisions,
-   controller-, observer-, and measurement-patch hashes, plus the AAR SHA-256. Functional-debug and release builds
+   controller-, observer-, measurement-, XHTTP-concurrency-, and XHTTP-close-error
+   patch hashes, plus the AAR SHA-256. The XHTTP backport fixes upload buffer
+   ownership and concurrent response-body ownership without changing the core
+   version or transport tuning. The builder runs focused byte-integrity and
+   lifecycle fixtures; CI repeats them under Go's race detector.
+   Functional-debug and release builds
    reject a missing, stale, mismatched, or Java-API-incompatible core, and
    release builds also verify every bundled HEV ABI against its pinned metadata.
 4. Configure a real release keystore outside the repository. Release tasks

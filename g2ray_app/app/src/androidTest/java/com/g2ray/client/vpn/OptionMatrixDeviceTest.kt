@@ -38,9 +38,17 @@ import java.util.concurrent.TimeUnit
 /** Opt-in real preference/service/TUN interaction checks; never edits accounts or profiles. */
 @RunWith(AndroidJUnit4::class)
 class OptionMatrixDeviceTest {
-    @Test fun loadedTrafficWithExplicitFailoverSettingRestoresPreferences() = runBlocking {
+    @Test fun loadedTrafficWithExplicitFailoverSettingRestoresPreferences() = withExplicitFailover("liveLoadedTransfers") {
+        LiveVpnDeviceTest().selectedProfileKeepsResponsiveDuringConcurrentTransfers()
+    }
+
+    @Test fun uploadControlsWithExplicitFailoverSettingRestoresPreferences() = withExplicitFailover("liveUploadControls") {
+        LiveVpnDeviceTest().selectedProfileUploadsThroughTunAndSocksControls()
+    }
+
+    private fun withExplicitFailover(gate: String, test: () -> Unit) = runBlocking {
         assumeTrue("Requires explicit liveOptions=true", args().getString("liveOptions") == "true")
-        assumeTrue("Requires explicit liveLoadedTransfers=true", args().getString("liveLoadedTransfers") == "true")
+        assumeTrue("Requires explicit $gate=true", args().getString(gate) == "true")
         val enabled = requireNotNull(args().getString("optionFailover")) { "Pass optionFailover=true or false" }.toBooleanStrict()
         val context = ApplicationProvider.getApplicationContext<G2RayApplication>()
         stop(context)
@@ -54,7 +62,7 @@ class OptionMatrixDeviceTest {
         try {
             prefs.setSeamlessFailoverEnabled(enabled)
             report("loaded_option seamless_failover=$enabled")
-            LiveVpnDeviceTest().selectedProfileKeepsResponsiveDuringConcurrentTransfers()
+            test()
         } finally {
             withContext(NonCancellable) {
                 try { stop(context) } finally {

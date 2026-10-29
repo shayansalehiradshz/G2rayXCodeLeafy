@@ -29,6 +29,14 @@ public abstract class VerifyLibXrayBuildContractTask extends DefaultTask {
     @PathSensitive(PathSensitivity.RELATIVE)
     public abstract RegularFileProperty getMeasurePatch();
 
+    @InputFile
+    @PathSensitive(PathSensitivity.RELATIVE)
+    public abstract RegularFileProperty getXhttpPatch();
+
+    @InputFile
+    @PathSensitive(PathSensitivity.RELATIVE)
+    public abstract RegularFileProperty getXhttpClosePatch();
+
     @TaskAction
     public void verifyContract() throws Exception {
         String script = Files.readString(
@@ -91,6 +99,26 @@ public abstract class VerifyLibXrayBuildContractTask extends DefaultTask {
         require(!measurePatch.isBlank() && measurePatch.contains("PingHTTPRequest") &&
                 measurePatch.contains("CheckRedirect") && measurePatch.contains("StatusCode"),
             "The libXray measurement patch is empty or does not validate HTTP results.");
+        verifyXhttpContract(script,
+            Files.readString(getXhttpPatch().getAsFile().get().toPath(), StandardCharsets.UTF_8),
+            Files.readString(getXhttpClosePatch().getAsFile().get().toPath(), StandardCharsets.UTF_8));
+    }
+
+    static void verifyXhttpContract(String script, String patch, String closePatch) {
+        require(script.contains("git -C $xrayCoreDir apply --check $XrayXhttpPatch") &&
+                script.contains("git -C $xrayCoreDir apply $XrayXhttpPatch") &&
+                script.contains("git -C $xrayCoreDir apply --check $XrayXhttpClosePatch") &&
+                script.contains("git -C $xrayCoreDir apply $XrayXhttpClosePatch"),
+            "The native build must validate and apply both XHTTP patches.");
+        require(script.contains("libxray.xray.xhttp.patch.sha256=") &&
+                script.contains("libxray.xray.xhttp.close.patch.sha256="),
+            "The native build must attest both XHTTP patches.");
+        require(script.contains("go test ./transport/internet/splithttp -run '^TestG2RayXHTTP'") &&
+                script.contains("if ($LASTEXITCODE -ne 0) { throw \"The patched XHTTP"),
+            "The native build must fail when the focused XHTTP regression tests fail.");
+        require(patch.contains("+\t\tn := int(buff.Len())") && patch.contains("atomic.Bool") &&
+                patch.contains("reader.Swap(nil)"), "The XHTTP concurrency patch is missing its ownership fixes.");
+        require(closePatch.contains("+\t\treturn err2"), "The XHTTP close-error patch is empty or incomplete.");
     }
 
     private static void require(boolean condition, String message) {

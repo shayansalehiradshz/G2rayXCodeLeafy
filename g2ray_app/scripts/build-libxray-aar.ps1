@@ -12,6 +12,9 @@ $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "native-build-workspace.ps1")
 $AndroidControllerPatch = Join-Path $PSScriptRoot "patches\libxray-android-controller.patch"
 $XrayObserverPatch = Join-Path $PSScriptRoot "patches\xray-observer-detached-snapshot.patch"
+$XrayXhttpPatch = Join-Path $PSScriptRoot "patches\xray-xhttp-upstream-races-5ca.patch"
+$XrayXhttpClosePatch = Join-Path $PSScriptRoot "patches\xray-xhttp-close-error-5ca.patch"
+$XrayXhttpTests = Join-Path $PSScriptRoot "fixtures\g2ray_xhttp_regression_test.go"
 $LibXrayMeasurePatch = Join-Path $PSScriptRoot "patches\libxray-measure-status.patch"
 $LibXrayMeasureTests = Join-Path $PSScriptRoot "fixtures\libxray_measure_status_test.go"
 $LibXrayBatchTests = Join-Path $PSScriptRoot "fixtures\libxray_batch_policy_test.go"
@@ -57,6 +60,11 @@ if (-not (Test-Path -LiteralPath $AndroidControllerPatch -PathType Leaf)) {
 }
 if (-not (Test-Path -LiteralPath $XrayObserverPatch -PathType Leaf)) {
     throw "The required Xray observer patch is missing at '$XrayObserverPatch'."
+}
+foreach ($inputFile in @($XrayXhttpPatch, $XrayXhttpClosePatch, $XrayXhttpTests)) {
+    if (-not (Test-Path -LiteralPath $inputFile -PathType Leaf)) {
+        throw "A required XHTTP patch or regression fixture is missing: '$inputFile'."
+    }
 }
 if (-not (Test-Path -LiteralPath $LibXrayMeasurePatch -PathType Leaf)) {
     throw "The required libXray measurement patch is missing at '$LibXrayMeasurePatch'."
@@ -147,6 +155,23 @@ if ($LASTEXITCODE -ne 0) {
 }
 $xrayObserverPatchHash = (Get-FileHash $XrayObserverPatch -Algorithm SHA256).Hash
 Write-Host "Applied Xray observer snapshot patch $xrayObserverPatchHash at $resolvedXrayCoreRef"
+
+git -C $xrayCoreDir apply --check $XrayXhttpPatch
+if ($LASTEXITCODE -ne 0) { throw "The pinned Xray source does not accept the XHTTP concurrency patch." }
+git -C $xrayCoreDir apply $XrayXhttpPatch
+if ($LASTEXITCODE -ne 0) { throw "Could not apply the XHTTP concurrency patch." }
+git -C $xrayCoreDir apply --check $XrayXhttpClosePatch
+if ($LASTEXITCODE -ne 0) { throw "The pinned Xray source does not accept the XHTTP close-error patch." }
+git -C $xrayCoreDir apply $XrayXhttpClosePatch
+if ($LASTEXITCODE -ne 0) { throw "Could not apply the XHTTP close-error patch." }
+$xrayXhttpPatchHash = (Get-FileHash $XrayXhttpPatch -Algorithm SHA256).Hash
+$xrayXhttpClosePatchHash = (Get-FileHash $XrayXhttpClosePatch -Algorithm SHA256).Hash
+Copy-Item -LiteralPath $XrayXhttpTests -Destination (Join-Path $xrayCoreDir "transport\internet\splithttp\g2ray_xhttp_regression_test.go")
+Push-Location $xrayCoreDir
+try {
+    go test ./transport/internet/splithttp -run '^TestG2RayXHTTP' -count=1 -timeout=180s
+    if ($LASTEXITCODE -ne 0) { throw "The patched XHTTP byte-integrity, concurrency or close-error fixtures failed." }
+} finally { Pop-Location }
 
 git -C $WorkDir apply --check $LibXrayMeasurePatch
 if ($LASTEXITCODE -ne 0) {
@@ -303,6 +328,8 @@ libxray.gobind=$GomobileVersion
 libxray.android.controller.patch.sha256=$androidControllerPatchHash
 libxray.xray.ref=$resolvedXrayCoreRef
 libxray.xray.observer.patch.sha256=$xrayObserverPatchHash
+libxray.xray.xhttp.patch.sha256=$xrayXhttpPatchHash
+libxray.xray.xhttp.close.patch.sha256=$xrayXhttpClosePatchHash
 libxray.measure.patch.sha256=$libXrayMeasurePatchHash
 "@ | Set-Content (Join-Path $OutputDir "libXray.properties") -Encoding ascii
 Write-Host "Copied libXray.aar to $OutputDir"

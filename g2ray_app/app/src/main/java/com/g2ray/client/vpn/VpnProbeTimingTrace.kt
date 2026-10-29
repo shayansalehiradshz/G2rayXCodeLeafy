@@ -15,20 +15,27 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicInteger
 
 /** Captures bounded timing events; HTTP callbacks never perform diagnostic I/O. */
-internal class VpnProbeTimingTrace(private val nowMs: () -> Long) {
+internal class VpnProbeTimingTrace(
+    private val nowMs: () -> Long,
+    private val identities: VpnProbeTraceIdentity,
+    private val assignedRequestId: Long? = null
+) {
+    constructor(nowMs: () -> Long) : this(nowMs, VpnProbeTraceIdentity())
+
     private val requests = ConcurrentLinkedQueue<RequestTiming>()
     private val requestCount = AtomicInteger(0)
 
     fun listenerFor(endpoint: String): EventListener {
-        val id = requestCount.getAndIncrement()
-        if (id >= MAX_REQUESTS) return EventListener.NONE
+        val count = requestCount.getAndUpdate { if (it == Int.MAX_VALUE) it else it + 1 }
+        if (count >= MAX_REQUESTS) return EventListener.NONE
+        val id = assignedRequestId ?: identities.nextRequestId()
         val label = endpoint.takeIf { it.matches(Regex("[A-Za-z0-9._-]{1,253}")) } ?: "redacted"
         return RequestTiming(label, id).also(requests::add)
     }
 
     fun summaries(): List<String> = requests.map { it.summary() }
 
-    private inner class RequestTiming(private val endpoint: String, private val id: Int) : EventListener() {
+    private inner class RequestTiming(private val endpoint: String, private val id: Long?) : EventListener() {
         private val events = ConcurrentLinkedQueue<String>()
         private val eventCount = AtomicInteger(0)
         @Volatile private var startedAt: Long? = null
@@ -77,7 +84,7 @@ internal class VpnProbeTimingTrace(private val nowMs: () -> Long) {
 
         override fun connectionAcquired(call: Call, connection: Connection) {
             // This identifies an OkHttp connection, never an Xray outbound.
-            connectionId = System.identityHashCode(connection)
+            connectionId = identities.connectionId(connection)
             connectionProtocol = connection.protocol()
             acquiredWithoutConnect = !connectAttempted
             record("connection_acquired")
@@ -126,8 +133,10 @@ internal class VpnProbeTimingTrace(private val nowMs: () -> Long) {
             val elapsed = if (start == null || end == null) "unknown" else (end - start).coerceAtLeast(0L).toString()
             val stages = events.joinToString(",")
             return "endpoint=$endpoint outcome=$outcome elapsed_ms=$elapsed " +
-                "request_id=$id request_start_ms=${start ?: "unknown"} request_end_ms=${finishedAt ?: "unknown"} " +
+                "run_id=${identities.runId} request_id=${id ?: "unknown"} " +
+                "request_start_ms=${start ?: "unknown"} request_end_ms=${finishedAt ?: "unknown"} " +
                 "connection_id=${connectionId ?: "unknown"} protocol=${connectionProtocol ?: "unknown"} " +
+                "connections_capped=${identities.connectionsCapped} " +
                 "acquired_without_connect=${acquiredWithoutConnect ?: "unknown"} " +
                 "http=${responseCode ?: "unknown"} response_bytes=${responseBytes ?: "unknown"} " +
                 "call_cancelled=${terminalCallCancelled ?: "unknown"} " +

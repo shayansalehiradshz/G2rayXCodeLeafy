@@ -47,6 +47,7 @@ import java.io.ByteArrayInputStream
 import java.io.IOException
 import java.io.InputStream
 import java.net.Proxy
+import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.Collections
 import java.util.concurrent.TimeUnit
@@ -82,6 +83,8 @@ import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class LiveVpnDeviceTest {
+    private val traceIdentity = VpnProbeTraceIdentity()
+
     @Test
     fun debugDataPathClientAttachesPerRequestTimingWithoutNetworkAccess() = runBlocking {
         assertTrue("This regression requires the actual debug client", com.g2ray.client.BuildConfig.DEBUG)
@@ -466,6 +469,13 @@ class LiveVpnDeviceTest {
     }
 
     @Test
+    fun selectedProfileUploadsThroughTunAndSocksControls() {
+        assumeTrue("Upload controls require -e liveUploadControls true",
+            InstrumentationRegistry.getArguments().getString("liveUploadControls") == "true")
+        runLiveTest(acceptanceCheck = { context, client -> verifyUploadControls(context, client) })
+    }
+
+    @Test
     fun deviceShellScriptExecutesMultipleCommandsThroughStdin() {
         assumeTrue("Bidirectional shell commands require Android 12 or newer",
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
@@ -543,6 +553,7 @@ class LiveVpnDeviceTest {
             // No SOCKS proxy, socket protection, or underlying-network binding:
             // these requests must traverse Android's default full-device VPN.
             .proxy(Proxy.NO_PROXY)
+            .strictSyntheticRequests()
             .connectionPool(ConnectionPool(5, 10, TimeUnit.MINUTES))
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(20, TimeUnit.SECONDS)
@@ -723,6 +734,7 @@ class LiveVpnDeviceTest {
                     client.dispatcher.cancelAll()
                     client.connectionPool.evictAll()
                     client.dispatcher.executorService.shutdown()
+                    traceIdentity.releaseConnections()
                     val mobileRxAfter = TrafficStats.getMobileRxBytes()
                     val mobileTxAfter = TrafficStats.getMobileTxBytes()
                     if (mobileRxBefore >= 0L && mobileTxBefore >= 0L &&
@@ -979,7 +991,8 @@ class LiveVpnDeviceTest {
         var responsive = 0
         for ((url, status) in endpoints) {
             val started = SystemClock.elapsedRealtime()
-            val trace = VpnProbeTimingTrace(SystemClock::elapsedRealtime)
+            val requestId = traceIdentity.nextRequestId()
+            val trace = VpnProbeTimingTrace(SystemClock::elapsedRealtime, traceIdentity, requestId)
             try {
                 client.newCall(Request.Builder().url(url).header("Cache-Control", "no-store")
                     .tag(VpnProbeTimingTrace::class.java, trace).build())
@@ -993,13 +1006,13 @@ class LiveVpnDeviceTest {
                             responsive++
                             onResponsiveRequest(started, finished)
                         }
-                        report("phase=$phase endpoint=${url.substringAfter("https://").substringBefore('/')} " +
+                        report("phase=$phase ${correlation(requestId)} endpoint=${url.substringAfter("https://").substringBefore('/')} " +
                             "http=${response.code} usable=$valid responsive=$fast elapsed_ms=$elapsedMs " +
                             "request_start_ms=$started request_end_ms=$finished")
                     }
             } catch (error: Exception) {
                 val finished = SystemClock.elapsedRealtime()
-                report("phase=$phase endpoint=${url.substringAfter("https://").substringBefore('/')} " +
+                report("phase=$phase ${correlation(requestId)} endpoint=${url.substringAfter("https://").substringBefore('/')} " +
                     "error=${error.javaClass.simpleName} elapsed_ms=${finished - started} " +
                     "request_start_ms=$started request_end_ms=$finished")
             } finally {
@@ -1024,11 +1037,11 @@ class LiveVpnDeviceTest {
         onCompletedRequest: (Long, Long) -> Unit = { _, _ -> }
     ) {
         // A failed transfer must not silently consume another copy of the budget.
-        val transferClient = client.newBuilder().retryOnConnectionFailure(false)
-            .followRedirects(false).followSslRedirects(false).build()
+        val transferClient = client.newBuilder().strictSyntheticRequests().build()
         val nonce = SystemClock.elapsedRealtimeNanos()
         val started = SystemClock.elapsedRealtime()
-        recordBulkRequest(SyntheticTransferRecorder.Kind.Download) { trace ->
+        val downloadId = traceIdentity.nextRequestId()
+        recordBulkRequest(SyntheticTransferRecorder.Kind.Download, downloadId) { trace, progress ->
             transferClient.newCall(Request.Builder()
                 .url("https://speed.cloudflare.com/__down?bytes=$downloadBytes&nonce=$nonce")
                 .tag(VpnProbeTimingTrace::class.java, trace)
@@ -1037,48 +1050,144 @@ class LiveVpnDeviceTest {
                 .build()).execute().use { response ->
                     assertEquals("Download endpoint rejected the transfer", 200, response.code)
                     val body = response.body ?: throw IOException("Download response has no body")
-                    body.byteStream().use { readTransferBody(it, downloadBytes) }
+                    body.byteStream().use { readTransferBody(it, downloadBytes, progress, downloadId) }
             }
         }
         val downloadFinished = SystemClock.elapsedRealtime()
         onCompletedRequest(started, downloadFinished)
-        report("download_bytes=$downloadBytes elapsed_ms=${downloadFinished - started} " +
+        report("download_bytes=$downloadBytes ${correlation(downloadId)} elapsed_ms=${downloadFinished - started} " +
             "request_start_ms=$started request_end_ms=$downloadFinished")
         val payload = ByteArray(uploadBytes) { (it and 0xff).toByte() }
         val uploadStarted = SystemClock.elapsedRealtime()
-        recordBulkRequest(SyntheticTransferRecorder.Kind.Upload) { trace ->
+        val uploadId = traceIdentity.nextRequestId()
+        recordBulkRequest(SyntheticTransferRecorder.Kind.Upload, uploadId) { trace, progress ->
             transferClient.newCall(Request.Builder()
                 .url("https://speed.cloudflare.com/__up?nonce=$nonce")
                 .tag(VpnProbeTimingTrace::class.java, trace)
-                .post(payload.toRequestBody("application/octet-stream".toMediaType()))
+                .post(SyntheticProgressRequestBody(payload.toRequestBody("application/octet-stream".toMediaType()), progress))
                 .build()).execute().use { response ->
                     assertTrue("Upload endpoint rejected the transfer: HTTP ${response.code}", response.isSuccessful)
             }
         }
         val uploadFinished = SystemClock.elapsedRealtime()
         onCompletedRequest(uploadStarted, uploadFinished)
-        report("upload_bytes=$uploadBytes elapsed_ms=${uploadFinished - uploadStarted} " +
+        report("upload_bytes=$uploadBytes ${correlation(uploadId)} elapsed_ms=${uploadFinished - uploadStarted} " +
             "request_start_ms=$uploadStarted request_end_ms=$uploadFinished")
     }
 
     private fun <T> recordBulkRequest(
         kind: SyntheticTransferRecorder.Kind,
-        transfer: (VpnProbeTimingTrace) -> T
+        requestId: Long?,
+        transfer: (VpnProbeTimingTrace, SyntheticTransferProgress) -> T
     ): T {
-        val trace = VpnProbeTimingTrace(SystemClock::elapsedRealtime)
+        val trace = VpnProbeTimingTrace(SystemClock::elapsedRealtime, traceIdentity, requestId)
+        val progress = SyntheticTransferProgress(SystemClock::elapsedRealtime)
         try {
-            return SyntheticTransferRecorder(SystemClock::elapsedRealtime, ::report)
-                .record(kind) { transfer(trace) }
+            return SyntheticTransferRecorder(SystemClock::elapsedRealtime, ::report, traceIdentity, requestId)
+                .record(kind) { transfer(trace, progress) }
         } finally {
             // No diagnostic I/O in HTTP callbacks, and no reporter failure may
             // replace the original transfer/cancellation exception.
             runCatching {
+                report("event=transfer_progress kind=${kind.name.lowercase()} ${correlation(requestId)} ${progress.summary()}")
                 trace.summaries().forEach { report("event=http_timing phase=bulk_${kind.name.lowercase()} $it") }
             }
         }
     }
 
-    private fun readTransferBody(input: InputStream, expectedBytes: Int): Int {
+    private fun correlation(requestId: Long?): String =
+        "run_id=${traceIdentity.runId} request_id=${requestId ?: "unknown"}"
+
+    private suspend fun verifyUploadControls(context: Context, client: OkHttpClient) = withContext(Dispatchers.IO) {
+        val args = InstrumentationRegistry.getArguments()
+        require(args.getString("smallProbesOnly") == "true") { "Controls have their own explicit upload budget" }
+        val samples = (args.getString("uploadSamples") ?: "4").toInt().also { require(it in 1..12) }
+        val size = (args.getString("uploadMiB") ?: "2").toInt().also { require(it in 1..8) } * 1024 * 1024
+        val socksFirst = when (args.getString("controlOrder")) {
+            null, "tun-first" -> false
+            "socks-first" -> true
+            else -> error("controlOrder must be tun-first or socks-first")
+        }
+        val service = requireNotNull(SocketProtector.vpnService)
+        val core = G2RayVpnService::class.java.getDeclaredField("core").apply { isAccessible = true }
+            .get(service) as XrayCoreManager
+        val port = requireNotNull(core.activeSocksPort())
+        val connectivity = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        fun requireSameTunnel() {
+            check(SocketProtector.vpnService === service && core.activeSocksPort() == port) {
+                "Runtime changed during the matched upload comparison"
+            }
+            check(connectivity.getNetworkCapabilities(connectivity.activeNetwork)
+                ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) { "Full VPN routing was lost" }
+        }
+        val socks = client.newBuilder().strictSyntheticRequests()
+            .proxy(Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", port)))
+            .connectionPool(ConnectionPool(5, 10, TimeUnit.MINUTES)).build()
+        val payload = ByteArray(size) { (it and 255).toByte() }
+        var failed = 0
+        var attempted = 0
+        report("event=upload_control_budget samples_per_path=$samples upload_bytes_each=$size " +
+            "payload_budget_bytes=${2L * samples * size} same_core=true no_direct_egress=true")
+        try {
+            repeat(samples) { index ->
+                val paths = listOf("tun" to client, "socks" to socks).let {
+                    if ((index % 2 == 0) == socksFirst) it.reversed() else it
+                }
+                for ((path, pathClient) in paths) {
+                    coroutineContext.ensureActive()
+                    requireSameTunnel()
+                    val generation = SocketProtector.underlyingNetworkGeneration()
+                    val id = traceIdentity.nextRequestId()
+                    attempted++
+                    try {
+                        recordBulkRequest(SyntheticTransferRecorder.Kind.Upload, id) { trace, progress ->
+                            val request = Request.Builder()
+                                .url("https://speed.cloudflare.com/__up?nonce=${SystemClock.elapsedRealtimeNanos()}")
+                                .tag(VpnProbeTimingTrace::class.java, trace)
+                                .post(SyntheticProgressRequestBody(
+                                    payload.toRequestBody("application/octet-stream".toMediaType()), progress))
+                                .build()
+                            pathClient.newCall(request).execute().use { response ->
+                                check(response.code == 200) { "Synthetic upload rejected" }
+                                response.body?.byteStream()?.use { input ->
+                                    val buffer = ByteArray(65_537)
+                                    var count = 0
+                                    while (count < buffer.size) {
+                                        val next = input.read(buffer, count, buffer.size - count)
+                                        if (next < 0) break
+                                        count += next
+                                    }
+                                    check(count <= 65_536) { "Synthetic upload response exceeded budget" }
+                                }
+                            }
+                        }
+                        report("event=upload_control ${correlation(id)} path=$path attempt=${index + 1} " +
+                            "outcome=completed expected_bytes=$size network_generation=$generation")
+                    } catch (error: Exception) {
+                        coroutineContext.ensureActive()
+                        failed++
+                        report("event=upload_control ${correlation(id)} path=$path attempt=${index + 1} " +
+                            "outcome=failed error_type=${error.javaClass.simpleName} expected_bytes=$size " +
+                            "network_generation=$generation")
+                    }
+                    requireSameTunnel()
+                    check(generation == SocketProtector.underlyingNetworkGeneration()) {
+                        "Physical network changed during a matched upload; do not attribute it to TUN"
+                    }
+                }
+                assertResponsiveQuorum(probeHttpsQuorum(client, "after_upload_pair_${index + 1}"), "after_upload_pair")
+            }
+            report("event=upload_control_acceptance attempts=$attempted failed=$failed")
+            assertEquals("Matched upload attempts failed; inspect per-call progress without discarding failures", 0, failed)
+        } finally {
+            socks.connectionPool.evictAll()
+        }
+    }
+
+    private fun readTransferBody(
+        input: InputStream, expectedBytes: Int,
+        progress: SyntheticTransferProgress? = null, requestId: Long? = null
+    ): Int {
         require(expectedBytes > 0)
         var total = 0
         val buffer = ByteArray(8 * 1024)
@@ -1087,12 +1196,13 @@ class LiveVpnDeviceTest {
                 val count = input.read(buffer, 0, minOf(buffer.size, expectedBytes - total + 1))
                 if (count == -1) break
                 total += count
+                progress?.advance(count.toLong())
                 if (total > expectedBytes) throw IOException("Download response exceeded the byte budget")
             }
             if (total != expectedBytes) throw IOException("Download response was truncated: $total/$expectedBytes bytes")
             return total
         } finally {
-            runCatching { report("event=download_body received_bytes=$total expected_bytes=$expectedBytes") }
+            runCatching { report("event=download_body ${correlation(requestId)} received_bytes=$total expected_bytes=$expectedBytes") }
         }
     }
 
