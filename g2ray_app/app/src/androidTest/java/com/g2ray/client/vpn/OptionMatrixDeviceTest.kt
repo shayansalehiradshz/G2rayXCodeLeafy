@@ -41,6 +41,9 @@ class OptionMatrixDeviceTest {
     @Test fun integrityWithExplicitFailoverSettingRestoresPreferences() = withExplicitFailover("liveIntegrity") {
         LiveVpnDeviceTest().selectedProfileVerifiesSyntheticIntegrity()
     }
+    @Test fun videoWithExplicitFailoverSettingRestoresPreferences() = withExplicitFailover("liveVideo") {
+        LiveVpnDeviceTest().selectedProfilePlaysBoundedYoutubeSample()
+    }
     @Test fun loadedTrafficWithExplicitFailoverSettingRestoresPreferences() = withExplicitFailover("liveLoadedTransfers") {
         LiveVpnDeviceTest().selectedProfileKeepsResponsiveDuringConcurrentTransfers()
     }

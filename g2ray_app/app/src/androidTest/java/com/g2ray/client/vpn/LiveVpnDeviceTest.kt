@@ -556,6 +556,18 @@ class LiveVpnDeviceTest {
                 factors.groupValues[1].toInt(), factors.groupValues[2].toInt(), factors.groupValues[3].toInt())
             else -> error("Unknown controlled XHTTP tuning variant")
         }
+        fun assertControlledRuntimeIdentity() {
+            if (tuning == "saved") return
+            val service = requireNotNull(SocketProtector.vpnService)
+            val actual = G2RayVpnService::class.java.getDeclaredField("activeProfile")
+                .apply { isAccessible = true }.get(service)
+            assertTrue("Controlled comparison changed route or tuning during recovery", actual == profile)
+            val extraHash = profile.xhttpExtraJson?.let {
+                java.security.MessageDigest.getInstance("SHA-256").digest(it.toByteArray())
+                    .joinToString("") { byte -> "%02x".format(byte) }
+            } ?: "absent"
+            report("event=controlled_runtime_identity matched=true extra_sha256=$extraHash")
+        }
         report("event=profile_variant xhttp_tuning=$tuning " +
             "extra_present=${profile.xhttpExtraJson != null} saved_profile_unchanged=true")
         assertTrue("UI startup uses the selected profile, not a transport override",
@@ -690,7 +702,9 @@ class LiveVpnDeviceTest {
                 return@runBlocking
             }
             if (acceptanceCheck != null) {
+                assertControlledRuntimeIdentity()
                 acceptanceCheck(context, client)
+                assertControlledRuntimeIdentity()
                 return@runBlocking
             }
             if (coreFailureCycles > 0) {

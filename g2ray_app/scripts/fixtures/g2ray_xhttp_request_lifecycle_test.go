@@ -227,3 +227,61 @@ func TestG2RayXHTTPStreamUpCloseOwnsBothRequests(t *testing.T) {
 	for i, r := range c.reads { if r.closes.Load() != 1 { t.Fatalf("request %d was not closed", i) } }
 	if manager.xmuxClients[0].Running.Load() != 0 { t.Fatal("retained running-stream reference") }
 }
+
+func TestG2RayXHTTPCanceledPoolWaiterLeavesNextRequestUsable(t *testing.T) {
+	s := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		io.WriteString(w, "ready")
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	s.EnableHTTP2 = true
+	s.StartTLS()
+	defer s.Close()
+	u, _ := url.Parse(s.URL)
+	host, port, _ := net.SplitHostPort(u.Host)
+	p, _ := strconv.Atoi(port)
+	certHash := sha256.Sum256(s.Certificate().Raw)
+	settings := &internet.MemoryStreamConfig{ProtocolName: "splithttp", ProtocolSettings: &Config{},
+		SecurityType: "tls", SecuritySettings: &xtls.Config{PinnedPeerCertSha256: [][]byte{certHash[:]}, NextProtocol: []string{"h2"}}}
+	c := createHTTPClient(xnet.TCPDestination(xnet.IPAddress(net.ParseIP(host)), xnet.Port(p)), settings).(*DefaultDialerClient)
+	defer c.Close()
+	h2 := c.client.Transport.(*http2.Transport)
+	original := h2.DialTLSContext
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	var attempts atomic.Int32
+	h2.DialTLSContext = func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+		attempts.Add(1)
+		once.Do(func(){ close(started) })
+		select {
+		case <-release: return original(ctx, network, addr, cfg)
+		case <-ctx.Done(): return nil, ctx.Err()
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	first := make(chan error, 1)
+	go func(){ r, _, _, err := c.OpenStream(ctx, s.URL, "", nil, false); if r != nil { r.Close() }; first <- err }()
+	<-started
+	type result struct { r io.ReadCloser; err error }
+	second := make(chan result, 1)
+	go func(){ r, _, _, err := c.OpenStream(context.Background(), s.URL, "", nil, false); second <- result{r, err} }()
+	cancel()
+	select {
+	case err := <-first: if !errors.Is(err, context.Canceled) { t.Fatalf("wrong error: %v", err) }
+	case <-time.After(time.Second): t.Fatal("canceled pool waiter did not return")
+	}
+	close(release)
+	select {
+	case got := <-second:
+		if got.err != nil { t.Fatal(got.err) }
+		defer got.r.Close()
+		b := make([]byte, 5)
+		if _, err := io.ReadFull(got.r, b); err != nil || string(b) != "ready" { t.Fatalf("other waiter lost shared dial: %q %v", b, err) }
+	case <-time.After(3*time.Second): t.Fatal("other pool waiter stayed blocked")
+	}
+	// The transport may discard an unneeded pending dial and create a new one;
+	// that is not a lost active stream. The next request must still complete.
+	if attempts.Load() > 2 || c.IsClosed() { t.Fatalf("pool ownership: attempts=%d closed=%v", attempts.Load(), c.IsClosed()) }
+}
