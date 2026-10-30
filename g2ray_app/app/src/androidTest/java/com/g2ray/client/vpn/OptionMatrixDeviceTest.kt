@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.VpnService
+import android.net.Uri
 import android.os.Bundle
 import android.os.Debug
 import android.os.ParcelFileDescriptor
@@ -38,6 +39,34 @@ import java.util.concurrent.TimeUnit
 /** Opt-in real preference/service/TUN interaction checks; never edits accounts or profiles. */
 @RunWith(AndroidJUnit4::class)
 class OptionMatrixDeviceTest {
+    /** Owner-approved setup action, never part of unattended acceptance runs. */
+    @Test fun saveApprovedTuningAsSeparateSelectedProfile() = runBlocking {
+        assumeTrue("Requires separate owner approval and saveApprovedTuning=true",
+            args().getString("liveOptions") == "true" && args().getString("saveApprovedTuning") == "true")
+        val context = ApplicationProvider.getApplicationContext<G2RayApplication>()
+        stop(context)
+        val repository = context.accountRepository
+        assertNull(repository.loadError.value)
+        val selection = repository.activeSelection.value
+        val originalProfiles = repository.profiles.value.toList()
+        val originalKeys = repository.apiKeys.value.toList()
+        val originalSettings = VpnEnginePreferences(context.secureStore).readSettings()
+        val selected = originalProfiles.first { it.id == selection.profileId && it.accountId == selection.accountId }
+        val source = originalProfiles.first { it.accountId == selected.accountId && it.address == selected.address && it.transport == Transport.XHTTP }
+        val variant = SyntheticProfileVariants.controlledXhttp(VlessUriParser.parse(source.rawUri).getOrThrow(), 1_000_000, 30, 20)
+        val label = "Mobile checked XHTTP 1M-30-20"
+        val renamed = VlessUriParser.parse(Uri.parse(variant.rawUri).buildUpon().fragment(label).build().toString()).getOrThrow()
+        assertTrue("Setup changed fields other than the approved label", renamed.copy(rawUri = variant.rawUri, name = variant.name) == variant)
+        val saved = repository.importProfile(selected.accountId, label, renamed.rawUri, renamed)
+        assertTrue("Setup overwrote an original config", originalProfiles.all { original -> repository.profiles.value.any { it == original } })
+        assertTrue("Setup changed wake credentials", repository.apiKeys.value == originalKeys)
+        assertTrue("Setup changed settings", VpnEnginePreferences(context.secureStore).readSettings() == originalSettings)
+        assertTrue("Setup changed account or key selection", repository.activeSelection.value == selection)
+        repository.selectProfile(saved.id)
+        assertTrue("Approved copy was not selected", repository.activeSelection.value == selection.copy(profileId = saved.id))
+        report("approved_tuning_copy selected=true originals_preserved=true credentials_unchanged=true settings_unchanged=true")
+    }
+
     @Test fun integrityWithExplicitFailoverSettingRestoresPreferences() = withExplicitFailover("liveIntegrity") {
         LiveVpnDeviceTest().selectedProfileVerifiesSyntheticIntegrity()
     }
