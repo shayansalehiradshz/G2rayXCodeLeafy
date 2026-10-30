@@ -1782,8 +1782,8 @@ async function waitForXhttpRoute(name, port, env, initialProbe = null, startedAt
       last.stable_probes = stableProbes;
       if (stableProbes >= ROUTE_READY_STABLE_PROBES) return last;
       if (stableSleepMs > 0) {
-        const delay = Math.min(stableSleepMs, Math.max(0, deadline - Date.now()));
-        if (delay > 0) await sleep(delay);
+        if (Date.now() + stableSleepMs >= deadline) break;
+        await sleep(stableSleepMs);
       }
       continue;
     }

@@ -1323,6 +1323,62 @@ async function testWakeRequiresStableRouteReadiness() {
   console.log("PASS: Worker rejects transient single route success");
 }
 
+async function testRouteDeadlineNeverShortensRequiredStabilityWindow() {
+  const originalNow = Date.now;
+  const originalSetTimeout = globalThis.setTimeout;
+  const previousFetch = globalThis.fetch;
+  for (const path of ["/api/health", "/api/wake"]) {
+    let now = originalNow();
+    let routeCalls = 0;
+    const shortenedSleeps = [];
+    Date.now = () => now;
+    // A timer may fire just before its requested wall-clock boundary. The
+    // remaining ten milliseconds must not replace the required 25 ms gap.
+    globalThis.setTimeout = (callback, ms, ...args) => {
+      if (ms > 0 && ms < 25) {
+        shortenedSleeps.push(ms);
+        now += ms - 1;
+        return originalSetTimeout(callback, 0, ...args);
+      }
+      return originalSetTimeout(callback, ms, ...args);
+    };
+    globalThis.fetch = async (input) => {
+      const url = String(input);
+      if (url.includes("api.github.com")) {
+        assert.equal(url.includes("/start"), false, "A warm host must not be started again");
+        return new Response(JSON.stringify({ name: "behavior-space", state: "Available", pending_operation: false }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+      if (url.includes("app.github.dev")) {
+        routeCalls += 1;
+        if (routeCalls === 1) now += 40;
+        return new Response("", { status: 200 });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    };
+    try {
+      const response = await worker.fetch(makeRequest(path), baseEnv({
+        ROUTE_WAIT_MS: "50", ROUTE_READY_STABLE_SLEEP_MS: "25"
+      }), {});
+      const body = await responseJson(response);
+      assert.equal(response.status, path === "/api/wake" ? 202 : 200);
+      assert.equal(body.route_ready, false);
+      assert.equal(body.route_probe.usable, true);
+      assert.equal(body.route_probe.stable_probes, 1);
+      assert.equal(body.route_probe.route_failure_reason, "route_stability_not_confirmed");
+      assert.equal(routeCalls, 1);
+      assert.deepEqual(shortenedSleeps, []);
+      console.log(`PASS: Worker ${path} never shortens the required route-stability gap near its deadline`);
+    } finally {
+      Date.now = originalNow;
+      globalThis.setTimeout = originalSetTimeout;
+      globalThis.fetch = previousFetch;
+    }
+  }
+}
+
 async function testHealthWaitsBetweenStableRouteProbes() {
   const routeCallTimes = [];
   globalThis.fetch = async (input) => {
@@ -2608,6 +2664,7 @@ try {
   await testHealthRejectsHttp400RouteAsUnusable();
   await testOptionalPortCannotMasqueradeAsPrimaryXhttpReadiness();
   await testWakeRequiresStableRouteReadiness();
+  await testRouteDeadlineNeverShortensRequiredStabilityWindow();
   await testHealthWaitsBetweenStableRouteProbes();
   await testRouteFetchTimeoutOverrideIsApplied();
   await testHealthDoesNotClaimReadyFromSingleDeadlineProbe();
