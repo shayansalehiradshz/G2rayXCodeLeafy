@@ -15,6 +15,10 @@ $XrayObserverPatch = Join-Path $PSScriptRoot "patches\xray-observer-detached-sna
 $XrayXhttpPatch = Join-Path $PSScriptRoot "patches\xray-xhttp-upstream-races-5ca.patch"
 $XrayXhttpClosePatch = Join-Path $PSScriptRoot "patches\xray-xhttp-close-error-5ca.patch"
 $XrayXhttpTests = Join-Path $PSScriptRoot "fixtures\g2ray_xhttp_regression_test.go"
+$XrayXhttpLifecyclePatch = Join-Path $PSScriptRoot "patches\xray-xhttp-lifecycle-5ca.patch"
+$XrayXhttpDialTests = Join-Path $PSScriptRoot "fixtures\g2ray_xhttp_dial_regression_test.go"
+$XrayXhttpRequestTests = Join-Path $PSScriptRoot "fixtures\g2ray_xhttp_request_lifecycle_test.go"
+$XrayVlessXhttpTests = Join-Path $PSScriptRoot "fixtures\g2ray_vless_xhttp_cancel_test.go"
 $XrayWebSocketPatch = Join-Path $PSScriptRoot "patches\xray-websocket-integrity-5ca.patch"
 $XrayWebSocketTests = Join-Path $PSScriptRoot "fixtures\g2ray_ws_regression_test.go"
 $XrayVlessCancelPatch = Join-Path $PSScriptRoot "patches\xray-vless-cancel-5ca.patch"
@@ -66,7 +70,8 @@ if (-not (Test-Path -LiteralPath $AndroidControllerPatch -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $XrayObserverPatch -PathType Leaf)) {
     throw "The required Xray observer patch is missing at '$XrayObserverPatch'."
 }
-foreach ($inputFile in @($XrayXhttpPatch, $XrayXhttpClosePatch, $XrayXhttpTests)) {
+foreach ($inputFile in @($XrayXhttpPatch, $XrayXhttpClosePatch, $XrayXhttpTests,
+    $XrayXhttpLifecyclePatch, $XrayXhttpDialTests, $XrayXhttpRequestTests, $XrayVlessXhttpTests)) {
     if (-not (Test-Path -LiteralPath $inputFile -PathType Leaf)) {
         throw "A required XHTTP patch or regression fixture is missing: '$inputFile'."
     }
@@ -191,13 +196,21 @@ if ($LASTEXITCODE -ne 0) { throw "The pinned Xray source does not accept the VLE
 git -C $xrayCoreDir apply $XrayVlessCancelPatch
 if ($LASTEXITCODE -ne 0) { throw "Could not apply the VLESS cancellation patch." }
 $xrayVlessCancelPatchHash = (Get-FileHash $XrayVlessCancelPatch -Algorithm SHA256).Hash
+git -C $xrayCoreDir apply --check $XrayXhttpLifecyclePatch
+if ($LASTEXITCODE -ne 0) { throw "The pinned Xray source does not accept the XHTTP lifecycle patch." }
+git -C $xrayCoreDir apply $XrayXhttpLifecyclePatch
+if ($LASTEXITCODE -ne 0) { throw "Could not apply the XHTTP lifecycle patch." }
+$xrayXhttpLifecyclePatchHash = (Get-FileHash $XrayXhttpLifecyclePatch -Algorithm SHA256).Hash
 Copy-Item -LiteralPath $XrayXhttpTests -Destination (Join-Path $xrayCoreDir "transport\internet\splithttp\g2ray_xhttp_regression_test.go")
+Copy-Item -LiteralPath $XrayXhttpDialTests -Destination (Join-Path $xrayCoreDir "transport\internet\splithttp\g2ray_xhttp_dial_regression_test.go")
+Copy-Item -LiteralPath $XrayXhttpRequestTests -Destination (Join-Path $xrayCoreDir "transport\internet\splithttp\g2ray_xhttp_request_lifecycle_test.go")
+Copy-Item -LiteralPath $XrayVlessXhttpTests -Destination (Join-Path $xrayCoreDir "proxy\vless\outbound\g2ray_vless_xhttp_cancel_test.go")
 Copy-Item -LiteralPath $XrayWebSocketTests -Destination (Join-Path $xrayCoreDir "transport\internet\websocket\g2ray_ws_regression_test.go")
 Copy-Item -LiteralPath $XrayRetryTests -Destination (Join-Path $xrayCoreDir "common\retry\g2ray_retry_regression_test.go")
 Copy-Item -LiteralPath $XrayVlessCancelTests -Destination (Join-Path $xrayCoreDir "proxy\vless\outbound\g2ray_vless_cancel_test.go")
 Push-Location $xrayCoreDir
 try {
-    go test ./transport/internet/splithttp -run '^TestG2RayXHTTP' -count=1 -timeout=180s
+    go test ./transport/internet/splithttp -run '^TestG2RayX' -count=1 -timeout=180s
     if ($LASTEXITCODE -ne 0) { throw "The patched XHTTP byte-integrity, concurrency or close-error fixtures failed." }
     go test ./transport/internet/websocket -run '^TestG2RayWS' -count=1 -timeout=90s
     if ($LASTEXITCODE -ne 0) { throw "The patched WebSocket integrity or deadline fixtures failed." }
@@ -364,6 +377,7 @@ libxray.xray.xhttp.patch.sha256=$xrayXhttpPatchHash
 libxray.xray.xhttp.close.patch.sha256=$xrayXhttpClosePatchHash
 libxray.xray.websocket.patch.sha256=$xrayWebSocketPatchHash
 libxray.xray.vless.cancel.patch.sha256=$xrayVlessCancelPatchHash
+libxray.xray.xhttp.lifecycle.patch.sha256=$xrayXhttpLifecyclePatchHash
 libxray.measure.patch.sha256=$libXrayMeasurePatchHash
 "@ | Set-Content (Join-Path $OutputDir "libXray.properties") -Encoding ascii
 Write-Host "Copied libXray.aar to $OutputDir"

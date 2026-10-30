@@ -12,7 +12,7 @@ public class VerifyLibXrayBuildContractTaskTest {
         git -C $xrayCoreDir apply $XrayXhttpClosePatch
         libxray.xray.xhttp.patch.sha256=hash
         libxray.xray.xhttp.close.patch.sha256=hash
-        go test ./transport/internet/splithttp -run '^TestG2RayXHTTP'
+        go test ./transport/internet/splithttp -run '^TestG2RayX'
         if ($LASTEXITCODE -ne 0) { throw "The patched XHTTP
         """;
     private final String patch = "+\t\tn := int(buff.Len())\natomic.Bool\nreader.Swap(nil)";
@@ -33,6 +33,34 @@ public class VerifyLibXrayBuildContractTaskTest {
         if ($LASTEXITCODE -ne 0) { throw "The patched VLESS
         """;
     private final String vlessPatch = "ExponentialBackoffContext(ctx, 5, 200) case <-r.ctx.Done(): r.ctx.Err()";
+    private final String lifecycleScript = """
+        git -C $xrayCoreDir apply --check $XrayXhttpLifecyclePatch
+        git -C $xrayCoreDir apply $XrayXhttpLifecyclePatch
+        libxray.xray.xhttp.lifecycle.patch.sha256=hash
+        g2ray_xhttp_request_lifecycle_test.go
+        g2ray_vless_xhttp_cancel_test.go
+        go test ./transport/internet/splithttp -run '^TestG2RayX'
+        """;
+    private final String lifecyclePatch = "context.WithTimeout(ctxInner, 8*time.Second) _ = rawConn.Close() case <-ctx.Done(): onClose: cancelRequest cancelStream()";
+
+    @Test public void acceptsCompleteXhttpLifecycleContract() {
+        VerifyLibXrayBuildContractTask.verifyXhttpLifecycleContract(lifecycleScript, lifecyclePatch);
+    }
+
+    @Test public void rejectsMissingXhttpLifecycleBuildStep() {
+        for (String line : lifecycleScript.strip().split("\n")) {
+            assertThrows(line, GradleException.class, () ->
+                VerifyLibXrayBuildContractTask.verifyXhttpLifecycleContract(lifecycleScript.replace(line, ""), lifecyclePatch));
+        }
+    }
+
+    @Test public void rejectsIncompleteXhttpLifecyclePatch() {
+        for (String part : new String[]{"context.WithTimeout(ctxInner, 8*time.Second)", "_ = rawConn.Close()",
+                "case <-ctx.Done():", "onClose: cancelRequest", "cancelStream()"}) {
+            assertThrows(part, GradleException.class, () ->
+                VerifyLibXrayBuildContractTask.verifyXhttpLifecycleContract(lifecycleScript, lifecyclePatch.replace(part, "")));
+        }
+    }
 
     @Test public void acceptsCompleteXhttpContract() {
         VerifyLibXrayBuildContractTask.verifyXhttpContract(script, patch, close);

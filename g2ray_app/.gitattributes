@@ -1,2 +1,3 @@
 gradlew text eol=lf
 scripts/patches/*.patch -text whitespace=-blank-at-eol,-space-before-tab
+scripts/patches/xray-xhttp-lifecycle-5ca.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab

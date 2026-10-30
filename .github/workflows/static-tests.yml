@@ -86,6 +86,7 @@ jobs:
           python3 tests/xray_isolated_server_pair_check_test.py
           python3 tests/native_checkout_eol_test.py
           python3 tests/analyze_vpn_load_test.py
+          python3 tests/synthetic_integrity_endpoint_test.py
 
   xray-core-tests:
     runs-on: ubuntu-latest
@@ -141,6 +142,8 @@ jobs:
             test -n "$expected"
             printf "%s  xray\n" "$expected" | sha256sum -c -
             test -x /usr/local/lib/g2ray/xray-official'
+          docker run --rm --entrypoint python3 -v "$PWD/tests:/audit:ro" g2ray-ws-verified \
+            /audit/xray_xhttp_handshake_check.py /usr/local/bin/xray
 
   extended-tests:
     runs-on: ubuntu-latest

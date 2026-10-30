@@ -38,6 +38,9 @@ import java.util.concurrent.TimeUnit
 /** Opt-in real preference/service/TUN interaction checks; never edits accounts or profiles. */
 @RunWith(AndroidJUnit4::class)
 class OptionMatrixDeviceTest {
+    @Test fun integrityWithExplicitFailoverSettingRestoresPreferences() = withExplicitFailover("liveIntegrity") {
+        LiveVpnDeviceTest().selectedProfileVerifiesSyntheticIntegrity()
+    }
     @Test fun loadedTrafficWithExplicitFailoverSettingRestoresPreferences() = withExplicitFailover("liveLoadedTransfers") {
         LiveVpnDeviceTest().selectedProfileKeepsResponsiveDuringConcurrentTransfers()
     }
@@ -61,6 +64,7 @@ class OptionMatrixDeviceTest {
         saved.writeText(JSONObject(raw.mapValues { it.value ?: JSONObject.NULL }).toString())
         try {
             prefs.setSeamlessFailoverEnabled(enabled)
+            prefs.setAutoRouteOptimizationEnabled(false)
             report("loaded_option seamless_failover=$enabled")
             test()
         } finally {

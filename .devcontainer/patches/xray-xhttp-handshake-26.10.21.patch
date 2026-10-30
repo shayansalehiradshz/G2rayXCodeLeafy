@@ -1,0 +1,76 @@
+diff --git a/proxy/vless/inbound/inbound.go b/proxy/vless/inbound/inbound.go
+index 56928740..1b71cbb5 100644
+--- a/proxy/vless/inbound/inbound.go
++++ b/proxy/vless/inbound/inbound.go
+@@ -277,6 +277,11 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
+ 	}
+ 
+ 	sessionPolicy := h.policyManager.ForLevel(0)
++	stopHandshake := func() {}
++	if bounded, ok := iConn.(interface{ StartHandshakeTimeout(time.Duration) func() }); ok {
++		stopHandshake = bounded.StartHandshakeTimeout(sessionPolicy.Timeouts.Handshake)
++		defer stopHandshake()
++	}
+ 	if err := connection.SetReadDeadline(time.Now().Add(sessionPolicy.Timeouts.Handshake)); err != nil {
+ 		return errors.New("unable to set read deadline").Base(err)
+ 	}
+@@ -310,6 +315,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
+ 
+ 	if err != nil {
+ 		if isfb {
++			stopHandshake()
+ 			if err := connection.SetReadDeadline(time.Time{}); err != nil {
+ 				errors.LogWarningInner(ctx, err, "unable to set back read deadline")
+ 			}
+@@ -522,6 +528,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
+ 		return err
+ 	}
+ 
++	stopHandshake()
+ 	if err := connection.SetReadDeadline(time.Time{}); err != nil {
+ 		errors.LogWarningInner(ctx, err, "unable to set back read deadline")
+ 	}
+diff --git a/transport/internet/splithttp/connection.go b/transport/internet/splithttp/connection.go
+index 613e1f36..8e9d3ec7 100644
+--- a/transport/internet/splithttp/connection.go
++++ b/transport/internet/splithttp/connection.go
+@@ -3,6 +3,7 @@ package splithttp
+ import (
+ 	"io"
+ 	"net"
++	"sync"
+ 	"time"
+ )
+ 
+@@ -34,12 +35,30 @@ func (c *splitConn) Close() error {
+ 	}
+ 
+ 	if err2 != nil {
+-		return err
++		return err2
+ 	}
+ 
+ 	return nil
+ }
+ 
++// VLESS uses this per-stream guard because HTTP request bodies are not raw
++// sockets. Never set a handshake deadline on their shared HTTP/2 carrier.
++func (c *splitConn) StartHandshakeTimeout(timeout time.Duration) func() {
++	finished := make(chan struct{})
++	timer := time.AfterFunc(timeout, func() {
++		defer close(finished)
++		_ = c.Close()
++	})
++	var once sync.Once
++	return func() {
++		once.Do(func() {
++			if !timer.Stop() {
++				<-finished
++			}
++		})
++	}
++}
++
+ func (c *splitConn) LocalAddr() net.Addr {
+ 	return c.localAddr
+ }

@@ -21,7 +21,7 @@ import static org.junit.Assert.*;
 
 public class VerifyLibXrayBundleTaskTest {
     @Rule public TemporaryFolder temporaryFolder = new TemporaryFolder();
-    private Path aar, metadata, controller, observer, measure, xhttp, close, webSocket, vlessCancel;
+    private Path aar, metadata, controller, observer, measure, xhttp, close, webSocket, vlessCancel, xhttpLifecycle;
     private Properties properties;
 
     @Before public void prepare() throws Exception {
@@ -35,6 +35,7 @@ public class VerifyLibXrayBundleTaskTest {
         close = Files.writeString(root.resolve("close.patch"), "close fixture\n");
         webSocket = Files.writeString(root.resolve("websocket.patch"), "WebSocket fixture\n");
         vlessCancel = Files.writeString(root.resolve("vless-cancel.patch"), "VLESS cancellation fixture\n");
+        xhttpLifecycle = Files.writeString(root.resolve("xhttp-lifecycle.patch"), "XHTTP lifecycle fixture\n");
         writeAar(true);
         properties = new Properties();
         properties.setProperty("libxray.ref", "80263da83e96b2972455b0a94b13ee1a10e51391");
@@ -49,7 +50,8 @@ public class VerifyLibXrayBundleTaskTest {
                 "libxray.xray.xhttp.patch.sha256", xhttp,
                 "libxray.xray.xhttp.close.patch.sha256", close,
                 "libxray.xray.websocket.patch.sha256", webSocket,
-                "libxray.xray.vless.cancel.patch.sha256", vlessCancel).entrySet()) {
+                "libxray.xray.vless.cancel.patch.sha256", vlessCancel,
+                "libxray.xray.xhttp.lifecycle.patch.sha256", xhttpLifecycle).entrySet()) {
             properties.setProperty(entry.getKey(), hash(entry.getValue()));
         }
         saveMetadata();
@@ -64,12 +66,22 @@ public class VerifyLibXrayBundleTaskTest {
     }
 
     private void verify(boolean required) throws Exception {
-        VerifyLibXrayBundleTask.verifyArtifacts(aar, metadata, controller, observer, measure, xhttp, close, webSocket, vlessCancel, required);
+        VerifyLibXrayBundleTask.verifyArtifacts(aar, metadata, controller, observer, measure, xhttp, close, webSocket, vlessCancel, xhttpLifecycle, required);
     }
 
     private void rejected(String expected) {
         GradleException error = assertThrows(GradleException.class, () -> verify(true));
         assertTrue(error.getMessage(), error.getMessage().contains(expected));
+    }
+
+    @Test public void rejectsMissingXhttpLifecycleAttestation() throws Exception {
+        properties.remove("libxray.xray.xhttp.lifecycle.patch.sha256"); saveMetadata();
+        rejected("libxray.xray.xhttp.lifecycle.patch.sha256");
+    }
+
+    @Test public void rejectsChangedXhttpLifecyclePatch() throws Exception {
+        Files.writeString(xhttpLifecycle, "changed lifecycle patch");
+        rejected("libxray.xray.xhttp.lifecycle.patch.sha256");
     }
 
     // Structural metadata/API fixture only: these native entries are not a functional Android library.

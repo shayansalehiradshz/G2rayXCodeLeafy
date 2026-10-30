@@ -45,6 +45,10 @@ public abstract class VerifyLibXrayBuildContractTask extends DefaultTask {
     @PathSensitive(PathSensitivity.RELATIVE)
     public abstract RegularFileProperty getVlessCancelPatch();
 
+    @InputFile
+    @PathSensitive(PathSensitivity.RELATIVE)
+    public abstract RegularFileProperty getXhttpLifecyclePatch();
+
     @TaskAction
     public void verifyContract() throws Exception {
         String script = Files.readString(
@@ -114,6 +118,23 @@ public abstract class VerifyLibXrayBuildContractTask extends DefaultTask {
             Files.readString(getWebSocketPatch().getAsFile().get().toPath(), StandardCharsets.UTF_8));
         verifyVlessCancelContract(script,
             Files.readString(getVlessCancelPatch().getAsFile().get().toPath(), StandardCharsets.UTF_8));
+        verifyXhttpLifecycleContract(script,
+            Files.readString(getXhttpLifecyclePatch().getAsFile().get().toPath(), StandardCharsets.UTF_8));
+    }
+
+    static void verifyXhttpLifecycleContract(String script, String patch) {
+        require(script.contains("git -C $xrayCoreDir apply --check $XrayXhttpLifecyclePatch") &&
+                script.contains("git -C $xrayCoreDir apply $XrayXhttpLifecyclePatch") &&
+                script.contains("libxray.xray.xhttp.lifecycle.patch.sha256="),
+            "The native build must apply and attest the XHTTP lifecycle patch.");
+        require(script.contains("g2ray_xhttp_request_lifecycle_test.go") &&
+                script.contains("g2ray_vless_xhttp_cancel_test.go") &&
+                script.contains("go test ./transport/internet/splithttp -run '^TestG2RayX'"),
+            "The native build must test cancellation through real XHTTP and VLESS.");
+        require(patch.contains("context.WithTimeout(ctxInner, 8*time.Second)") &&
+                patch.contains("_ = rawConn.Close()") && patch.contains("case <-ctx.Done():") &&
+                patch.contains("onClose: cancelRequest") && patch.contains("cancelStream()"),
+            "The XHTTP patch must bound setup, close failed sockets and cancel owned requests.");
     }
 
     static void verifyVlessCancelContract(String script, String patch) {
@@ -153,7 +174,7 @@ public abstract class VerifyLibXrayBuildContractTask extends DefaultTask {
         require(script.contains("libxray.xray.xhttp.patch.sha256=") &&
                 script.contains("libxray.xray.xhttp.close.patch.sha256="),
             "The native build must attest both XHTTP patches.");
-        require(script.contains("go test ./transport/internet/splithttp -run '^TestG2RayXHTTP'") &&
+        require(script.contains("go test ./transport/internet/splithttp -run '^TestG2RayX'") &&
                 script.contains("if ($LASTEXITCODE -ne 0) { throw \"The patched XHTTP"),
             "The native build must fail when the focused XHTTP regression tests fail.");
         require(patch.contains("+\t\tn := int(buff.Len())") && patch.contains("atomic.Bool") &&

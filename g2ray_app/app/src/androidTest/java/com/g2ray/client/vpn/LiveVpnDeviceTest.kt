@@ -352,6 +352,15 @@ class LiveVpnDeviceTest {
     fun selectedProfileStartsWithSmallProbes() = runLiveTest(startupOnly = true)
 
     @Test
+    fun selectedProfileVerifiesSyntheticIntegrity() {
+        assumeTrue("Requires explicit liveIntegrity=true",
+            InstrumentationRegistry.getArguments().getString("liveIntegrity") == "true")
+        runLiveTest(acceptanceCheck = { context, client ->
+            withContext(Dispatchers.IO) { verifySyntheticIntegrity(context, client, ::report) }
+        })
+    }
+
+    @Test
     fun optionalDomainBypassUsesPhysicalExitWithoutChangingDefaultVpnRouting() {
         val args = InstrumentationRegistry.getArguments()
         assumeTrue("Bypass checks require -e liveRouting true and -e liveVpn true",
@@ -536,15 +545,18 @@ class LiveVpnDeviceTest {
             }
         }
         assertNotNull("No matching saved transport profile exists on the selected edge", savedProfile)
-        val coreDefaultExtra = when (args.getString("xhttpTuning")) {
-            null, "saved" -> false
-            "core-default" -> true
-            else -> error("xhttpTuning must be saved or core-default")
-        }
-        require(!coreDefaultExtra || !uiStart) { "UI startup must use the unchanged saved profile" }
+        val tuning = args.getString("xhttpTuning") ?: "saved"
+        require(tuning == "saved" || !uiStart) { "UI startup must use the unchanged saved profile" }
         val parsedProfile = VlessUriParser.parse(savedProfile!!.rawUri).getOrThrow()
-        val profile = if (coreDefaultExtra) SyntheticProfileVariants.withoutXhttpExtra(parsedProfile) else parsedProfile
-        report("event=profile_variant xhttp_tuning=${if (coreDefaultExtra) "core-default" else "saved"} " +
+        val factors = Regex("ablate-(60000|1000000)-(10|30)-(0|20)").matchEntire(tuning)
+        val profile = when {
+            tuning == "saved" -> parsedProfile
+            tuning == "core-default" -> SyntheticProfileVariants.withoutXhttpExtra(parsedProfile)
+            factors != null -> SyntheticProfileVariants.controlledXhttp(parsedProfile,
+                factors.groupValues[1].toInt(), factors.groupValues[2].toInt(), factors.groupValues[3].toInt())
+            else -> error("Unknown controlled XHTTP tuning variant")
+        }
+        report("event=profile_variant xhttp_tuning=$tuning " +
             "extra_present=${profile.xhttpExtraJson != null} saved_profile_unchanged=true")
         assertTrue("UI startup uses the selected profile, not a transport override",
             !uiStart || transport == null || transport == selected!!.transport)

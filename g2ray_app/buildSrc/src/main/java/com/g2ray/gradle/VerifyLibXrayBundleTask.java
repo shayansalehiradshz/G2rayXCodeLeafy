@@ -74,6 +74,10 @@ public abstract class VerifyLibXrayBundleTask extends DefaultTask {
     @PathSensitive(PathSensitivity.RELATIVE)
     public abstract RegularFileProperty getVlessCancelPatch();
 
+    @InputFile
+    @PathSensitive(PathSensitivity.RELATIVE)
+    public abstract RegularFileProperty getXhttpLifecyclePatch();
+
     @Input
     public abstract Property<Boolean> getRequired();
 
@@ -96,12 +100,13 @@ public abstract class VerifyLibXrayBundleTask extends DefaultTask {
             getXhttpPatch().getAsFile().get().toPath(),
             getXhttpClosePatch().getAsFile().get().toPath(),
             getWebSocketPatch().getAsFile().get().toPath(),
-            getVlessCancelPatch().getAsFile().get().toPath(), getRequired().get());
+            getVlessCancelPatch().getAsFile().get().toPath(),
+            getXhttpLifecyclePatch().getAsFile().get().toPath(), getRequired().get());
     }
 
     static void verifyArtifacts(Path aar, Path metadata, Path controllerPatch, Path observerPatch,
                                 Path measurePatch, Path xhttpPatch, Path xhttpClosePatch, Path webSocketPatch,
-                                Path vlessCancelPatch,
+                                Path vlessCancelPatch, Path xhttpLifecyclePatch,
                                 boolean required) throws Exception {
         boolean aarExists = Files.isRegularFile(aar);
         boolean metadataExists = Files.isRegularFile(metadata);
@@ -171,6 +176,7 @@ public abstract class VerifyLibXrayBundleTask extends DefaultTask {
         requirePatchHash(properties, "libxray.xray.xhttp.close.patch.sha256", xhttpClosePatch);
         requirePatchHash(properties, "libxray.xray.websocket.patch.sha256", webSocketPatch);
         requirePatchHash(properties, "libxray.xray.vless.cancel.patch.sha256", vlessCancelPatch);
+        requirePatchHash(properties, "libxray.xray.xhttp.lifecycle.patch.sha256", xhttpLifecyclePatch);
 
         verifyNativeLibraries(aar);
         verifyJavaApi(aar);
