@@ -2,6 +2,7 @@ package com.g2ray.client.vpn
 
 import android.content.Context
 import android.os.SystemClock
+import com.g2ray.client.G2RayApplication
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -19,6 +20,11 @@ internal fun verifySyntheticIntegrity(context: Context, client: OkHttpClient, re
     val base = fixture.getString("base_url").toHttpUrl()
     require(base.isHttps && base.port == 443 && base.host.endsWith(".app.github.dev") &&
         base.encodedPath == "/" && base.query == null && base.username.isEmpty() && base.password.isEmpty())
+    val settings = VpnEnginePreferences((context.applicationContext as G2RayApplication).secureStore).readSettings()
+    require(settings.routingPolicy.bypassDomains.none { base.host == it || base.host.endsWith(".$it") }) {
+        "The owned fixture matches a direct-routing bypass rule"
+    }
+    record("event=owned_fixture_route proxy_required=true no_matching_domain_bypass=true")
     val token = fixture.getString("token")
     require(token.matches(Regex("[a-f0-9]{64}")))
     val samples = fixture.getInt("samples").also { require(it in 1..5) }

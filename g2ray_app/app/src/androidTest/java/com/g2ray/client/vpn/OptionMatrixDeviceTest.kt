@@ -51,6 +51,10 @@ class OptionMatrixDeviceTest {
         val originalProfiles = repository.profiles.value.toList()
         val originalKeys = repository.apiKeys.value.toList()
         val originalSettings = VpnEnginePreferences(context.secureStore).readSettings()
+        val fixtureHost = java.net.URI(JSONObject(File(context.filesDir, "integrity-fixture.private.json").readText()).getString("base_url")).host
+        assertTrue("The owned fixture is excluded by a direct-routing rule", originalSettings.routingPolicy.bypassDomains.none {
+            fixtureHost == it || fixtureHost.endsWith(".$it")
+        })
         val selected = originalProfiles.first { it.id == selection.profileId && it.accountId == selection.accountId }
         val source = originalProfiles.first { it.accountId == selected.accountId && it.address == selected.address && it.transport == Transport.XHTTP }
         val variant = SyntheticProfileVariants.controlledXhttp(VlessUriParser.parse(source.rawUri).getOrThrow(), 1_000_000, 30, 20)
@@ -64,7 +68,7 @@ class OptionMatrixDeviceTest {
         assertTrue("Setup changed account or key selection", repository.activeSelection.value == selection)
         repository.selectProfile(saved.id)
         assertTrue("Approved copy was not selected", repository.activeSelection.value == selection.copy(profileId = saved.id))
-        report("approved_tuning_copy selected=true originals_preserved=true credentials_unchanged=true settings_unchanged=true")
+        report("approved_tuning_copy selected=true originals_preserved=true credentials_unchanged=true settings_unchanged=true owned_fixture_proxy_route=true")
     }
 
     @Test fun integrityWithExplicitFailoverSettingRestoresPreferences() = withExplicitFailover("liveIntegrity") {
